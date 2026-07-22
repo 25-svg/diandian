@@ -2,7 +2,8 @@ use super::{Database, DatabaseError};
 use knowledge::VaultScan;
 
 pub use knowledge_store::{
-    KnowledgeStatus, KnowledgeSyncSummary, KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL,
+    KnowledgeDocumentRecord, KnowledgeStatus, KnowledgeSyncSummary,
+    KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL, KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL,
     KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL, KNOWLEDGE_MIGRATION_SQL,
 };
 
@@ -22,5 +23,20 @@ impl Database {
     ) -> Result<KnowledgeStatus, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
         Ok(knowledge_store::get_knowledge_status(&pool, vault_path).await?)
+    }
+
+    pub async fn list_eligible_documents(
+        &self,
+        card_types: &[String],
+    ) -> Result<Vec<KnowledgeDocumentRecord>, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        Ok(knowledge_store::list_eligible_documents(&pool, card_types).await?)
+    }
+
+    pub async fn list_asr_parameter_cards(
+        &self,
+    ) -> Result<Vec<KnowledgeDocumentRecord>, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        Ok(knowledge_store::list_asr_parameter_cards(&pool).await?)
     }
 }

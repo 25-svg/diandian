@@ -732,6 +732,7 @@ dependencies = [
  "hyper 0.14.32",
  "knowledge",
  "knowledge-store",
+ "knowledge-writer",
  "log",
  "m3u8-rs 5.0.5",
  "master-script",
@@ -3585,6 +3586,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "knowledge-writer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "tempfile",
  "tokio",
  "uuid",
 ]

@@ -56,6 +56,15 @@ fn recognizes_a_vault_by_any_known_directory_without_obsidian_config() {
 }
 
 #[test]
+fn recognizes_master_script_and_scenario_directories() {
+    for directory in ["10-企业母稿", "11-场景应对"] {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(directory)).unwrap();
+        assert!(inspect_vault(root.path()).unwrap().valid, "{directory}");
+    }
+}
+
+#[test]
 fn accepts_current_vault_layout_with_pending_review_directory() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join(".obsidian")).unwrap();
@@ -68,6 +77,8 @@ fn accepts_current_vault_layout_with_pending_review_directory() {
         "06-辅稿",
         "07-证据索引",
         "08-产品参数库",
+        "10-企业母稿",
+        "11-场景应对",
         "99-待审核",
     ] {
         fs::create_dir(root.path().join(directory)).unwrap();
@@ -90,6 +101,8 @@ fn accepts_legacy_review_directory_as_an_alias() {
         "06-辅稿",
         "07-证据索引",
         "08-产品参数库",
+        "10-企业母稿",
+        "11-场景应对",
         "09-审核逐字稿",
     ] {
         fs::create_dir(root.path().join(directory)).unwrap();
@@ -109,7 +122,11 @@ fn parses_windows_newlines_and_separates_pending_cards_from_notes() {
         "---\r\nid: PC-001\r\ntitle: 产品卡\r\ntype: product_catalog\r\nstatus: pending_review\r\nversion: 0.1.0\r\n---\r\n正文",
     );
     write(root.path(), "99-待审核/README.md", "# 待审核说明\r\n");
-    write(root.path(), "01-产品事实/丢失头.md", "# 这本应是一张知识卡\r\n");
+    write(
+        root.path(),
+        "01-产品事实/丢失头.md",
+        "# 这本应是一张知识卡\r\n",
+    );
 
     let scan = scan_vault(root.path()).unwrap();
     assert_eq!(scan.issues.len(), 1);
@@ -121,6 +138,7 @@ fn parses_windows_newlines_and_separates_pending_cards_from_notes() {
         .unwrap();
     assert_eq!(pending.classification, "pending_review");
     assert!(!pending.eligible);
+    assert!(pending.asr_eligible);
     let note = scan
         .documents
         .iter()
@@ -135,6 +153,66 @@ fn parses_windows_newlines_and_separates_pending_cards_from_notes() {
         .unwrap();
     assert_eq!(broken.classification, "invalid");
     assert_eq!(broken.issue.as_deref(), Some("缺少 YAML frontmatter"));
+}
+
+#[test]
+fn asr_eligibility_requires_a_valid_unrestricted_company_parameter_or_alias_card() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".obsidian")).unwrap();
+    write(
+        root.path(),
+        "02-别名与ASR纠错/ALIAS-001.md",
+        "---\nid: ALIAS-001\ntitle: 小白兔别名\ntype: alias\nstatus: pending_review\nversion: 1\n---\n小白兔 = EF 70-200mm",
+    );
+    write(
+        root.path(),
+        "08-产品参数库/PARAM-001.md",
+        "---\nid: PARAM-001\ntitle: 产品参数\ntype: product_catalog\nstatus: pending_review\nversion: 1\n---\n焦距 70-200mm",
+    );
+    write(
+        root.path(),
+        "08-产品参数库/malformed.md",
+        "---\ntitle: 缺少编号\ntype: product_catalog\nstatus: pending_review\n---\n正文",
+    );
+    write(
+        root.path(),
+        "08-产品参数库/restricted.md",
+        "---\nid: PARAM-PRIVATE\ntitle: 受限参数\ntype: product_catalog\nstatus: approved\nsensitivity: restricted\n---\n内部参数",
+    );
+    write(
+        root.path(),
+        "08-产品参数库/unrelated.md",
+        "---\nid: TALK-001\ntitle: 错放的话术卡\ntype: talk_track\nstatus: approved\n---\n正文",
+    );
+    write(
+        root.path(),
+        "01-产品事实/PF-001.md",
+        "---\nid: PF-001\ntitle: 普通知识\ntype: product_fact\nstatus: approved\n---\n正文",
+    );
+
+    let scan = scan_vault(root.path()).unwrap();
+    let by_id = |id: &str| {
+        scan.documents
+            .iter()
+            .find(|item| item.card_id == id)
+            .unwrap()
+    };
+
+    for id in ["ALIAS-001", "PARAM-001"] {
+        assert!(by_id(id).asr_eligible);
+        assert!(!by_id(id).eligible);
+    }
+    assert!(
+        !scan
+            .documents
+            .iter()
+            .find(|item| item.relative_path.ends_with("malformed.md"))
+            .unwrap()
+            .asr_eligible
+    );
+    assert!(!by_id("PARAM-PRIVATE").asr_eligible);
+    assert!(!by_id("TALK-001").asr_eligible);
+    assert!(!by_id("PF-001").asr_eligible);
 }
 
 #[test]
@@ -206,7 +284,11 @@ fn duplicate_card_ids_are_reported_and_never_eligible() {
 fn restricted_documents_keep_their_security_classification_when_ids_repeat() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join(".obsidian")).unwrap();
-    write(root.path(), "public.md", "---\nid: DUP-SEC\ntitle: 普通知识卡\ntype: product_fact\nstatus: approved\n---\n正文");
+    write(
+        root.path(),
+        "public.md",
+        "---\nid: DUP-SEC\ntitle: 普通知识卡\ntype: product_fact\nstatus: approved\n---\n正文",
+    );
     write(root.path(), "restricted.md", "---\nid: DUP-SEC\ntitle: 受限知识卡\ntype: product_fact\nstatus: approved\nsensitivity: personal\n---\n手机号 13800138000");
 
     let scan = scan_vault(root.path()).unwrap();
@@ -216,7 +298,10 @@ fn restricted_documents_keep_their_security_classification_when_ids_repeat() {
         .find(|item| item.relative_path == "restricted.md")
         .unwrap();
     assert_eq!(restricted.classification, "restricted");
-    assert_eq!(restricted.issue.as_deref(), Some("检测到个人或受限信息，正文未进入索引"));
+    assert_eq!(
+        restricted.issue.as_deref(),
+        Some("检测到个人或受限信息，正文未进入索引")
+    );
     assert!(restricted.body.is_empty());
 }
 

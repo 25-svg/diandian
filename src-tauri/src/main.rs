@@ -10,6 +10,7 @@ mod ffmpeg;
 mod handlers;
 #[cfg(feature = "headless")]
 mod http_server;
+mod knowledge_writer;
 mod migration;
 mod progress;
 mod recorder_manager;
@@ -473,6 +474,12 @@ fn get_migrations() -> Vec<Migration> {
             version: 19,
             description: "add_master_script_tables",
             sql: database::master_script::MASTER_SCRIPT_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 20,
+            description: "add_knowledge_asr_eligibility",
+            sql: database::knowledge::KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
     ]

@@ -1,5 +1,5 @@
 use knowledge::VaultScan;
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 pub const KNOWLEDGE_MIGRATION_SQL: &str = r#"
 CREATE TABLE knowledge_sources (
@@ -53,6 +53,23 @@ UPDATE knowledge_documents SET classification = CASE
     ELSE 'invalid'
 END;
 "#;
+
+pub const KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL: &str = r#"
+ALTER TABLE knowledge_documents ADD COLUMN asr_eligible INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_knowledge_documents_asr_eligible ON knowledge_documents(asr_eligible, active);
+"#;
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeDocumentRecord {
+    pub card_id: String,
+    pub title: String,
+    pub card_type: String,
+    pub version: String,
+    pub relative_path: String,
+    pub metadata_json: String,
+    pub body: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -136,14 +153,15 @@ pub async fn sync_knowledge_vault(
         sqlx::query(
             r#"INSERT INTO knowledge_documents (
                    source_id, relative_path, card_id, title, card_type, status, version,
-                   content_hash, metadata_json, body, eligible, classification, issue, active, last_seen_sync,
+                   content_hash, metadata_json, body, eligible, asr_eligible, classification, issue, active, last_seen_sync,
                    updated_at
-               ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,datetime('now'))
+               ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,?15,datetime('now'))
                ON CONFLICT(source_id, relative_path) DO UPDATE SET
                    card_id=excluded.card_id, title=excluded.title, card_type=excluded.card_type,
                    status=excluded.status, version=excluded.version, content_hash=excluded.content_hash,
                    metadata_json=excluded.metadata_json, body=excluded.body,
-                   eligible=excluded.eligible, classification=excluded.classification,
+                   eligible=excluded.eligible, asr_eligible=excluded.asr_eligible,
+                   classification=excluded.classification,
                    issue=excluded.issue, active=1,
                    last_seen_sync=excluded.last_seen_sync, updated_at=datetime('now')"#,
         )
@@ -158,6 +176,7 @@ pub async fn sync_knowledge_vault(
         .bind(document.metadata.to_string())
         .bind(&document.body)
         .bind(i64::from(document.eligible))
+        .bind(i64::from(document.asr_eligible))
         .bind(&document.classification)
         .bind(&document.issue)
         .bind(&sync_token)
@@ -173,7 +192,7 @@ pub async fn sync_knowledge_vault(
     .fetch_one(&mut *transaction)
     .await? as usize;
     sqlx::query(
-        "UPDATE knowledge_documents SET active=0, eligible=0, updated_at=datetime('now') WHERE source_id=?1 AND active=1 AND last_seen_sync<>?2",
+        "UPDATE knowledge_documents SET active=0, eligible=0, asr_eligible=0, updated_at=datetime('now') WHERE source_id=?1 AND active=1 AND last_seen_sync<>?2",
     )
     .bind(source_id)
     .bind(&sync_token)
@@ -207,6 +226,41 @@ pub async fn sync_knowledge_vault(
         error_count,
         synced_at,
     })
+}
+
+pub async fn list_eligible_documents(
+    pool: &SqlitePool,
+    card_types: &[String],
+) -> Result<Vec<KnowledgeDocumentRecord>, sqlx::Error> {
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT card_id, title, card_type, version, relative_path, metadata_json, body \
+         FROM knowledge_documents WHERE active=1 AND eligible=1",
+    );
+    if !card_types.is_empty() {
+        query.push(" AND card_type IN (");
+        let mut separated = query.separated(", ");
+        for card_type in card_types {
+            separated.push_bind(card_type);
+        }
+        separated.push_unseparated(")");
+    }
+    query
+        .push(" ORDER BY card_id, relative_path")
+        .build_query_as::<KnowledgeDocumentRecord>()
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn list_asr_parameter_cards(
+    pool: &SqlitePool,
+) -> Result<Vec<KnowledgeDocumentRecord>, sqlx::Error> {
+    sqlx::query_as::<_, KnowledgeDocumentRecord>(
+        "SELECT card_id, title, card_type, version, relative_path, metadata_json, body \
+         FROM knowledge_documents WHERE active=1 AND asr_eligible=1 \
+         ORDER BY card_id, relative_path",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn get_knowledge_status(
@@ -277,6 +331,9 @@ mod knowledge_sync_tests {
         pool.execute(KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL)
             .await
             .unwrap();
+        pool.execute(KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL)
+            .await
+            .unwrap();
         pool
     }
 
@@ -297,6 +354,7 @@ mod knowledge_sync_tests {
             metadata: serde_json::json!({"id": id}),
             body: "正文".into(),
             eligible,
+            asr_eligible: false,
             classification: if eligible {
                 "eligible"
             } else {
@@ -305,6 +363,124 @@ mod knowledge_sync_tests {
             .into(),
             issue: None,
         }
+    }
+
+    #[tokio::test]
+    async fn v20_adds_asr_eligibility_column_and_index() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL)
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL)
+            .await
+            .unwrap();
+
+        let column: (String, i64, String) = sqlx::query_as(
+            "SELECT name, [notnull], dflt_value FROM pragma_table_info('knowledge_documents') WHERE name='asr_eligible'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(column, ("asr_eligible".into(), 1, "0".into()));
+        let index: String = sqlx::query_scalar(
+            "SELECT name FROM pragma_index_list('knowledge_documents') WHERE name='idx_knowledge_documents_asr_eligible'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index, "idx_knowledge_documents_asr_eligible");
+    }
+
+    #[tokio::test]
+    async fn general_query_filters_active_eligible_rows_with_bound_card_types() {
+        let pool = pool().await;
+        let mut product = document("01-产品事实/PF-001.md", "PF-001", "hash-a", true);
+        product.title = "产品事实".into();
+        product.metadata = serde_json::json!({"source": "company"});
+        product.body = "产品正文".into();
+        let mut other = document("04-话术模块/TALK-001.md", "TALK-001", "hash-b", true);
+        other.card_type = "talk_track".into();
+        let inactive = document("01-产品事实/PF-OLD.md", "PF-OLD", "hash-c", true);
+        sync_knowledge_vault(&pool, r"C:\Vault", &scan(vec![product, other, inactive]))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE knowledge_documents SET active=0 WHERE card_id='PF-OLD'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = list_eligible_documents(&pool, &["product_fact".into()])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].card_id, "PF-001");
+        assert_eq!(rows[0].title, "产品事实");
+        assert_eq!(rows[0].card_type, "product_fact");
+        assert_eq!(rows[0].version, "1");
+        assert_eq!(rows[0].relative_path, "01-产品事实/PF-001.md");
+        assert_eq!(rows[0].metadata_json, r#"{"source":"company"}"#);
+        assert_eq!(rows[0].body, "产品正文");
+
+        let injection = list_eligible_documents(&pool, &["product_fact' OR 1=1 --".into()])
+            .await
+            .unwrap();
+        assert!(injection.is_empty());
+    }
+
+    #[tokio::test]
+    async fn asr_query_is_independent_from_general_eligibility() {
+        let pool = pool().await;
+        let mut pending_parameter =
+            document("08-产品参数库/PARAM-001.md", "PARAM-001", "hash-a", false);
+        pending_parameter.card_type = "product_catalog".into();
+        pending_parameter.asr_eligible = true;
+        let mut pending_alias = document(
+            "02-别名与ASR纠错/ALIAS-001.md",
+            "ALIAS-001",
+            "hash-b",
+            false,
+        );
+        pending_alias.card_type = "alias".into();
+        pending_alias.asr_eligible = true;
+        let mut malformed = document("08-产品参数库/broken.md", "", "hash-c", false);
+        malformed.classification = "invalid".into();
+        malformed.issue = Some("missing id".into());
+        let mut restricted = document("08-产品参数库/private.md", "PARAM-PRIVATE", "hash-d", false);
+        restricted.classification = "restricted".into();
+        restricted.issue = Some("restricted".into());
+
+        sync_knowledge_vault(
+            &pool,
+            r"C:\Vault",
+            &scan(vec![
+                pending_parameter,
+                pending_alias,
+                malformed,
+                restricted,
+            ]),
+        )
+        .await
+        .unwrap();
+
+        assert!(list_eligible_documents(&pool, &[])
+            .await
+            .unwrap()
+            .is_empty());
+        let rows = list_asr_parameter_cards(&pool).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.card_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ALIAS-001", "PARAM-001"]
+        );
     }
 
     fn scan(documents: Vec<KnowledgeDocument>) -> VaultScan {
@@ -495,6 +671,9 @@ mod knowledge_sync_tests {
             .await
             .unwrap();
         pool.execute(KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL)
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL)
             .await
             .unwrap();
         sync_knowledge_vault(&pool, r"C:\Vault", &source)

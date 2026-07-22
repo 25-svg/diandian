@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/danmu_stream", "crates/knowledge", "crates/knowledge-store", "crates/master-script", "crates/master-script-store", "crates/recorder", "crates/whisper-cpp-rs"]
+members = ["crates/danmu_stream", "crates/knowledge", "crates/knowledge-store", "crates/knowledge-writer", "crates/master-script", "crates/master-script-store", "crates/recorder", "crates/whisper-cpp-rs"]
 resolver = "2"
 
 [workspace.lints.clippy]
@@ -27,6 +27,7 @@ workspace = true
 danmu_stream = { path = "crates/danmu_stream" }
 knowledge = { path = "crates/knowledge" }
 knowledge-store = { path = "crates/knowledge-store" }
+knowledge-writer = { path = "crates/knowledge-writer" }
 master-script = { path = "crates/master-script" }
 master-script-store = { path = "crates/master-script-store" }
 recorder = { path = "crates/recorder" }

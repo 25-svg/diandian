@@ -17,6 +17,8 @@ const REQUIRED_DIRS: &[&str] = &[
     "06-辅稿",
     "07-证据索引",
     "08-产品参数库",
+    "10-企业母稿",
+    "11-场景应对",
 ];
 const REVIEW_DIR_ALIASES: &[&str] = &["99-待审核", "09-审核逐字稿"];
 const EXCLUDED_DIRS: &[&str] = &[".obsidian", "90-模板", "99-待处理冲突"];
@@ -53,6 +55,7 @@ pub struct KnowledgeDocument {
     pub metadata: serde_json::Value,
     pub body: String,
     pub eligible: bool,
+    pub asr_eligible: bool,
     pub classification: String,
     pub issue: Option<String>,
 }
@@ -206,6 +209,10 @@ pub fn parse_document(vault: &Path, path: &Path) -> KnowledgeDocument {
         classification = "invalid".to_string();
     }
 
+    let asr_eligible = issue.is_none()
+        && matches!(classification.as_str(), "eligible" | "pending_review")
+        && is_asr_parameter_card(&relative_path, &card_type);
+
     KnowledgeDocument {
         relative_path,
         card_id,
@@ -221,6 +228,7 @@ pub fn parse_document(vault: &Path, path: &Path) -> KnowledgeDocument {
             body.trim().to_string()
         },
         eligible,
+        asr_eligible,
         classification,
         issue,
     }
@@ -244,13 +252,14 @@ pub fn scan_vault(path: &Path) -> Result<VaultScan, KnowledgeError> {
     for document in &mut documents {
         if document.classification != "restricted"
             && id_counts
-            .get(&document.card_id)
-            .copied()
-            .unwrap_or_default()
-            > 1
+                .get(&document.card_id)
+                .copied()
+                .unwrap_or_default()
+                > 1
         {
             document.issue = Some(format!("知识卡 ID 重复: {}", document.card_id));
             document.eligible = false;
+            document.asr_eligible = false;
             document.classification = "duplicate".to_string();
         }
     }
@@ -385,6 +394,18 @@ fn is_ignored_note(relative_path: &str) -> bool {
         || file_name.ends_with("-品牌索引.md")
 }
 
+fn is_asr_parameter_card(relative_path: &str, card_type: &str) -> bool {
+    let directory = Path::new(relative_path)
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str());
+    matches!(
+        (directory, card_type),
+        (Some("08-产品参数库"), "product_catalog")
+            | (Some("02-别名与ASR纠错"), "asr_correction" | "alias")
+    )
+}
+
 fn is_restricted(metadata: &Value, body: &str) -> bool {
     if matches!(
         yaml_string(metadata, "sensitivity").as_str(),
@@ -420,6 +441,7 @@ fn invalid_document(
         metadata: serde_json::Value::Null,
         body: String::new(),
         eligible: false,
+        asr_eligible: false,
         classification: "invalid".to_string(),
         issue: Some(message),
     }
@@ -437,6 +459,7 @@ fn ignored_document(relative_path: String, content_hash: String) -> KnowledgeDoc
         metadata: serde_json::Value::Null,
         body: String::new(),
         eligible: false,
+        asr_eligible: false,
         classification: "ignored".to_string(),
         issue: None,
     }
