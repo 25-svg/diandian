@@ -1,6 +1,36 @@
 use knowledge::{inspect_vault, scan_vault};
 use std::fs;
 
+fn directory_fingerprint(root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::time::UNIX_EPOCH;
+
+    let mut rows = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            let metadata = entry.metadata().unwrap();
+            let modified = metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            format!("{relative}\t{}\t{modified}", metadata.len())
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    format!("{:x}", Sha256::digest(rows.join("\n").as_bytes()))
+}
+
 fn write(root: &std::path::Path, relative: &str, content: &str) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -81,4 +111,28 @@ fn duplicate_card_ids_are_reported_and_never_eligible() {
         .documents
         .iter()
         .all(|item| item.issue.as_deref() == Some("知识卡 ID 重复: DUP-001")));
+}
+
+#[test]
+#[ignore = "requires OBSIDIAN_TEST_VAULT"]
+fn scans_external_vault_without_modifying_files() {
+    let path = std::env::var_os("OBSIDIAN_TEST_VAULT").expect("OBSIDIAN_TEST_VAULT");
+    let root = std::path::PathBuf::from(path);
+    let before = directory_fingerprint(&root);
+    let scan = scan_vault(&root).unwrap();
+    let after = directory_fingerprint(&root);
+    println!(
+        "documents={} eligible={} issues={} fingerprint_before={} fingerprint_after={}",
+        scan.documents.len(),
+        scan.documents.iter().filter(|item| item.eligible).count(),
+        scan.issues.len(),
+        before,
+        after
+    );
+    assert!(!scan.documents.is_empty());
+    assert!(scan
+        .documents
+        .iter()
+        .any(|item| item.status == "pending_review"));
+    assert_eq!(before, after);
 }

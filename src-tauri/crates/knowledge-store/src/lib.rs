@@ -332,4 +332,46 @@ mod knowledge_sync_tests {
             .unwrap();
         assert_eq!((status.error_count, status.eligible_count), (1, 0));
     }
+
+    #[tokio::test]
+    async fn rebuilds_snapshot_from_vault_scan() {
+        let pool = pool().await;
+        let mut invalid = document("broken.md", "", "hash-b", false);
+        invalid.issue = Some("YAML frontmatter 未闭合".into());
+        let source = scan(vec![
+            document("PF-001.md", "PF-001", "hash-a", true),
+            invalid,
+        ]);
+        sync_knowledge_vault(&pool, r"C:\Vault", &source)
+            .await
+            .unwrap();
+        let before = get_knowledge_status(&pool, Some(r"C:\Vault"))
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TABLE knowledge_documents")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE knowledge_sources")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        sync_knowledge_vault(&pool, r"C:\Vault", &source)
+            .await
+            .unwrap();
+        let after = get_knowledge_status(&pool, Some(r"C:\Vault"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                before.active_count,
+                before.eligible_count,
+                before.error_count
+            ),
+            (after.active_count, after.eligible_count, after.error_count)
+        );
+    }
 }
