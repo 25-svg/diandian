@@ -234,6 +234,29 @@ rustfmt --edition 2021 --check 'crates/master-script/src/lib.rs' 'crates/master-
 
 Output: exit code `0`, no output.
 
+## Documentation correction: failed hard-gate admission
+
+- Clarified the design specification so any failed hard gate always produces admission `blocked`, regardless of score.
+- Restricted `needs_confirmation` to supplemental workflow or UI metadata; it cannot be an alternative admission state.
+- No production code changed because `evaluate_admission` and the implementation plan already return `CandidateAdmission::Blocked` whenever any hard gate fails.
+
+Consistency scan:
+
+```powershell
+rg -n -C 3 'needs_confirmation|blocked|Blocked|failed gate|hard-gate|hard gate|任一条件不满足|未通过硬性准入|准入状态' docs/superpowers/specs/2026-07-22-master-script-baseline-analysis-design.md docs/superpowers/plans/2026-07-22-master-script-baseline-analysis.md
+```
+
+Evidence:
+
+```text
+spec: 任一条件不满足时，准入状态始终为 `blocked`。
+spec: `needs_confirmation` 仅可作为补充的工作流或界面元数据，不得作为替代准入状态。
+spec: 未通过硬性准入，不论模型分数多少都不能进入候选。
+plan: failed gate test expects CandidateAdmission::Blocked.
+plan: evaluate_admission returns CandidateAdmission::Blocked when !gates.all_pass().
+plan: hard-gate block despite 100 model points is required coverage.
+```
+
 ## Regression evidence
 
 The relevant non-native package tests passed:
