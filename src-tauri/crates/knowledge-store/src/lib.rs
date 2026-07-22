@@ -39,6 +39,18 @@ CREATE INDEX idx_knowledge_documents_type_status ON knowledge_documents(card_typ
 CREATE INDEX idx_knowledge_documents_eligible ON knowledge_documents(eligible, active);
 "#;
 
+pub const KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL: &str = r#"
+ALTER TABLE knowledge_documents ADD COLUMN classification TEXT NOT NULL DEFAULT 'invalid';
+UPDATE knowledge_documents SET classification = CASE
+    WHEN eligible=1 THEN 'eligible'
+    WHEN issue='检测到个人或受限信息，正文未进入索引' THEN 'restricted'
+    WHEN issue IS NOT NULL THEN 'invalid'
+    WHEN status IN ('pending_review','pending','draft','待审核','待确认') THEN 'pending_review'
+    ELSE 'invalid'
+END;
+CREATE INDEX idx_knowledge_documents_classification ON knowledge_documents(classification, active);
+"#;
+
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeSyncSummary {
@@ -48,6 +60,9 @@ pub struct KnowledgeSyncSummary {
     pub unchanged: usize,
     pub deactivated: usize,
     pub eligible_count: usize,
+    pub pending_review_count: usize,
+    pub ignored_count: usize,
+    pub restricted_count: usize,
     pub error_count: usize,
     pub synced_at: String,
 }
@@ -61,6 +76,9 @@ pub struct KnowledgeStatus {
     pub last_synced_at: Option<String>,
     pub active_count: i64,
     pub eligible_count: i64,
+    pub pending_review_count: i64,
+    pub ignored_count: i64,
+    pub restricted_count: i64,
     pub error_count: i64,
 }
 
@@ -73,12 +91,15 @@ pub async fn sync_knowledge_vault(
     let sync_token = uuid::Uuid::new_v4().to_string();
     let synced_at = chrono::Utc::now().to_rfc3339();
     let eligible_count = scan.documents.iter().filter(|item| item.eligible).count();
+    let pending_review_count = classification_count(scan, "pending_review");
+    let ignored_count = classification_count(scan, "ignored");
+    let restricted_count = classification_count(scan, "restricted");
     let error_count = scan
         .documents
         .iter()
-        .filter(|item| item.issue.is_some())
+        .filter(|item| matches!(item.classification.as_str(), "invalid" | "duplicate"))
         .count();
-    let source_status = if scan.issues.is_empty() {
+    let source_status = if error_count == 0 {
         "ready"
     } else {
         "degraded"
@@ -112,14 +133,15 @@ pub async fn sync_knowledge_vault(
         sqlx::query(
             r#"INSERT INTO knowledge_documents (
                    source_id, relative_path, card_id, title, card_type, status, version,
-                   content_hash, metadata_json, body, eligible, issue, active, last_seen_sync,
+                   content_hash, metadata_json, body, eligible, classification, issue, active, last_seen_sync,
                    updated_at
-               ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13,datetime('now'))
+               ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,datetime('now'))
                ON CONFLICT(source_id, relative_path) DO UPDATE SET
                    card_id=excluded.card_id, title=excluded.title, card_type=excluded.card_type,
                    status=excluded.status, version=excluded.version, content_hash=excluded.content_hash,
                    metadata_json=excluded.metadata_json, body=excluded.body,
-                   eligible=excluded.eligible, issue=excluded.issue, active=1,
+                   eligible=excluded.eligible, classification=excluded.classification,
+                   issue=excluded.issue, active=1,
                    last_seen_sync=excluded.last_seen_sync, updated_at=datetime('now')"#,
         )
         .bind(source_id)
@@ -133,6 +155,7 @@ pub async fn sync_knowledge_vault(
         .bind(document.metadata.to_string())
         .bind(&document.body)
         .bind(i64::from(document.eligible))
+        .bind(&document.classification)
         .bind(&document.issue)
         .bind(&sync_token)
         .execute(&mut *transaction)
@@ -175,6 +198,9 @@ pub async fn sync_knowledge_vault(
         unchanged,
         deactivated,
         eligible_count,
+        pending_review_count,
+        ignored_count,
+        restricted_count,
         error_count,
         synced_at,
     })
@@ -188,7 +214,10 @@ pub async fn get_knowledge_status(
             source.last_synced_at,
             COALESCE(SUM(CASE WHEN document.active=1 THEN 1 ELSE 0 END),0) AS active_count,
             COALESCE(SUM(CASE WHEN document.active=1 AND document.eligible=1 THEN 1 ELSE 0 END),0) AS eligible_count,
-            COALESCE(SUM(CASE WHEN document.active=1 AND document.issue IS NOT NULL THEN 1 ELSE 0 END),0) AS error_count
+            COALESCE(SUM(CASE WHEN document.active=1 AND document.classification='pending_review' THEN 1 ELSE 0 END),0) AS pending_review_count,
+            COALESCE(SUM(CASE WHEN document.active=1 AND document.classification='ignored' THEN 1 ELSE 0 END),0) AS ignored_count,
+            COALESCE(SUM(CASE WHEN document.active=1 AND document.classification='restricted' THEN 1 ELSE 0 END),0) AS restricted_count,
+            COALESCE(SUM(CASE WHEN document.active=1 AND document.classification IN ('invalid','duplicate') THEN 1 ELSE 0 END),0) AS error_count
         FROM knowledge_sources source
         LEFT JOIN knowledge_documents document ON document.source_id=source.id"#;
     let result = if let Some(path) = vault_path {
@@ -212,8 +241,18 @@ pub async fn get_knowledge_status(
         last_synced_at: None,
         active_count: 0,
         eligible_count: 0,
+        pending_review_count: 0,
+        ignored_count: 0,
+        restricted_count: 0,
         error_count: 0,
     }))
+}
+
+fn classification_count(scan: &VaultScan, classification: &str) -> usize {
+    scan.documents
+        .iter()
+        .filter(|item| item.classification == classification)
+        .count()
 }
 
 #[cfg(test)]
@@ -229,6 +268,9 @@ mod knowledge_sync_tests {
             .await
             .unwrap();
         pool.execute(KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
+            .await
+            .unwrap();
         pool
     }
 
@@ -249,6 +291,12 @@ mod knowledge_sync_tests {
             metadata: serde_json::json!({"id": id}),
             body: "正文".into(),
             eligible,
+            classification: if eligible {
+                "eligible"
+            } else {
+                "pending_review"
+            }
+            .into(),
             issue: None,
         }
     }
@@ -323,6 +371,7 @@ mod knowledge_sync_tests {
     async fn parse_failures_are_indexed_but_never_eligible() {
         let pool = pool().await;
         let mut invalid = document("broken.md", "", "hash-b", false);
+        invalid.classification = "invalid".into();
         invalid.issue = Some("YAML frontmatter 未闭合".into());
         sync_knowledge_vault(&pool, r"C:\Vault", &scan(vec![invalid]))
             .await
@@ -334,9 +383,84 @@ mod knowledge_sync_tests {
     }
 
     #[tokio::test]
+    async fn reports_beginner_friendly_document_categories() {
+        let pool = pool().await;
+        let eligible = document("approved.md", "PF-001", "hash-a", true);
+        let pending = document("pending.md", "PF-002", "hash-b", false);
+        let mut ignored = document("README.md", "", "hash-c", false);
+        ignored.classification = "ignored".into();
+        ignored.status.clear();
+        let mut restricted = document("restricted.md", "PF-003", "hash-d", false);
+        restricted.classification = "restricted".into();
+        restricted.issue = Some("检测到个人或受限信息，正文未进入索引".into());
+        let mut invalid = document("broken.md", "", "hash-e", false);
+        invalid.classification = "invalid".into();
+        invalid.issue = Some("YAML frontmatter 未闭合".into());
+
+        sync_knowledge_vault(
+            &pool,
+            r"C:\Vault",
+            &scan(vec![eligible, pending, ignored, restricted, invalid]),
+        )
+        .await
+        .unwrap();
+        let status = get_knowledge_status(&pool, Some(r"C:\Vault"))
+            .await
+            .unwrap();
+
+        assert_eq!(status.eligible_count, 1);
+        assert_eq!(status.pending_review_count, 1);
+        assert_eq!(status.ignored_count, 1);
+        assert_eq!(status.restricted_count, 1);
+        assert_eq!(status.error_count, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_existing_v16_documents() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        sqlx::query("INSERT INTO knowledge_sources (id, vault_path, status) VALUES (1, 'C:\\Vault', 'ready')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (path, status, eligible, issue) in [
+            ("approved.md", "approved", 1_i64, None),
+            ("pending.md", "pending_review", 0_i64, None),
+            ("broken.md", "", 0_i64, Some("YAML frontmatter 未闭合")),
+        ] {
+            sqlx::query(
+                "INSERT INTO knowledge_documents (source_id, relative_path, status, content_hash, eligible, issue, last_seen_sync) VALUES (1, ?1, ?2, ?3, ?4, ?5, 'sync')",
+            )
+            .bind(path)
+            .bind(status)
+            .bind(path)
+            .bind(eligible)
+            .bind(issue)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
+            .await
+            .unwrap();
+        let status = get_knowledge_status(&pool, Some(r"C:\Vault"))
+            .await
+            .unwrap();
+        assert_eq!(status.eligible_count, 1);
+        assert_eq!(status.pending_review_count, 1);
+        assert_eq!(status.error_count, 1);
+    }
+
+    #[tokio::test]
     async fn rebuilds_snapshot_from_vault_scan() {
         let pool = pool().await;
         let mut invalid = document("broken.md", "", "hash-b", false);
+        invalid.classification = "invalid".into();
         invalid.issue = Some("YAML frontmatter 未闭合".into());
         let source = scan(vec![
             document("PF-001.md", "PF-001", "hash-a", true),
@@ -358,6 +482,9 @@ mod knowledge_sync_tests {
             .await
             .unwrap();
         pool.execute(KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
+            .await
+            .unwrap();
         sync_knowledge_vault(&pool, r"C:\Vault", &source)
             .await
             .unwrap();

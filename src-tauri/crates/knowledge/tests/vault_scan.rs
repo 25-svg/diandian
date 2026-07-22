@@ -49,6 +49,95 @@ fn inspects_existing_vault_without_writing_to_it() {
 }
 
 #[test]
+fn recognizes_a_vault_by_any_known_directory_without_obsidian_config() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("01-产品事实")).unwrap();
+    assert!(inspect_vault(root.path()).unwrap().valid);
+}
+
+#[test]
+fn accepts_current_vault_layout_with_pending_review_directory() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".obsidian")).unwrap();
+    for directory in [
+        "01-产品事实",
+        "02-别名与ASR纠错",
+        "03-直播案例",
+        "04-话术模块",
+        "05-人群画像",
+        "06-辅稿",
+        "07-证据索引",
+        "08-产品参数库",
+        "99-待审核",
+    ] {
+        fs::create_dir(root.path().join(directory)).unwrap();
+    }
+
+    let result = inspect_vault(root.path()).unwrap();
+    assert!(result.missing_directories.is_empty());
+}
+
+#[test]
+fn accepts_legacy_review_directory_as_an_alias() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".obsidian")).unwrap();
+    for directory in [
+        "01-产品事实",
+        "02-别名与ASR纠错",
+        "03-直播案例",
+        "04-话术模块",
+        "05-人群画像",
+        "06-辅稿",
+        "07-证据索引",
+        "08-产品参数库",
+        "09-审核逐字稿",
+    ] {
+        fs::create_dir(root.path().join(directory)).unwrap();
+    }
+
+    let result = inspect_vault(root.path()).unwrap();
+    assert!(result.missing_directories.is_empty());
+}
+
+#[test]
+fn parses_windows_newlines_and_separates_pending_cards_from_notes() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".obsidian")).unwrap();
+    write(
+        root.path(),
+        "08-产品参数库/PC-001.md",
+        "---\r\nid: PC-001\r\ntitle: 产品卡\r\ntype: product_catalog\r\nstatus: pending_review\r\nversion: 0.1.0\r\n---\r\n正文",
+    );
+    write(root.path(), "99-待审核/README.md", "# 待审核说明\r\n");
+    write(root.path(), "01-产品事实/丢失头.md", "# 这本应是一张知识卡\r\n");
+
+    let scan = scan_vault(root.path()).unwrap();
+    assert_eq!(scan.issues.len(), 1);
+    assert_eq!(scan.documents.len(), 3);
+    let pending = scan
+        .documents
+        .iter()
+        .find(|item| item.card_id == "PC-001")
+        .unwrap();
+    assert_eq!(pending.classification, "pending_review");
+    assert!(!pending.eligible);
+    let note = scan
+        .documents
+        .iter()
+        .find(|item| item.relative_path.ends_with("README.md"))
+        .unwrap();
+    assert_eq!(note.classification, "ignored");
+    assert!(note.issue.is_none());
+    let broken = scan
+        .documents
+        .iter()
+        .find(|item| item.relative_path.ends_with("丢失头.md"))
+        .unwrap();
+    assert_eq!(broken.classification, "invalid");
+    assert_eq!(broken.issue.as_deref(), Some("缺少 YAML frontmatter"));
+}
+
+#[test]
 fn indexes_only_approved_cards_and_reports_invalid_frontmatter() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join(".obsidian")).unwrap();
@@ -114,6 +203,24 @@ fn duplicate_card_ids_are_reported_and_never_eligible() {
 }
 
 #[test]
+fn restricted_documents_keep_their_security_classification_when_ids_repeat() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".obsidian")).unwrap();
+    write(root.path(), "public.md", "---\nid: DUP-SEC\ntitle: 普通知识卡\ntype: product_fact\nstatus: approved\n---\n正文");
+    write(root.path(), "restricted.md", "---\nid: DUP-SEC\ntitle: 受限知识卡\ntype: product_fact\nstatus: approved\nsensitivity: personal\n---\n手机号 13800138000");
+
+    let scan = scan_vault(root.path()).unwrap();
+    let restricted = scan
+        .documents
+        .iter()
+        .find(|item| item.relative_path == "restricted.md")
+        .unwrap();
+    assert_eq!(restricted.classification, "restricted");
+    assert_eq!(restricted.issue.as_deref(), Some("检测到个人或受限信息，正文未进入索引"));
+    assert!(restricted.body.is_empty());
+}
+
+#[test]
 #[ignore = "requires OBSIDIAN_TEST_VAULT"]
 fn scans_external_vault_without_modifying_files() {
     let path = std::env::var_os("OBSIDIAN_TEST_VAULT").expect("OBSIDIAN_TEST_VAULT");
@@ -121,10 +228,19 @@ fn scans_external_vault_without_modifying_files() {
     let before = directory_fingerprint(&root);
     let scan = scan_vault(&root).unwrap();
     let after = directory_fingerprint(&root);
+    let classification_count = |classification: &str| {
+        scan.documents
+            .iter()
+            .filter(|item| item.classification == classification)
+            .count()
+    };
     println!(
-        "documents={} eligible={} issues={} fingerprint_before={} fingerprint_after={}",
+        "documents={} eligible={} pending={} ignored={} restricted={} issues={} fingerprint_before={} fingerprint_after={}",
         scan.documents.len(),
-        scan.documents.iter().filter(|item| item.eligible).count(),
+        classification_count("eligible"),
+        classification_count("pending_review"),
+        classification_count("ignored"),
+        classification_count("restricted"),
         scan.issues.len(),
         before,
         after
@@ -134,5 +250,9 @@ fn scans_external_vault_without_modifying_files() {
         .documents
         .iter()
         .any(|item| item.status == "pending_review"));
+    assert_eq!(classification_count("eligible"), 2);
+    assert_eq!(classification_count("pending_review"), 533);
+    assert_eq!(classification_count("ignored"), 12);
+    assert_eq!(scan.issues.len(), 0);
     assert_eq!(before, after);
 }

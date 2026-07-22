@@ -457,6 +457,12 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::knowledge::KNOWLEDGE_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 17,
+            description: "add_knowledge_document_classification",
+            sql: database::knowledge::KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

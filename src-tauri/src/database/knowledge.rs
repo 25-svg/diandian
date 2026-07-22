@@ -1,7 +1,10 @@
 use super::{Database, DatabaseError};
 use knowledge::VaultScan;
 
-pub use knowledge_store::{KnowledgeStatus, KnowledgeSyncSummary, KNOWLEDGE_MIGRATION_SQL};
+pub use knowledge_store::{
+    KnowledgeStatus, KnowledgeSyncSummary, KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL,
+    KNOWLEDGE_MIGRATION_SQL,
+};
 
 impl Database {
     pub async fn sync_knowledge_vault(

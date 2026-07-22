@@ -17,8 +17,8 @@ const REQUIRED_DIRS: &[&str] = &[
     "06-辅稿",
     "07-证据索引",
     "08-产品参数库",
-    "09-审核逐字稿",
 ];
+const REVIEW_DIR_ALIASES: &[&str] = &["99-待审核", "09-审核逐字稿"];
 const EXCLUDED_DIRS: &[&str] = &[".obsidian", "90-模板", "99-待处理冲突"];
 const RESTRICTED_MESSAGE: &str = "检测到个人或受限信息，正文未进入索引";
 
@@ -53,6 +53,7 @@ pub struct KnowledgeDocument {
     pub metadata: serde_json::Value,
     pub body: String,
     pub eligible: bool,
+    pub classification: String,
     pub issue: Option<String>,
 }
 
@@ -60,6 +61,7 @@ pub struct KnowledgeDocument {
 #[serde(rename_all = "camelCase")]
 pub struct ScanIssue {
     pub relative_path: String,
+    pub classification: String,
     pub message: String,
 }
 
@@ -78,12 +80,21 @@ pub fn inspect_vault(path: &Path) -> Result<VaultInspection, KnowledgeError> {
 
     let canonical_root = path.canonicalize()?;
     let has_obsidian_config = canonical_root.join(".obsidian").is_dir();
-    let missing_directories = REQUIRED_DIRS
+    let mut missing_directories = REQUIRED_DIRS
         .iter()
         .filter(|name| !canonical_root.join(name).is_dir())
         .map(|name| (*name).to_string())
         .collect::<Vec<_>>();
-    let has_known_directory = missing_directories.len() < REQUIRED_DIRS.len();
+    if !REVIEW_DIR_ALIASES
+        .iter()
+        .any(|name| canonical_root.join(name).is_dir())
+    {
+        missing_directories.push("99-待审核（或 09-审核逐字稿）".to_string());
+    }
+    let has_known_directory = REQUIRED_DIRS
+        .iter()
+        .chain(REVIEW_DIR_ALIASES.iter())
+        .any(|name| canonical_root.join(name).is_dir());
     if !has_obsidian_config && !has_known_directory {
         return Err(KnowledgeError::InvalidVault);
     }
@@ -124,6 +135,9 @@ pub fn parse_document(vault: &Path, path: &Path) -> KnowledgeDocument {
 
     let (frontmatter, body) = match split_frontmatter(content) {
         Ok(parts) => parts,
+        Err(message) if message == "缺少 YAML frontmatter" && is_ignored_note(&relative_path) => {
+            return ignored_document(relative_path, content_hash)
+        }
         Err(message) => return invalid_document(relative_path, content_hash, message),
     };
     let yaml = match serde_yaml::from_str::<Value>(frontmatter) {
@@ -173,6 +187,25 @@ pub fn parse_document(vault: &Path, path: &Path) -> KnowledgeDocument {
         issue = Some(RESTRICTED_MESSAGE.to_string());
     }
 
+    let mut classification = if restricted {
+        "restricted"
+    } else if issue.is_some() {
+        "invalid"
+    } else if approved(&status) {
+        "eligible"
+    } else if pending_review(&status) {
+        "pending_review"
+    } else {
+        issue = Some(format!("无法识别卡片状态: {status}"));
+        "invalid"
+    }
+    .to_string();
+    let eligible = classification == "eligible";
+
+    if issue.is_some() && classification == "eligible" {
+        classification = "invalid".to_string();
+    }
+
     KnowledgeDocument {
         relative_path,
         card_id,
@@ -187,7 +220,8 @@ pub fn parse_document(vault: &Path, path: &Path) -> KnowledgeDocument {
         } else {
             body.trim().to_string()
         },
-        eligible: issue.is_none() && approved(&status),
+        eligible,
+        classification,
         issue,
     }
 }
@@ -208,7 +242,8 @@ pub fn scan_vault(path: &Path) -> Result<VaultScan, KnowledgeError> {
         }
     }
     for document in &mut documents {
-        if id_counts
+        if document.classification != "restricted"
+            && id_counts
             .get(&document.card_id)
             .copied()
             .unwrap_or_default()
@@ -216,6 +251,7 @@ pub fn scan_vault(path: &Path) -> Result<VaultScan, KnowledgeError> {
         {
             document.issue = Some(format!("知识卡 ID 重复: {}", document.card_id));
             document.eligible = false;
+            document.classification = "duplicate".to_string();
         }
     }
 
@@ -224,6 +260,7 @@ pub fn scan_vault(path: &Path) -> Result<VaultScan, KnowledgeError> {
         .filter_map(|document| {
             document.issue.as_ref().map(|message| ScanIssue {
                 relative_path: document.relative_path.clone(),
+                classification: document.classification.clone(),
                 message: message.clone(),
             })
         })
@@ -294,11 +331,15 @@ fn relative_path(vault: &Path, path: &Path) -> Option<String> {
 
 fn split_frontmatter(content: &str) -> Result<(&str, &str), String> {
     let normalized = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let rest = normalized
-        .strip_prefix("---\n")
-        .ok_or("缺少 YAML frontmatter")?;
-    let end = rest.find("\n---\n").ok_or("YAML frontmatter 未闭合")?;
-    Ok((&rest[..end], &rest[end + 5..]))
+    if let Some(rest) = normalized.strip_prefix("---\r\n") {
+        let end = rest.find("\r\n---\r\n").ok_or("YAML frontmatter 未闭合")?;
+        return Ok((&rest[..end], &rest[end + 7..]));
+    }
+    if let Some(rest) = normalized.strip_prefix("---\n") {
+        let end = rest.find("\n---\n").ok_or("YAML frontmatter 未闭合")?;
+        return Ok((&rest[..end], &rest[end + 5..]));
+    }
+    Err("缺少 YAML frontmatter".to_string())
 }
 
 fn yaml_string(value: &Value, key: &str) -> String {
@@ -323,6 +364,25 @@ fn yaml_version(value: &Value) -> String {
 
 fn approved(status: &str) -> bool {
     matches!(status, "approved" | "imported" | "已审核" | "已入库")
+}
+
+fn pending_review(status: &str) -> bool {
+    matches!(
+        status,
+        "pending_review" | "pending" | "draft" | "待审核" | "待确认"
+    )
+}
+
+fn is_ignored_note(relative_path: &str) -> bool {
+    let file_name = Path::new(relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let lower = file_name.to_ascii_lowercase();
+    lower == "readme.md"
+        || file_name == "来源说明.md"
+        || file_name == "产品参数库.md"
+        || file_name.ends_with("-品牌索引.md")
 }
 
 fn is_restricted(metadata: &Value, body: &str) -> bool {
@@ -360,6 +420,24 @@ fn invalid_document(
         metadata: serde_json::Value::Null,
         body: String::new(),
         eligible: false,
+        classification: "invalid".to_string(),
         issue: Some(message),
+    }
+}
+
+fn ignored_document(relative_path: String, content_hash: String) -> KnowledgeDocument {
+    KnowledgeDocument {
+        relative_path,
+        card_id: String::new(),
+        title: String::new(),
+        card_type: String::new(),
+        status: String::new(),
+        version: "1".to_string(),
+        content_hash,
+        metadata: serde_json::Value::Null,
+        body: String::new(),
+        eligible: false,
+        classification: "ignored".to_string(),
+        issue: None,
     }
 }

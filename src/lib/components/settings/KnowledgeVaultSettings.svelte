@@ -6,9 +6,11 @@
     AlertTriangle,
     CheckCircle2,
     Database,
+    FileText,
     FolderOpen,
     Loader2,
     RefreshCw,
+    ShieldAlert,
   } from "lucide-svelte";
   import {
     friendlyKnowledgeError,
@@ -29,6 +31,9 @@
     lastSyncedAt: null,
     activeCount: 0,
     eligibleCount: 0,
+    pendingReviewCount: 0,
+    ignoredCount: 0,
+    restrictedCount: 0,
     errorCount: 0,
   };
   let inspection: VaultInspection | null = null;
@@ -121,12 +126,6 @@
           {#if status.connected}
             <p class="mt-2 break-all text-xs text-gray-500 dark:text-gray-400">{status.vaultPath}</p>
           {/if}
-          {#if status.connected && status.errorCount > 0}
-            <p class="mt-2 flex items-center gap-1.5 text-sm text-amber-700 dark:text-amber-300">
-              <AlertTriangle class="h-4 w-4" />
-              <span>查看需要处理的文件：共 {status.errorCount} 个</span>
-            </p>
-          {/if}
         </div>
 
         <div class="flex shrink-0 items-center gap-2">
@@ -146,6 +145,52 @@
           {/if}
         </div>
       </div>
+
+      {#if status.connected}
+        <div class="mt-4 grid gap-2 border-t border-gray-100 pt-4 sm:grid-cols-2 dark:border-gray-700">
+          <div class="flex items-start gap-2 text-sm">
+            <CheckCircle2 class="mt-0.5 h-4 w-4 shrink-0 text-green-600" />
+            <div>
+              <p class="font-medium text-gray-800 dark:text-gray-100">可正式检索：{status.eligibleCount} 张</p>
+              <p class="text-xs text-gray-500 dark:text-gray-400">已审核，可用于直播复盘和辅稿生成</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-2 text-sm">
+            <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+            <div>
+              <p class="font-medium text-gray-800 dark:text-gray-100">等待人工审核：{status.pendingReviewCount} 张</p>
+              <p class="text-xs text-gray-500 dark:text-gray-400">审核通过后才会提供给分析模型</p>
+            </div>
+          </div>
+          {#if status.ignoredCount > 0}
+            <div class="flex items-start gap-2 text-sm">
+              <FileText class="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
+              <div>
+                <p class="font-medium text-gray-800 dark:text-gray-100">说明文档：{status.ignoredCount} 篇</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">README 和目录索引，无需处理</p>
+              </div>
+            </div>
+          {/if}
+          {#if status.restrictedCount > 0}
+            <div class="flex items-start gap-2 text-sm">
+              <ShieldAlert class="mt-0.5 h-4 w-4 shrink-0 text-orange-500" />
+              <div>
+                <p class="font-medium text-gray-800 dark:text-gray-100">受限内容：{status.restrictedCount} 张</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">含个人或受限信息，正文不会进入索引</p>
+              </div>
+            </div>
+          {/if}
+          {#if status.errorCount > 0}
+            <div class="flex items-start gap-2 text-sm text-red-700 dark:text-red-300">
+              <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <p class="font-medium">格式问题：{status.errorCount} 个</p>
+                <p class="text-xs">需要补全字段、修复 YAML 或处理重复 ID</p>
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
 
       {#if inspection && inspection.missingDirectories.length > 0}
         <div class="mt-4 border-t border-gray-100 pt-3 text-sm text-gray-600 dark:border-gray-700 dark:text-gray-300">

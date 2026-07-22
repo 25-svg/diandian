@@ -5,6 +5,9 @@ export type KnowledgeStatus = {
   lastSyncedAt: string | null;
   activeCount: number;
   eligibleCount: number;
+  pendingReviewCount: number;
+  ignoredCount: number;
+  restrictedCount: number;
   errorCount: number;
 };
 
@@ -15,6 +18,9 @@ export type KnowledgeSyncSummary = {
   unchanged: number;
   deactivated: number;
   eligibleCount: number;
+  pendingReviewCount: number;
+  ignoredCount: number;
+  restrictedCount: number;
   errorCount: number;
   syncedAt: string;
 };
@@ -41,17 +47,43 @@ export function knowledgeStatusPresentation(status: KnowledgeStatus): KnowledgeS
       detail: "选择 Obsidian 知识库文件夹后即可同步",
     };
   }
+  const knowledgeCardCount = Math.max(0, status.activeCount - status.ignoredCount);
+  const categories = [
+    `可用 ${status.eligibleCount}`,
+    status.pendingReviewCount > 0 ? `待审核 ${status.pendingReviewCount}` : "",
+    status.restrictedCount > 0 ? `受限 ${status.restrictedCount}` : "",
+    status.errorCount > 0 ? `异常 ${status.errorCount}` : "",
+  ].filter(Boolean).join("，");
+  const ignored = status.ignoredCount > 0
+    ? `；另忽略 ${status.ignoredCount} 篇说明文档`
+    : "";
+  const detail = `知识卡 ${knowledgeCardCount} 张：${categories}${ignored}`;
+
   if (status.status === "degraded" || status.errorCount > 0) {
     return {
       tone: "warning",
-      label: `有 ${status.errorCount} 个文件需要处理`,
-      detail: `已同步 ${status.activeCount} 张卡片，${status.eligibleCount} 张可用于正式检索`,
+      label: `有 ${status.errorCount} 个格式问题需要处理`,
+      detail,
+    };
+  }
+  if (status.pendingReviewCount > 0) {
+    return {
+      tone: "warning",
+      label: `有 ${status.pendingReviewCount} 张卡片等待审核`,
+      detail,
+    };
+  }
+  if (status.restrictedCount > 0) {
+    return {
+      tone: "warning",
+      label: `有 ${status.restrictedCount} 张受限卡片未收录`,
+      detail,
     };
   }
   return {
     tone: "success",
     label: "知识库已就绪",
-    detail: `已同步 ${status.activeCount} 张卡片，${status.eligibleCount} 张可用于正式检索`,
+    detail,
   };
 }
 
