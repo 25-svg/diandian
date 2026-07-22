@@ -619,14 +619,14 @@ fn collect_chunk_cues(
             } else {
                 &row.raw_srt
             };
-            let cues = parse_srt(value)
+            let cues = parse_srt_cues(value)
                 .map_err(|error| format!("checkpoint recovery error for chunk {index}: {error}"))?;
             Ok((*start_ms, cues))
         })
         .collect()
 }
 
-fn parse_srt(value: &str) -> Result<Vec<SrtCue>, String> {
+pub fn parse_srt_cues(value: &str) -> Result<Vec<SrtCue>, String> {
     let normalized = value.replace("\r\n", "\n");
     normalized
         .split("\n\n")

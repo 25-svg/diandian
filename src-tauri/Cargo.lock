@@ -741,6 +741,7 @@ dependencies = [
  "knowledge-writer",
  "log",
  "m3u8-rs 5.0.5",
+ "master-builder",
  "master-ingest",
  "master-script",
  "master-script-store",
@@ -3944,6 +3945,16 @@ dependencies = [
  "log",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "master-builder"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

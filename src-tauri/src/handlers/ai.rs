@@ -57,7 +57,7 @@ pub async fn minimax_chat(
     request_minimax_text(&api_key, &system_prompt, messages, 4096).await
 }
 
-async fn request_minimax_text(
+pub(crate) async fn request_minimax_text(
     api_key: &str,
     system_prompt: &str,
     messages: Vec<Value>,

@@ -1,5 +1,9 @@
-use crate::database::master_script::NewMasterSource;
+use crate::database::master_script::{
+    MasterChunkRow, MasterScriptRow, MasterSourceRow, NewMasterSection, NewMasterSource,
+    NewMasterVersion,
+};
 use crate::handlers::video::resolve_video_transcript_context;
+use crate::master_script::{builder, model};
 use crate::master_script::{
     parameter_card_from_record, resume_master_ingest as run_resume_master_ingest,
     start_master_ingest as run_start_master_ingest, DatabaseCheckpointStore,
@@ -7,11 +11,17 @@ use crate::master_script::{
 };
 use crate::state::State;
 use crate::state_type;
+use master_builder::{
+    validate_master_draft, BuilderIssue, MasterDraft, MasterDraftValidation, MasterSectionKind,
+    ParameterFactCard, TranscriptCue,
+};
 use master_ingest::{
     select_parameter_cards, validate_resume_source, IngestRequest, IngestStatus, SourceIdentity,
     MAX_PARAMETER_CARDS,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 #[cfg(feature = "gui")]
@@ -26,6 +36,38 @@ pub struct MasterVideoIngestRequest {
     pub recognized_terms: Vec<String>,
     #[serde(default)]
     pub manually_selected_card_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPreviewRequest {
+    pub source_id: i64,
+    pub script_key: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishMasterRequest {
+    pub source_id: i64,
+    pub script_key: String,
+    pub draft: MasterDraft,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPreview {
+    pub source_id: i64,
+    pub script_key: String,
+    pub draft: MasterDraft,
+    pub validation: MasterDraftValidation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterScriptStatus {
+    pub source: MasterSourceRow,
+    pub chunks: Vec<MasterChunkRow>,
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -86,6 +128,268 @@ pub async fn resume_master_ingest(
         prepared.artifacts,
     )
     .await
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn preview_master_script(
+    state: state_type!(),
+    request: MasterPreviewRequest,
+) -> Result<MasterPreview, String> {
+    let script_key = builder::safe_key(&request.script_key)?;
+    let truth = load_master_truth(&state, request.source_id).await?;
+    let api_key = state.config.read().await.openai_api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("MiniMax API Key 尚未配置，无法整理母稿".into());
+    }
+    let draft = model::generate_master_draft(
+        &api_key,
+        &request.title,
+        &truth.transcript,
+        &truth.parameter_cards,
+    )
+    .await?;
+    let validation = validate_with_review_gate(
+        &draft,
+        &truth.transcript,
+        &truth.parameter_cards,
+        truth.pending_critical_count,
+    );
+    Ok(MasterPreview {
+        source_id: request.source_id,
+        script_key,
+        draft,
+        validation,
+    })
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn publish_master_script(
+    state: state_type!(),
+    request: PublishMasterRequest,
+) -> Result<MasterScriptRow, String> {
+    let script_key = builder::safe_key(&request.script_key)?;
+    let truth = load_master_truth(&state, request.source_id).await?;
+    let validation = validate_with_review_gate(
+        &request.draft,
+        &truth.transcript,
+        &truth.parameter_cards,
+        truth.pending_critical_count,
+    );
+    if !validation.publishable {
+        return Err(format!(
+            "母稿仍有 {} 项阻断问题，请先返回预览修正",
+            validation.blocking_issues.len()
+        ));
+    }
+    let vault = configured_vault(&state).await?;
+    let base = PathBuf::from("10-企业母稿").join(&script_key).join("V1.0");
+    let index_relative = base.join("README.md");
+    let index = builder::render_master_index(&script_key, &request.draft);
+    let mut files = vec![(index_relative.clone(), index.clone())];
+    for section in &request.draft.sections {
+        let section_key = builder::safe_key(&section.section_key)?;
+        files.push((
+            base.join(format!("{:02}-{section_key}.md", section.position)),
+            builder::render_master_section(&script_key, section),
+        ));
+    }
+    let sections = request
+        .draft
+        .sections
+        .iter()
+        .map(section_to_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut created = Vec::<PathBuf>::new();
+    for (relative, content) in files {
+        if let Err(error) = write_new_master_file(&vault, &relative, &content, &mut created).await {
+            cleanup_created_files(&vault, &created).await;
+            return Err(error);
+        }
+    }
+    let published = state
+        .db
+        .publish_master_version(NewMasterVersion {
+            script_key: script_key.clone(),
+            version: "1.0.0".into(),
+            source_id: request.source_id,
+            title: request.draft.title.clone(),
+            index_relative_path: normalized_path(&index_relative),
+            content_hash: builder::content_hash(&index),
+            sections,
+        })
+        .await;
+    match published {
+        Ok(row) => Ok(row),
+        Err(error) => {
+            cleanup_created_files(&vault, &created).await;
+            Err(error.to_string())
+        }
+    }
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_master_script_status(
+    state: state_type!(),
+    source_id: i64,
+) -> Result<MasterScriptStatus, String> {
+    Ok(MasterScriptStatus {
+        source: state
+            .db
+            .get_master_source(source_id)
+            .await
+            .map_err(String::from)?,
+        chunks: state
+            .db
+            .list_master_chunks(source_id)
+            .await
+            .map_err(String::from)?,
+    })
+}
+
+struct MasterTruth {
+    transcript: Vec<TranscriptCue>,
+    parameter_cards: Vec<ParameterFactCard>,
+    pending_critical_count: usize,
+}
+
+async fn load_master_truth(state: &State, source_id: i64) -> Result<MasterTruth, String> {
+    let source = state
+        .db
+        .get_master_source(source_id)
+        .await
+        .map_err(String::from)?;
+    let video_id = source
+        .source_key
+        .strip_prefix("video:")
+        .ok_or("当前只支持从已导入视频生成母稿")?
+        .parse::<i64>()
+        .map_err(|error| error.to_string())?;
+    let context = resolve_video_transcript_context(state, video_id).await?;
+    if context.media_file.to_string_lossy() != source.media_path {
+        return Err("母稿来源视频路径已变化，请重新导入".into());
+    }
+    let bundle =
+        crate::subtitle_generator::transcript_artifacts::TranscriptArtifactStore::load_from_dir(
+            context.source,
+            &context.artifact_dir,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let transcript = master_ingest::parse_srt_cues(&bundle.corrected_srt)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, cue)| TranscriptCue {
+            id: (index + 1) as u64,
+            start_ms: cue.start_ms,
+            end_ms: cue.end_ms,
+            text: cue.text,
+        })
+        .collect();
+    let parameter_cards = state
+        .db
+        .list_asr_parameter_cards()
+        .await
+        .map_err(String::from)?
+        .into_iter()
+        .map(|record| ParameterFactCard {
+            card_id: record.card_id,
+            static_terms: vec![record.title],
+        })
+        .collect();
+    Ok(MasterTruth {
+        transcript,
+        parameter_cards,
+        pending_critical_count: bundle.pending_critical_count,
+    })
+}
+
+fn validate_with_review_gate(
+    draft: &MasterDraft,
+    transcript: &[TranscriptCue],
+    cards: &[ParameterFactCard],
+    pending_critical_count: usize,
+) -> MasterDraftValidation {
+    let mut validation = validate_master_draft(draft, transcript, cards);
+    if pending_critical_count > 0 {
+        validation.blocking_issues.push(BuilderIssue {
+            code: "pending_critical_transcript_review".into(),
+            message: format!("还有 {pending_critical_count} 条关键逐字稿纠错待人工确认"),
+            section_key: None,
+        });
+        validation.publishable = false;
+    }
+    validation
+}
+
+async fn configured_vault(state: &State) -> Result<PathBuf, String> {
+    let path = state.config.read().await.knowledge_vault_path.clone();
+    if path.trim().is_empty() {
+        return Err("尚未连接 Obsidian 知识库".into());
+    }
+    let path = PathBuf::from(path);
+    if !path.is_dir() {
+        return Err("Obsidian 知识库目录不可用".into());
+    }
+    Ok(path)
+}
+
+async fn write_new_master_file(
+    vault: &Path,
+    relative: &Path,
+    content: &str,
+    created: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    crate::knowledge_writer::write_verified_markdown(vault, relative, true, content).await?;
+    created.push(relative.to_path_buf());
+    Ok(())
+}
+
+async fn cleanup_created_files(vault: &Path, created: &[PathBuf]) {
+    for relative in created.iter().rev() {
+        let _ = tokio::fs::remove_file(vault.join(relative)).await;
+    }
+}
+
+fn section_to_row(
+    section: &master_builder::MasterSectionDraft,
+) -> Result<NewMasterSection, String> {
+    Ok(NewMasterSection {
+        section_key: section.section_key.clone(),
+        position: i64::from(section.position),
+        section_kind: match &section.kind {
+            MasterSectionKind::Opening => master_script::MasterSectionKind::Opening,
+            MasterSectionKind::Product => master_script::MasterSectionKind::Product,
+            MasterSectionKind::Transition => master_script::MasterSectionKind::Transition,
+            MasterSectionKind::Scenario => master_script::MasterSectionKind::Scenario,
+            MasterSectionKind::Closing => master_script::MasterSectionKind::Closing,
+        },
+        product_card_id: section.product_card_id.clone(),
+        title: section
+            .host_text
+            .lines()
+            .next()
+            .unwrap_or("章节")
+            .to_string(),
+        source_start_ms: i64::try_from(section.source_start_ms)
+            .map_err(|error| error.to_string())?,
+        source_end_ms: i64::try_from(section.source_end_ms).map_err(|error| error.to_string())?,
+        host_text: section.host_text.clone(),
+        master_text: section.master_text.clone(),
+        metadata_json: json!({
+            "sourceCueIds": section.source_cue_ids,
+            "textOrigin": section.text_origin,
+            "conditions": section.conditions,
+            "dynamicFields": section.dynamic_fields,
+        })
+        .to_string(),
+    })
+}
+
+fn normalized_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 struct PreparedVideoIngest {
