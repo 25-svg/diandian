@@ -316,10 +316,18 @@ fn normalize_model_text_origins(sections: &mut serde_json::Value) {
             .trim()
             .to_ascii_lowercase()
             .replace(['-', ' '], "_");
-        let canonical = match normalized.as_str() {
-            "verbatim" | "original" | "host" | "host_speech" => "host_speech",
-            "rewrite_candidate" | "ai_rewrite_candidate" => "ai_rewrite_candidate",
-            _ => continue,
+        let canonical = if matches!(normalized.as_str(), "verbatim" | "original" | "host")
+            || normalized == "host_speech"
+            || (normalized.contains("host") && normalized.contains("original"))
+        {
+            "host_speech"
+        } else if normalized == "rewrite_candidate"
+            || normalized == "ai_rewrite_candidate"
+            || normalized.contains("rewrite")
+        {
+            "ai_rewrite_candidate"
+        } else {
+            continue;
         };
         *origin = serde_json::Value::String(canonical.to_owned());
     }
@@ -436,7 +444,13 @@ pub fn master_system_prompt() -> &'static str {
 2. 每个章节必须引用真实 sourceCueIds，并填写这些 cue 的精确 sourceStartMs/sourceEndMs。
 3. 参数卡只用于确认静态商品名称和型号，不得推断价格、库存、优惠、成色、链接号或成交状态。
 4. 随机问答、突发互动单独标记 kind=scenario；AI 改写只能标记 textOrigin=ai_rewrite_candidate，不能混入主播原话。
-5. 只输出本次指定 cueId 范围内的章节；kind 只能是 opening/product/transition/scenario/closing。"#
+5. 只输出本次指定 cueId 范围内的章节；kind 只能是 opening/product/transition/scenario/closing。
+6. Every section must use exactly these camelCase fields: sectionKey, kind, productCardId, sourceCueIds, sourceStartMs, sourceEndMs, hostText, masterText, textOrigin, conditions, dynamicFields.
+7. textOrigin must be exactly host_speech for verbatim host words. Never output verbatim, original, host_original, or any other synonym.
+8. kind must be exactly one of opening, product, transition, scenario, closing.
+9. sourceCueIds must be an array of integer cue IDs. sourceStartMs and sourceEndMs must be integer milliseconds.
+10. conditions and dynamicFields must be JSON arrays. Use [] when there is no value. sectionKey must be a short unique string.
+Output schema example: {"sections":[{"sectionKey":"section-001","kind":"opening","productCardId":null,"sourceCueIds":[1,2],"sourceStartMs":0,"sourceEndMs":5000,"hostText":"主播逐字原话","masterText":"主播逐字原话","textOrigin":"host_speech","conditions":[],"dynamicFields":[]}]}"#
 }
 
 fn kind_name(kind: &MasterSectionKind) -> &'static str {

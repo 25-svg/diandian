@@ -68,11 +68,12 @@ fn fills_missing_non_business_structure_fields() {
 
 #[test]
 fn normalizes_model_text_origin_aliases() {
-    let json = r#"{"sections":[{"kind":"opening","sourceCueIds":[1],"sourceStartMs":0,"sourceEndMs":2000,"hostText":"欢迎来到直播间","masterText":"欢迎来到直播间","textOrigin":"verbatim"}]}"#;
+    let json = r#"{"sections":[{"kind":"opening","sourceCueIds":[1],"sourceStartMs":0,"sourceEndMs":2000,"hostText":"欢迎来到直播间","masterText":"欢迎来到直播间","textOrigin":"verbatim"},{"kind":"closing","sourceCueIds":[2],"sourceStartMs":2000,"sourceEndMs":4000,"hostText":"感谢大家","masterText":"感谢大家","textOrigin":"host_original"}]}"#;
 
     let sections = parse_model_sections(json).unwrap();
 
     assert_eq!(sections[0].text_origin, TextOrigin::HostSpeech);
+    assert_eq!(sections[1].text_origin, TextOrigin::HostSpeech);
 }
 
 fn cue(id: u64, start_ms: u64, end_ms: u64, text: &str) -> TranscriptCue {
@@ -280,6 +281,10 @@ fn model_prompt_forbids_rewriting_and_dynamic_fact_inference() {
         "不得推断价格",
         "kind=scenario",
         "ai_rewrite_candidate",
+        "textOrigin must be exactly host_speech",
+        "sectionKey",
+        "sourceStartMs",
+        "dynamicFields",
     ] {
         assert!(prompt.contains(required), "missing prompt rule: {required}");
     }
