@@ -95,6 +95,7 @@
                 "flv",
                 "m4v",
                 "webm",
+                "ts",
               ],
             },
           ],
@@ -163,10 +164,11 @@
         "video/x-m4v",
         "video/webm",
         "video/x-matroska",
+        "video/mp2t",
       ];
       if (
         allowedTypes.includes(file.type) ||
-        file.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|m4v|webm)$/i)
+        file.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|m4v|webm|ts)$/i)
       ) {
         // 提前设置文件信息，提升用户体验
         selectedFileName = file.name;
@@ -176,7 +178,7 @@
         await uploadFile(file);
       } else {
         alert(
-          "请选择支持的视频文件格式 (MP4, MKV, AVI, MOV, WMV, FLV, M4V, WebM)",
+          "请选择支持的视频文件格式 (MP4, MKV, AVI, MOV, WMV, FLV, M4V, WebM, TS)",
         );
       }
     }
@@ -252,11 +254,12 @@
         "video/x-m4v",
         "video/webm",
         "video/x-matroska",
+        "video/mp2t",
       ];
       for (const file of files) {
         if (
           !allowedTypes.includes(file.type) &&
-          !file.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|m4v|webm)$/i)
+          !file.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|m4v|webm|ts)$/i)
         ) {
           throw new Error(`不支持的文件格式: ${file.name}`);
         }
@@ -532,7 +535,7 @@
   <input
     bind:this={fileInput}
     type="file"
-    accept=".mp4,.mkv,.avi,.mov,.wmv,.flv,.m4v,.webm,video/*"
+    accept=".mp4,.mkv,.avi,.mov,.wmv,.flv,.m4v,.webm,.ts,video/*"
     multiple
     style="display: none"
     on:change={handleFileInputChange}
@@ -667,7 +670,7 @@
                   </p>
                 {/if}
                 <p class="text-xs text-gray-500 dark:text-gray-500">
-                  支持 MP4, MKV, AVI, MOV, WMV, FLV, M4V, WebM 格式
+                  支持 MP4, MKV, AVI, MOV, WMV, FLV, M4V, WebM, TS 格式
                 </p>
               </div>
             {/if}

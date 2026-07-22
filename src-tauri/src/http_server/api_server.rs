@@ -1674,7 +1674,7 @@ async fn handler_upload_files(
                 .to_lowercase();
 
             // 使用与后端相同的格式验证逻辑
-            let supported_extensions = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm"];
+            let supported_extensions = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm", "ts"];
             if !supported_extensions.iter().any(|&ext| ext == extension) {
                 return Err(ApiError(format!(
                     "不支持的文件格式: {}。支持的格式: {}",
@@ -1754,7 +1754,7 @@ async fn handler_upload_and_import_files(
                             .to_lowercase();
 
                         let supported_extensions =
-                            ["mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm"];
+                            ["mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm", "ts"];
                         if !supported_extensions.iter().any(|&ext| ext == extension) {
                             return Err(ApiError(format!(
                                 "不支持的文件格式: {}。支持的格式: {}",
@@ -2143,6 +2143,7 @@ async fn handler_hls(
         Some("aac") => "audio/aac",
         Some("mp4") => "video/mp4",
         Some("webm") => "video/webm",
+        Some("ts") => "video/mp2t",
         Some("m4s") => "video/iso.segment",
         _ => "application/octet-stream",
     };
