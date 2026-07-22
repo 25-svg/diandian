@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from "svelte";
-  import { Check, X } from "lucide-svelte";
+  import { Check, Loader2, X } from "lucide-svelte";
   import MasterBuildProgress from "./MasterBuildProgress.svelte";
   import MasterPreviewPanel from "./MasterPreview.svelte";
   import { previewMasterScript, publishMasterScript, startMasterIngest, type MasterPreview } from "../../masterScript";
@@ -14,18 +14,20 @@
   let error = "";
   let preview: MasterPreview | null = null;
   let busy = true;
+  let structuring = false;
   let scriptKey = `MS-${new Date().toISOString().slice(0,10).replaceAll("-", "")}`;
 
   async function build(): Promise<void> {
-    busy = true; failed = false; error = "";
+    busy = true; structuring = false; failed = false; error = "";
     try {
       const result = await startMasterIngest({ videoId, title: videoTitle });
       sourceId = result.sourceId; completed = result.status.completed; total = result.status.total;
       failed = result.status.status === "failed";
       if (failed) { error = result.status.error || "转写中断"; return; }
+      structuring = true;
       preview = await previewMasterScript(sourceId, scriptKey, videoTitle);
     } catch (reason: any) { failed = true; error = reason?.message || String(reason); }
-    finally { busy = false; }
+    finally { busy = false; structuring = false; }
   }
 
   async function publish(): Promise<void> {
@@ -44,7 +46,8 @@
     <div class="body">
       <label>母稿编号<input bind:value={scriptKey} disabled={Boolean(preview) || busy} /></label>
       <p class="hint">系统会自动使用公司确认的参数卡纠正产品名和型号；价格、库存和优惠仍以主播原话为准。</p>
-      {#if !preview}<MasterBuildProgress {completed} {total} {failed} message={error} onRetry={failed ? build : null}/>{/if}
+      {#if !preview && !structuring}<MasterBuildProgress {completed} {total} {failed} message={error} onRetry={failed ? build : null}/>{/if}
+      {#if !preview && structuring}<div class="structuring"><Loader2 class="spin" size={20}/><div><strong>正在整理母稿</strong><p>逐字稿已完成，正在并行提取章节和主播原话，请勿关闭窗口。</p></div></div>{/if}
       {#if preview}
         {#if preview.validation.blockingIssues.length}<div class="warning">{preview.validation.blockingIssues[0].message}</div>{/if}
         <MasterPreviewPanel {preview}/>
@@ -56,5 +59,5 @@
 </div>
 
 <style>
-  .backdrop{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:24px;background:rgba(15,23,42,.28);backdrop-filter:blur(12px)}.dialog{display:flex;width:min(860px,96vw);max-height:90vh;flex-direction:column;overflow:hidden;border:1px solid rgba(255,255,255,.7);border-radius:12px;background:#f7f7f9;box-shadow:0 24px 70px rgba(15,23,42,.22)}header,footer{display:flex;align-items:center;padding:16px 20px;background:rgba(255,255,255,.88)}header{border-bottom:1px solid #e5e7eb}header h2{margin:0;font-size:18px}header p{margin:3px 0 0;color:#6b7280;font-size:13px}.icon{margin-left:auto;border:0;background:none;cursor:pointer}.body{display:grid;gap:14px;overflow:auto;padding:18px 20px}label{display:grid;gap:6px;color:#374151;font-size:13px}input{height:38px;padding:0 11px;border:1px solid #d1d5db;border-radius:7px;background:#fff}.hint{margin:0;color:#6b7280;font-size:13px;line-height:1.5}.warning{padding:10px 12px;border:1px solid #f5d38a;border-radius:7px;background:#fff8e8;color:#8a5a00;font-size:13px}footer{justify-content:flex-end;gap:9px;border-top:1px solid #e5e7eb}footer button{display:inline-flex;height:38px;align-items:center;gap:6px;padding:0 15px;border-radius:7px;cursor:pointer}.secondary{border:1px solid #d1d5db;background:#fff}.primary{border:0;background:#007aff;color:#fff}.primary:disabled{opacity:.45;cursor:not-allowed}
+  .backdrop{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:24px;background:rgba(15,23,42,.28);backdrop-filter:blur(12px)}.dialog{display:flex;width:min(860px,96vw);max-height:90vh;flex-direction:column;overflow:hidden;border:1px solid rgba(255,255,255,.7);border-radius:12px;background:#f7f7f9;box-shadow:0 24px 70px rgba(15,23,42,.22)}header,footer{display:flex;align-items:center;padding:16px 20px;background:rgba(255,255,255,.88)}header{border-bottom:1px solid #e5e7eb}header h2{margin:0;font-size:18px}header p{margin:3px 0 0;color:#6b7280;font-size:13px}.icon{margin-left:auto;border:0;background:none;cursor:pointer}.body{display:grid;gap:14px;overflow:auto;padding:18px 20px}label{display:grid;gap:6px;color:#374151;font-size:13px}input{height:38px;padding:0 11px;border:1px solid #d1d5db;border-radius:7px;background:#fff}.hint{margin:0;color:#6b7280;font-size:13px;line-height:1.5}.structuring{display:flex;align-items:center;gap:12px;padding:16px;border:1px solid #cfe3ff;border-radius:8px;background:#f4f8ff;color:#1f2937}.structuring p{margin:4px 0 0;color:#64748b;font-size:13px}:global(.spin){animation:spin 1s linear infinite}.warning{padding:10px 12px;border:1px solid #f5d38a;border-radius:7px;background:#fff8e8;color:#8a5a00;font-size:13px}footer{justify-content:flex-end;gap:9px;border-top:1px solid #e5e7eb}footer button{display:inline-flex;height:38px;align-items:center;gap:6px;padding:0 15px;border-radius:7px;cursor:pointer}.secondary{border:1px solid #d1d5db;background:#fff}.primary{border:0;background:#007aff;color:#fff}.primary:disabled{opacity:.45;cursor:not-allowed}@keyframes spin{to{transform:rotate(360deg)}}
 </style>
