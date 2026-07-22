@@ -195,6 +195,7 @@ mod master_script_database_tests {
             source_key: "video:7".into(),
             source_start_ms: 500,
             source_end_ms: 4_000,
+            transcript_hash: "transcript-hash".into(),
             host_text: "supporting host text".into(),
             comparison_json: "{\"matches\":[\"product\"]}".into(),
             gates_json: serde_json::to_string(&passing_gates()).unwrap(),

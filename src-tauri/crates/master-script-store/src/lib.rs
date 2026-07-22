@@ -66,6 +66,7 @@ CREATE TABLE support_script_candidates (
   source_key TEXT NOT NULL,
   source_start_ms INTEGER NOT NULL,
   source_end_ms INTEGER NOT NULL,
+  transcript_hash TEXT NOT NULL,
   host_text TEXT NOT NULL,
   comparison_json TEXT NOT NULL,
   gates_json TEXT NOT NULL,
@@ -74,7 +75,8 @@ CREATE TABLE support_script_candidates (
   admission TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending_review','approved','held','returned','rejected','merged')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  decided_at TEXT
+  decided_at TEXT,
+  UNIQUE(master_script_id, master_section_id, source_key, source_start_ms, source_end_ms, transcript_hash)
 );
 "#;
 
@@ -146,6 +148,7 @@ pub struct NewSupportCandidate {
     pub source_key: String,
     pub source_start_ms: i64,
     pub source_end_ms: i64,
+    pub transcript_hash: String,
     pub host_text: String,
     pub comparison_json: String,
     pub gates_json: String,
@@ -225,6 +228,7 @@ pub struct SupportCandidateRow {
     pub source_key: String,
     pub source_start_ms: i64,
     pub source_end_ms: i64,
+    pub transcript_hash: String,
     pub host_text: String,
     pub comparison_json: String,
     pub gates_json: String,
@@ -240,32 +244,41 @@ pub async fn create_master_source(
     pool: &SqlitePool,
     input: &NewMasterSource,
 ) -> Result<MasterSourceRow, StoreError> {
-    if let Some(existing) =
-        sqlx::query_as::<_, MasterSourceRow>("SELECT * FROM master_sources WHERE source_key = $1")
-            .bind(&input.source_key)
-            .fetch_optional(pool)
-            .await?
-    {
-        if existing.media_path == input.media_path && existing.media_hash == input.media_hash {
-            return Ok(existing);
-        }
-        return Err(invalid_state(format!(
-            "source key {} is already bound to different media",
-            input.source_key
-        )));
-    }
-
-    Ok(sqlx::query_as::<_, MasterSourceRow>(
+    let inserted = sqlx::query_as::<_, MasterSourceRow>(
         "INSERT INTO master_sources (source_kind, source_key, media_path, media_hash, duration_ms, status) \
-         VALUES ($1, $2, $3, $4, $5, 'queued') RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, 'queued') \
+         ON CONFLICT(source_key) DO NOTHING RETURNING *",
     )
     .bind(&input.source_kind)
     .bind(&input.source_key)
     .bind(&input.media_path)
     .bind(&input.media_hash)
     .bind(input.duration_ms)
-    .fetch_one(pool)
-    .await?)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(inserted) = inserted {
+        return Ok(inserted);
+    }
+
+    let existing =
+        sqlx::query_as::<_, MasterSourceRow>("SELECT * FROM master_sources WHERE source_key = $1")
+            .bind(&input.source_key)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| {
+                invalid_state(format!(
+                    "source key conflict for {} could not be resolved",
+                    input.source_key
+                ))
+            })?;
+    if same_master_source_input(&existing, input) {
+        Ok(existing)
+    } else {
+        Err(invalid_state(format!(
+            "source key {} is already bound to different immutable input",
+            input.source_key
+        )))
+    }
 }
 
 pub async fn upsert_master_chunk(
@@ -396,6 +409,12 @@ pub async fn insert_support_candidate(
             input.admission, computed_admission
         )));
     }
+    if computed_admission != CandidateAdmission::CandidateQueue {
+        return Err(invalid_state(format!(
+            "support candidates require candidate_queue admission, got {:?}",
+            computed_admission
+        )));
+    }
 
     let section_belongs_to_master = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM master_sections WHERE id = $1 AND master_script_id = $2",
@@ -410,25 +429,10 @@ pub async fn insert_support_candidate(
         ));
     }
 
-    if let Some(existing) = sqlx::query_as::<_, SupportCandidateRow>(
-        "SELECT * FROM support_script_candidates WHERE candidate_key = $1",
-    )
-    .bind(&input.candidate_key)
-    .fetch_optional(pool)
-    .await?
-    {
-        if same_candidate_payload(&existing, input, score.total(), computed_admission) {
-            return Ok(existing);
-        }
-        return Err(invalid_state(format!(
-            "candidate key {} has a different payload",
-            input.candidate_key
-        )));
-    }
-
-    Ok(sqlx::query_as::<_, SupportCandidateRow>(
-        "INSERT INTO support_script_candidates (candidate_key, master_script_id, master_section_id, source_key, source_start_ms, source_end_ms, host_text, comparison_json, gates_json, score_json, total_score, admission, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending_review') RETURNING *",
+    let inserted = sqlx::query_as::<_, SupportCandidateRow>(
+        "INSERT INTO support_script_candidates (candidate_key, master_script_id, master_section_id, source_key, source_start_ms, source_end_ms, transcript_hash, host_text, comparison_json, gates_json, score_json, total_score, admission, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending_review') \
+         ON CONFLICT DO NOTHING RETURNING *",
     )
     .bind(&input.candidate_key)
     .bind(input.master_script_id)
@@ -436,14 +440,60 @@ pub async fn insert_support_candidate(
     .bind(&input.source_key)
     .bind(input.source_start_ms)
     .bind(input.source_end_ms)
+    .bind(&input.transcript_hash)
     .bind(&input.host_text)
     .bind(&input.comparison_json)
     .bind(&input.gates_json)
     .bind(&input.score_json)
     .bind(i64::from(score.total()))
     .bind(admission_as_str(computed_admission))
-    .fetch_one(pool)
-    .await?)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(inserted) = inserted {
+        return Ok(inserted);
+    }
+
+    let by_key = sqlx::query_as::<_, SupportCandidateRow>(
+        "SELECT * FROM support_script_candidates WHERE candidate_key = $1",
+    )
+    .bind(&input.candidate_key)
+    .fetch_optional(pool)
+    .await?;
+    let by_identity = sqlx::query_as::<_, SupportCandidateRow>(
+        "SELECT * FROM support_script_candidates \
+         WHERE master_script_id = $1 AND master_section_id = $2 AND source_key = $3 \
+           AND source_start_ms = $4 AND source_end_ms = $5 AND transcript_hash = $6",
+    )
+    .bind(input.master_script_id)
+    .bind(input.master_section_id)
+    .bind(&input.source_key)
+    .bind(input.source_start_ms)
+    .bind(input.source_end_ms)
+    .bind(&input.transcript_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    let existing = match (by_key, by_identity) {
+        (Some(by_key), Some(by_identity)) if by_key.id != by_identity.id => {
+            return Err(invalid_state(
+                "candidate key and immutable identity conflict with different rows",
+            ));
+        }
+        (Some(existing), _) | (_, Some(existing)) => existing,
+        (None, None) => {
+            return Err(invalid_state(
+                "candidate conflict could not be resolved to an existing row",
+            ));
+        }
+    };
+    if same_candidate_payload(&existing, input, score.total(), computed_admission) {
+        Ok(existing)
+    } else {
+        Err(invalid_state(format!(
+            "candidate identity {} has a different immutable payload",
+            input.candidate_key
+        )))
+    }
 }
 
 pub async fn list_support_candidates(
@@ -503,13 +553,21 @@ fn same_candidate_payload(
         && existing.source_key == input.source_key
         && existing.source_start_ms == input.source_start_ms
         && existing.source_end_ms == input.source_end_ms
+        && existing.transcript_hash == input.transcript_hash
         && existing.host_text == input.host_text
         && existing.comparison_json == input.comparison_json
         && existing.gates_json == input.gates_json
         && existing.score_json == input.score_json
         && existing.total_score == i64::from(total_score)
         && existing.admission == admission_as_str(admission)
-        && existing.status == "pending_review"
+}
+
+fn same_master_source_input(existing: &MasterSourceRow, input: &NewMasterSource) -> bool {
+    existing.source_kind == input.source_kind
+        && existing.source_key == input.source_key
+        && existing.media_path == input.media_path
+        && existing.media_hash == input.media_hash
+        && existing.duration_ms == input.duration_ms
 }
 
 fn admission_as_str(admission: CandidateAdmission) -> &'static str {
@@ -529,13 +587,31 @@ fn invalid_state(message: impl Into<String>) -> StoreError {
 mod master_script_store_tests {
     use super::*;
     use master_script::{CandidateAdmission, HardGateResult, MasterSectionKind, ScoreBreakdown};
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::Executor;
+    use std::str::FromStr;
+    use std::time::Duration;
 
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        pool.execute(MASTER_SCRIPT_MIGRATION_SQL).await.unwrap();
+        pool
+    }
+
+    async fn concurrent_test_pool() -> sqlx::SqlitePool {
+        let database_name = format!("master-script-store-{}", uuid::Uuid::new_v4());
+        let options = SqliteConnectOptions::from_str(&format!(
+            "sqlite:file:{database_name}?mode=memory&cache=shared"
+        ))
+        .unwrap()
+        .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
             .await
             .unwrap();
         pool.execute(MASTER_SCRIPT_MIGRATION_SQL).await.unwrap();
@@ -617,6 +693,7 @@ mod master_script_store_tests {
             source_key: "video:7".into(),
             source_start_ms: 500,
             source_end_ms: 4_000,
+            transcript_hash: "transcript-hash".into(),
             host_text: "supporting host text".into(),
             comparison_json: "{\"matches\":[\"product\"]}".into(),
             gates_json: serde_json::to_string(&passing_gates()).unwrap(),
@@ -649,17 +726,53 @@ mod master_script_store_tests {
     }
 
     #[tokio::test]
-    async fn master_source_is_idempotent_for_same_media_and_rejects_conflicts() {
+    async fn master_source_is_idempotent_only_for_identical_immutable_input() {
         let pool = test_pool().await;
         let first = create_master_source(&pool, &source_input()).await.unwrap();
         let second = create_master_source(&pool, &source_input()).await.unwrap();
         assert_eq!(first.id, second.id);
-        let mut conflict = source_input();
-        conflict.media_hash = "other-media".into();
-        assert!(matches!(
-            create_master_source(&pool, &conflict).await,
-            Err(StoreError::InvalidMasterScriptState(_))
-        ));
+
+        let mut conflicts = Vec::new();
+        let mut source_kind = source_input();
+        source_kind.source_kind = "archive".into();
+        conflicts.push(source_kind);
+        let mut media_path = source_input();
+        media_path.media_path = r"C:\fixtures\other-master.ts".into();
+        conflicts.push(media_path);
+        let mut media_hash = source_input();
+        media_hash.media_hash = "other-media".into();
+        conflicts.push(media_hash);
+        let mut duration = source_input();
+        duration.duration_ms += 1;
+        conflicts.push(duration);
+
+        for conflict in conflicts {
+            assert!(matches!(
+                create_master_source(&pool, &conflict).await,
+                Err(StoreError::InvalidMasterScriptState(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_master_sources_return_the_same_row() {
+        let pool = concurrent_test_pool().await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                create_master_source(&pool, &source_input()).await
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.unwrap().unwrap().id);
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]));
     }
 
     #[tokio::test]
@@ -743,12 +856,111 @@ mod master_script_store_tests {
     }
 
     #[tokio::test]
+    async fn same_candidate_identity_with_different_key_returns_original_row() {
+        let (pool, master, section) = seeded_master().await;
+        let input = queued_candidate(master.id, section.id, 85);
+        let first = insert_support_candidate(&pool, &input).await.unwrap();
+        let mut retry = input;
+        retry.candidate_key = "different-caller-key".into();
+
+        let second = insert_support_candidate(&pool, &retry).await.unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.candidate_key, second.candidate_key);
+        assert_eq!(list_support_candidates(&pool, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_candidate_identity_with_conflicting_payload_is_rejected() {
+        let (pool, master, section) = seeded_master().await;
+        let input = queued_candidate(master.id, section.id, 85);
+        insert_support_candidate(&pool, &input).await.unwrap();
+        let mut conflict = input;
+        conflict.candidate_key = "different-caller-key".into();
+        conflict.host_text = "conflicting host text".into();
+
+        let error = insert_support_candidate(&pool, &conflict)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::InvalidMasterScriptState(_)));
+        assert_eq!(list_support_candidates(&pool, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_transcript_hash_creates_a_distinct_candidate_identity() {
+        let (pool, master, section) = seeded_master().await;
+        let input = queued_candidate(master.id, section.id, 85);
+        let first = insert_support_candidate(&pool, &input).await.unwrap();
+        let mut distinct = input;
+        distinct.candidate_key = "different-caller-key".into();
+        distinct.transcript_hash = "different-transcript-hash".into();
+
+        let second = insert_support_candidate(&pool, &distinct).await.unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(list_support_candidates(&pool, None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn score_84_cannot_be_persisted_as_queued() {
         let (pool, master, section) = seeded_master().await;
         let error = insert_support_candidate(&pool, &queued_candidate(master.id, section.id, 84))
             .await
             .unwrap_err();
         assert!(matches!(error, StoreError::InvalidMasterScriptState(_)));
+    }
+
+    #[tokio::test]
+    async fn review_only_candidate_is_not_inserted() {
+        let (pool, master, section) = seeded_master().await;
+        let mut input = queued_candidate(master.id, section.id, 84);
+        input.admission = CandidateAdmission::ReviewOnly;
+
+        let error = insert_support_candidate(&pool, &input).await.unwrap_err();
+
+        assert!(matches!(error, StoreError::InvalidMasterScriptState(_)));
+        assert!(list_support_candidates(&pool, Some("pending_review"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn analysis_only_candidate_is_not_inserted() {
+        let (pool, master, section) = seeded_master().await;
+        let score = ScoreBreakdown::new(20, 20, 15, 10, 4, 0).unwrap();
+        let mut input = queued_candidate(master.id, section.id, 85);
+        input.candidate_key = "candidate-analysis-only".into();
+        input.score_json = serde_json::to_string(&score).unwrap();
+        input.admission = CandidateAdmission::AnalysisOnly;
+
+        let error = insert_support_candidate(&pool, &input).await.unwrap_err();
+
+        assert!(matches!(error, StoreError::InvalidMasterScriptState(_)));
+        assert!(list_support_candidates(&pool, Some("pending_review"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_candidate_is_not_inserted() {
+        let (pool, master, section) = seeded_master().await;
+        let mut gates = passing_gates();
+        gates.facts_resolved = false;
+        let mut input = queued_candidate(master.id, section.id, 85);
+        input.candidate_key = "candidate-blocked".into();
+        input.gates_json = serde_json::to_string(&gates).unwrap();
+        input.admission = CandidateAdmission::Blocked;
+
+        let error = insert_support_candidate(&pool, &input).await.unwrap_err();
+
+        assert!(matches!(error, StoreError::InvalidMasterScriptState(_)));
+        assert!(list_support_candidates(&pool, Some("pending_review"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -766,5 +978,75 @@ mod master_script_store_tests {
             decide_support_candidate(&pool, candidate.id, "merged").await,
             Err(StoreError::InvalidMasterScriptState(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_candidate_retry_after_decision_returns_the_decided_row() {
+        let (pool, master, section) = seeded_master().await;
+        let input = queued_candidate(master.id, section.id, 85);
+        let inserted = insert_support_candidate(&pool, &input).await.unwrap();
+        let approved = decide_support_candidate(&pool, inserted.id, "approved")
+            .await
+            .unwrap();
+
+        let retried = insert_support_candidate(&pool, &input).await.unwrap();
+
+        assert_eq!(retried.id, approved.id);
+        assert_eq!(retried.status, "approved");
+        assert_eq!(list_support_candidates(&pool, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_candidate_identities_return_the_same_row() {
+        let pool = concurrent_test_pool().await;
+        let source = create_master_source(&pool, &source_input()).await.unwrap();
+        let master = publish_master_version(
+            &pool,
+            &NewMasterVersion {
+                script_key: "MS-CONCURRENT".into(),
+                version: "1.0.0".into(),
+                source_id: source.id,
+                title: "concurrent master".into(),
+                index_relative_path: "10-master-scripts/MS-CONCURRENT/V1.0.md".into(),
+                content_hash: "concurrent-master-hash".into(),
+                sections: vec![NewMasterSection {
+                    section_key: "product-1".into(),
+                    position: 1,
+                    section_kind: MasterSectionKind::Product,
+                    product_card_id: Some("product-card-1".into()),
+                    title: "Product".into(),
+                    source_start_ms: 0,
+                    source_end_ms: 30_000,
+                    host_text: "host text".into(),
+                    master_text: "master text".into(),
+                    metadata_json: "{}".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let section = list_master_sections(&pool, master.id)
+            .await
+            .unwrap()
+            .remove(0);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            let mut input = queued_candidate(master.id, section.id, 85);
+            input.candidate_key = format!("concurrent-candidate-{index}");
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                insert_support_candidate(&pool, &input).await
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.unwrap().unwrap().id);
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(list_support_candidates(&pool, None).await.unwrap().len(), 1);
     }
 }
