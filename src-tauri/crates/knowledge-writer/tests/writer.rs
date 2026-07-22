@@ -2,6 +2,7 @@ use knowledge_writer::write_verified_markdown;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 fn temporary_files(parent: &Path) -> Vec<String> {
     fs::read_dir(parent)
@@ -110,6 +111,44 @@ async fn expected_absent_refuses_to_overwrite() {
     .await
     .is_err());
     assert_eq!(fs::read_to_string(&destination).unwrap(), "original");
+    assert!(temporary_files(destination.parent().unwrap()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_expected_absent_has_exactly_one_winner_without_temp_files() {
+    let vault = tempfile::tempdir().unwrap();
+    let relative = Path::new("10-企业母稿/concurrent.md");
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+
+    for index in 0..16 {
+        let vault = vault.path().to_path_buf();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            let content = format!("writer-{index}");
+            barrier.wait().await;
+            let result = write_verified_markdown(
+                &vault,
+                Path::new("10-企业母稿/concurrent.md"),
+                true,
+                &content,
+            )
+            .await;
+            (content, result)
+        }));
+    }
+
+    let mut winners = Vec::new();
+    for task in tasks {
+        let (content, result) = task.await.unwrap();
+        if result.is_ok() {
+            winners.push(content);
+        }
+    }
+
+    assert_eq!(winners.len(), 1);
+    let destination = vault.path().join(relative);
+    assert_eq!(fs::read_to_string(&destination).unwrap(), winners[0]);
     assert!(temporary_files(destination.parent().unwrap()).is_empty());
 }
 
