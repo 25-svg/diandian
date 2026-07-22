@@ -58,6 +58,8 @@ pub struct Config {
     pub volcengine_boosting_table_id: String,
     #[serde(default)]
     pub volcengine_correct_table_id: String,
+    #[serde(default)]
+    pub knowledge_vault_path: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -185,6 +187,7 @@ impl Config {
             volcengine_resource_id: default_volcengine_resource_id(),
             volcengine_boosting_table_id: String::new(),
             volcengine_correct_table_id: String::new(),
+            knowledge_vault_path: String::new(),
         };
 
         config.save();

@@ -1,6 +1,7 @@
 pub mod account;
 pub mod ai;
 pub mod config;
+pub mod knowledge;
 pub mod macros;
 pub mod message;
 pub mod recorder;
