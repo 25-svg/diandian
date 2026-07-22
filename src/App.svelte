@@ -5,14 +5,23 @@
   import Setting from "./page/Setting.svelte";
   import Account from "./page/Account.svelte";
   import About from "./page/About.svelte";
-  import { log, onOpenUrl } from "./lib/invoker";
+  import { log, onOpenUrl, set_title } from "./lib/invoker";
   import Clip from "./page/Clip.svelte";
   import Task from "./page/Task.svelte";
   import AI from "./page/AI.svelte";
   import Archive from "./page/Archive.svelte";
+  import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
+  import type { RecordItem } from "./lib/db";
+  import type { VideoItem } from "./lib/interface";
   import { onMount } from "svelte";
 
   let active = "总览";
+  let analysisArchive: RecordItem | null = null;
+  let analysisVideo: VideoItem | null = null;
+  let analysisRefreshToken = 0;
+  onMount(() => {
+    void set_title("典典直播切片");
+  });
   onMount(async () => {
     await onOpenUrl((urls: string[]) => {
       console.log("Received Deep Link:", urls);
@@ -57,6 +66,37 @@
     });
   });
 
+  onMount(() => {
+    const openArchiveAnalysis = (event: Event) => {
+      analysisArchive = (event as CustomEvent<RecordItem>).detail;
+      analysisVideo = null;
+      analysisRefreshToken += 1;
+      active = "录播分析";
+    };
+    const openVideoAnalysis = (event: Event) => {
+      analysisVideo = (event as CustomEvent<VideoItem>).detail;
+      analysisArchive = null;
+      analysisRefreshToken += 1;
+      active = "录播分析";
+    };
+    const openArchiveTranscription = () => {
+      active = "助手";
+    };
+    window.addEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
+    window.addEventListener("bsr:open-video-analysis", openVideoAnalysis);
+    window.addEventListener("bsr:transcribe-archive", openArchiveTranscription);
+    return () => {
+      window.removeEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
+      window.removeEventListener("bsr:open-video-analysis", openVideoAnalysis);
+      window.removeEventListener("bsr:transcribe-archive", openArchiveTranscription);
+    };
+  });
+
+  // HMR can preserve this route while resetting the selected analysis source.
+  $: if (active === "录播分析" && !analysisArchive && !analysisVideo) {
+    active = "录播";
+  }
+
   log.info("App loaded");
 </script>
 
@@ -70,7 +110,7 @@
         }}
       />
     </div>
-    <div class="content bg-white dark:bg-[#2c2c2e]">
+    <div class="content">
       <div class="page" class:visible={active == "总览"}>
         <Summary />
       </div>
@@ -79,6 +119,16 @@
       </div>
       <div class="page" class:visible={active == "录播"}>
         <Archive />
+      </div>
+      <div class="page" class:visible={active == "录播分析"}>
+        <ArchiveAnalysis
+          archive={analysisArchive}
+          video={analysisVideo}
+          refreshToken={analysisRefreshToken}
+          on:back={() => {
+            active = analysisVideo ? "切片" : "录播";
+          }}
+        />
       </div>
       <div class="page" class:visible={active == "切片"}>
         <Clip />
@@ -106,6 +156,7 @@
   .sidebar {
     display: flex;
     height: 100vh;
+    flex: 0 0 224px;
   }
 
   .wrap {
@@ -113,6 +164,9 @@
     flex-direction: row;
     height: 100vh;
     overflow: hidden;
+    background:
+      radial-gradient(circle at 82% -10%, rgba(164, 210, 255, .35), transparent 34%),
+      linear-gradient(135deg, #f3f4f7 0%, #e9ebf0 100%);
   }
 
   .visible {
@@ -134,8 +188,17 @@
   }
 
   .content {
-    width: 100%;
-    height: 100vh;
+    width: calc(100% - 12px);
+    height: calc(100vh - 20px);
+    margin: 10px 10px 10px 0;
     overflow: hidden;
+    border: 1px solid rgba(255,255,255,.82);
+    border-radius: 20px;
+    background: rgba(255,255,255,.88);
+    box-shadow: 0 18px 50px rgba(47, 53, 66, .12), 0 2px 6px rgba(47, 53, 66, .05);
+    backdrop-filter: blur(24px) saturate(150%);
   }
+
+  :global(.dark) .wrap { background: radial-gradient(circle at 82% -10%, rgba(28,91,148,.28), transparent 34%), #18181a; }
+  :global(.dark) .content { border-color: rgba(255,255,255,.08); background: rgba(37,37,40,.9); box-shadow: 0 18px 50px rgba(0,0,0,.32); }
 </style>

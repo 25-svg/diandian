@@ -2,13 +2,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+mod audited_calibration;
 pub mod general;
 pub mod hwaccel;
 pub mod playlist;
 
 use crate::constants;
 use crate::progress::progress_reporter::{ProgressReporter, ProgressReporterTrait};
-use crate::subtitle_generator::{powerlive, whisper_online};
+use crate::subtitle_generator::{funasr, powerlive, whisper_online};
 use crate::subtitle_generator::{
     whisper_cpp, GenerateResult, SubtitleGenerator, SubtitleGeneratorType,
 };
@@ -773,7 +774,353 @@ pub async fn generate_video_subtitle(
     openai_api_endpoint: &str,
     language_hint: &str,
 ) -> Result<GenerateResult, String> {
+    let result = generate_video_subtitle_once(
+        reporter,
+        file,
+        generator_type,
+        whisper_model,
+        whisper_prompt,
+        openai_api_key,
+        openai_api_endpoint,
+        language_hint,
+    )
+    .await;
+
+    if generator_type == "funasr" {
+        if let Err(error) = &result {
+            log::warn!("FunASR failed, falling back to local Whisper: {error}");
+            if let Some(reporter) = reporter {
+                reporter.update("FunASR不可用，正在使用本地备用识别").await;
+            }
+            return generate_video_subtitle_once(
+                reporter,
+                file,
+                "whisper",
+                whisper_model,
+                whisper_prompt,
+                openai_api_key,
+                openai_api_endpoint,
+                language_hint,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+/// Convert an MP4 (or any FFmpeg-readable media) into 10-minute, 16kHz mono
+/// MP3 chunks. At 64kbps each chunk is about 4.8MB, comfortably below the
+/// Volcengine binary-upload recommendation of 20MB.
+pub async fn extract_volcengine_audio_chunks(file: &Path) -> Result<Vec<PathBuf>, String> {
+    let parent = file
+        .parent()
+        .ok_or_else(|| "输入视频没有父目录".to_string())?;
+    let stem = file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("recording");
+    let chunk_dir = parent.join(format!("{stem}.volc-asr-chunks"));
+    if chunk_dir.is_dir() {
+        tokio::fs::remove_dir_all(&chunk_dir)
+            .await
+            .map_err(|error| format!("清理火山ASR临时分段失败: {error}"))?;
+    }
+    tokio::fs::create_dir_all(&chunk_dir)
+        .await
+        .map_err(|error| format!("创建火山ASR临时目录失败: {error}"))?;
+    let pattern = chunk_dir.join("chunk_%05d.mp3");
+    let output = ffmpeg_command()
+        .arg("-i")
+        .arg(file)
+        .args(["-vn", "-ar", "16000", "-ac", "1"])
+        .args(["-c:a", "libmp3lame", "-b:a", "64k"])
+        .args(["-f", "segment", "-segment_time", "600"])
+        .args(["-reset_timestamps", "1", "-y"])
+        .arg(&pattern)
+        .output()
+        .await
+        .map_err(|error| format!("启动FFmpeg提取火山ASR音频失败: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "提取火山ASR音频失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut chunks = std::fs::read_dir(&chunk_dir)
+        .map_err(|error| format!("读取火山ASR临时分段失败: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("mp3"))
+        .collect::<Vec<_>>();
+    chunks.sort();
+    if chunks.is_empty() {
+        return Err("视频中没有可提取的音轨".to_string());
+    }
+    Ok(chunks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_volcengine_video_subtitle(
+    reporter: Option<&ProgressReporter>,
+    file: &Path,
+    api_key: &str,
+    app_id: &str,
+    access_token: &str,
+    resource_id: &str,
+    boosting_table_id: &str,
+    correct_table_id: &str,
+) -> Result<GenerateResult, String> {
+    let audit_path =
+        crate::subtitle_generator::transcript_artifacts::TranscriptArtifactStore::asr_audit_path(
+            file,
+        );
+    match tokio::fs::remove_file(&audit_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("清理旧火山ASR审计文件失败: {error}")),
+    }
+    if let Some(reporter) = reporter {
+        reporter.update("正在从MP4提取火山ASR音频").await;
+    }
+    let chunks = extract_volcengine_audio_chunks(file).await?;
+    let chunk_dir = chunks
+        .first()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
+    let client = crate::subtitle_generator::volcengine::VolcengineAsr::new(
+        api_key,
+        app_id,
+        access_token,
+        resource_id,
+        boosting_table_id,
+        correct_table_id,
+    )?;
+    let danmu_timeline =
+        match crate::subtitle_generator::asr_context::DanmuTimeline::load_for_media(file) {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                log::warn!("Dynamic ASR context unavailable: {error}");
+                None
+            }
+        };
+    let mut full_result = GenerateResult {
+        generator_type: SubtitleGeneratorType::Volcengine,
+        subtitle_id: String::new(),
+        subtitle_content: Vec::new(),
+    };
+    for (index, chunk) in chunks.iter().enumerate() {
+        if let Some(reporter) = reporter {
+            reporter
+                .update(&format!("火山ASR识别第 {}/{} 段", index + 1, chunks.len()))
+                .await;
+        }
+        let chunk_context = danmu_timeline
+            .as_ref()
+            .and_then(|timeline| timeline.for_chunk(index as u64 * 600_000, 600_000));
+        if let Some(context) = &chunk_context {
+            log::info!(
+                "Volcengine ASR chunk {}/{} dynamic context evidence_count={}",
+                index + 1,
+                chunks.len(),
+                context.evidence_count
+            );
+        }
+        let result = client
+            .recognize_file(
+                chunk,
+                chunk_context
+                    .as_ref()
+                    .map(|context| context.payload.as_str()),
+            )
+            .await
+            .map_err(|error| format!("火山ASR第 {}/{} 段失败: {error}", index + 1, chunks.len()))?;
+        full_result.concat_with_offset_ms(&result, index as u64 * 600_000);
+    }
+    if let Some(timeline) = &danmu_timeline {
+        let (audited_result, audit) = audited_calibration::apply_calibration_if_audited(
+            full_result,
+            |candidate| {
+                crate::subtitle_generator::asr_evidence::calibrate_with_danmu(candidate, timeline)
+            },
+            |audit| audited_calibration::persist_json_durably(&audit_path, audit),
+        );
+        full_result = audited_result;
+        match audit {
+            Ok(audit) => {
+                log::info!(
+                    "ASR evidence calibration: changes={}, quality_flags={}",
+                    audit.changes.len(),
+                    audit.quality_flags.len()
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "ASR evidence calibration audit was not persisted; using original text: {error}"
+                );
+            }
+        }
+    }
+    if let Some(path) = chunk_dir {
+        let _ = tokio::fs::remove_dir_all(path).await;
+    }
+    if full_result.subtitle_content.is_empty() {
+        return Err("火山ASR没有识别到可用文字".to_string());
+    }
+    Ok(full_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_video_subtitle_once(
+    reporter: Option<&ProgressReporter>,
+    file: &Path,
+    generator_type: &str,
+    whisper_model: &str,
+    whisper_prompt: &str,
+    openai_api_key: &str,
+    openai_api_endpoint: &str,
+    language_hint: &str,
+) -> Result<GenerateResult, String> {
     match generator_type {
+        "funasr" => {
+            if let Some(reporter) = reporter {
+                reporter.update("正在提取音频").await;
+            }
+            let full_wav = extract_full_audio(file).await?;
+            let fact_card_path = file.with_extension("facts.json");
+            let fact_card = if fact_card_path.is_file() {
+                match tokio::fs::read_to_string(&fact_card_path).await {
+                    Ok(content) => match serde_json::from_str(&content) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            log::warn!(
+                                "Ignoring invalid ASR fact card {:?}: {error}",
+                                fact_card_path
+                            );
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        log::warn!("Failed to read ASR fact card {:?}: {error}", fact_card_path);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(reporter) = reporter {
+                reporter
+                    .update("首次使用正在加载中文识别模型，后续会更快")
+                    .await;
+            }
+            let response = match funasr::FunAsr::new().await {
+                Ok(generator) => {
+                    if let Some(reporter) = reporter {
+                        reporter.update("正在生成逐字稿").await;
+                    }
+                    generator.transcribe(&full_wav, fact_card.clone()).await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = tokio::fs::remove_file(&full_wav).await;
+            let mut response = response?;
+
+            if let Some(reporter) = reporter {
+                reporter.update("正在校对商品和价格").await;
+            }
+            if !openai_api_key.trim().is_empty() {
+                match crate::handlers::ai::minimax_correct_transcript(
+                    openai_api_key,
+                    &response.raw_text,
+                    &response.corrected_text,
+                    fact_card.as_ref(),
+                )
+                .await
+                {
+                    Ok((corrected_text, accepted_changes)) => {
+                        for change in &accepted_changes {
+                            for segment in &mut response.segments {
+                                if segment.text.contains(&change.source) {
+                                    segment.text =
+                                        segment.text.replacen(&change.source, &change.corrected, 1);
+                                }
+                            }
+                            for item in &mut response.review_items {
+                                if item.recognized.contains(&change.source) {
+                                    item.recognized = item.recognized.replacen(
+                                        &change.source,
+                                        &change.corrected,
+                                        1,
+                                    );
+                                }
+                                if item.context.contains(&change.source) {
+                                    item.context =
+                                        item.context.replacen(&change.source, &change.corrected, 1);
+                                }
+                            }
+                        }
+                        response.corrected_text = corrected_text;
+                        response.changes.extend(accepted_changes);
+                    }
+                    Err(error) => {
+                        log::warn!("MiniMax constrained transcript correction skipped: {error}");
+                        response.changes.push(funasr::CorrectionChange {
+                            source: String::new(),
+                            corrected: String::new(),
+                            change_type: "MiniMax校对未执行".to_string(),
+                            evidence: error,
+                            needs_review: true,
+                        });
+                    }
+                }
+            }
+
+            log::info!(
+                "FunASR completed via {} in {:.3}s (model load {:.3}s)",
+                response.engine,
+                response.inference_seconds,
+                response.model_load_seconds
+            );
+
+            // Preserve all three audit artifacts. The corrected transcript is
+            // used for SRT, while the raw transcript is never overwritten.
+            let raw_path = file.with_extension("asr.raw.txt");
+            let raw_srt_path = file.with_extension("asr.raw.srt");
+            let corrected_path = file.with_extension("asr.corrected.txt");
+            let corrected_srt_path = file.with_extension("asr.corrected.srt");
+            let changes_path = file.with_extension("asr.changes.json");
+            let review_path = file.with_extension("asr.review.json");
+            tokio::fs::write(&raw_path, &response.raw_text)
+                .await
+                .map_err(|e| format!("Failed to save raw FunASR transcript: {e}"))?;
+            tokio::fs::write(
+                &raw_srt_path,
+                funasr::segments_to_srt(&response.raw_segments),
+            )
+            .await
+            .map_err(|e| format!("Failed to save raw FunASR SRT: {e}"))?;
+            tokio::fs::write(&corrected_path, &response.corrected_text)
+                .await
+                .map_err(|e| format!("Failed to save corrected FunASR transcript: {e}"))?;
+            tokio::fs::write(
+                &corrected_srt_path,
+                funasr::segments_to_srt(&response.segments),
+            )
+            .await
+            .map_err(|e| format!("Failed to save corrected FunASR SRT: {e}"))?;
+            let changes = serde_json::to_vec_pretty(&response.changes)
+                .map_err(|e| format!("Failed to serialize FunASR change log: {e}"))?;
+            tokio::fs::write(&changes_path, changes)
+                .await
+                .map_err(|e| format!("Failed to save FunASR change log: {e}"))?;
+            let review_items = serde_json::to_vec_pretty(&response.review_items)
+                .map_err(|e| format!("Failed to serialize review items: {e}"))?;
+            tokio::fs::write(&review_path, review_items)
+                .await
+                .map_err(|e| format!("Failed to save ASR review list: {e}"))?;
+
+            Ok(funasr::into_generate_result(&response))
+        }
         "whisper" => {
             if whisper_model.is_empty() {
                 return Err("Whisper model not configured".to_string());

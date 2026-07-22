@@ -5,10 +5,17 @@ live_end_notify = true
 clip_notify = true
 post_notify = true
 auto_subtitle = false
-subtitle_generator_type = "whisper_online"
+subtitle_generator_type = "funasr"
+volcengine_api_key = ""
+volcengine_app_id = ""
+volcengine_access_token = ""
+volcengine_resource_id = "volc.seedasr.auc"
+volcengine_boosting_table_id = ""
+volcengine_correct_table_id = ""
 whisper_model = "./whisper_model.bin"
 whisper_prompt = "这是一段中文 你们好"
 openai_api_key = ""
+admin_mode = false
 clip_name_format = "[{room_id}][{live_id}][{title}][{created_at}].mp4"
 
 [auto_generate]

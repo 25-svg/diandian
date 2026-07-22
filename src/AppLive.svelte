@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     invoke,
+    invokeSensitive,
     set_title,
     TAURI_ENV,
     listen,
@@ -28,6 +29,7 @@
   const live_id = urlParams.get("live_id");
   const focus_start = parseInt(urlParams.get("start") || "0");
   const focus_end = parseInt(urlParams.get("end") || "0");
+  const embedded = urlParams.get("embed") === "1";
 
   log.info("AppLive loaded", room_id, platform, live_id);
 
@@ -502,7 +504,7 @@
     invoke("get_archive", { roomId: room_id, liveId: live_id }).then(
       (a: RecordItem) => {
         archive = a;
-        set_title(`[${room_id}]${archive.title}`);
+        if (!embedded) set_title(`[${room_id}]${archive.title}`);
       }
     );
     console.log(archive);
@@ -642,14 +644,17 @@
     if (!selected_video) {
       return;
     }
-    await invoke("delete_video", { id: video_selected });
+    if (!window.confirm(`确定要删除“${selected_video.title || selected_video.file}”吗？此操作无法撤销。`)) {
+      return;
+    }
+    await invokeSensitive("delete_video", { id: video_selected });
     video_selected = 0;
     selected_video = null;
     await get_video_list();
   }
   let player;
   let lpanel_collapsed = true;
-  let rpanel_collapsed = false;
+  let rpanel_collapsed = embedded;
   let markers: Marker[] = [];
   // load markers from local storage
   markers = JSON.parse(

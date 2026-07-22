@@ -1,7 +1,12 @@
 <script lang="ts">
-  import { invoke, get_static_url } from "../lib/invoker";
+  import { invoke, invokeSensitive, get_static_url } from "../lib/invoker";
   import type { RecordItem } from "../lib/db";
-  import { onMount } from "svelte";
+  import { groupArchivesForDeletion } from "../lib/archiveDelete";
+  import {
+    pruneArchiveSelection,
+    selectArchiveRange,
+  } from "../lib/archiveSelection";
+  import { onDestroy, onMount } from "svelte";
   import {
     Play,
     Trash2,
@@ -16,6 +21,9 @@
     Home,
     FileVideo,
     History,
+    BrainCircuit,
+    FileText,
+    X,
   } from "lucide-svelte";
   import BilibiliIcon from "../lib/components/BilibiliIcon.svelte";
   import DouyinIcon from "../lib/components/DouyinIcon.svelte";
@@ -39,6 +47,7 @@
   let roomOptions: RoomOption[] = [];
 
   let selectedArchives: Set<string> = new Set();
+  let lastSelectedArchiveId: string | null = null;
   let showDeleteConfirm = false;
   let archiveToDelete: RecordItem | null = null;
 
@@ -60,6 +69,130 @@
   // 所有数据缓存
   let allArchives = [];
   let allRooms: RecorderInfo[] = [];
+  let emptyRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  let transcriptReady = new Set<string>(
+    JSON.parse(localStorage.getItem("archive-transcript-ready") || "[]")
+  );
+  let transcriptGenerating = new Set<string>();
+  let transcriptStatus = "";
+  let showFactCardModal = false;
+  let factCardArchive: RecordItem | null = null;
+  let factProducts = "";
+  let factPrices = "";
+  let factConditions = "";
+  let factLinks = "";
+  let factInventory = "";
+  let factAliases = "";
+  let factCardError = "";
+
+  function archiveKey(archive: RecordItem): string {
+    return `${archive.platform}:${archive.room_id}:${archive.live_id}`;
+  }
+
+  function isTranscriptReady(archive: RecordItem): boolean {
+    return transcriptReady.has(archiveKey(archive));
+  }
+
+  function generateArchiveTranscript(archive: RecordItem) {
+    if (isArchiveRecording(archive) || transcriptGenerating.has(archiveKey(archive))) return;
+    factCardArchive = archive;
+    factCardError = "";
+    const saved = localStorage.getItem(`archive-fact-card:${archive.room_id}`);
+    if (saved) {
+      try {
+        const card = JSON.parse(saved);
+        factProducts = (card.products || []).join("、");
+        factPrices = (card.prices || []).join("、");
+        factConditions = (card.conditions || []).join("、");
+        factLinks = (card.link_numbers || []).join("、");
+        factInventory = (card.inventory_phrases || []).join("、");
+        factAliases = Object.entries(card.aliases || {}).map(([from, to]) => `${from}=${to}`).join("\n");
+      } catch {
+        // Ignore a damaged local draft and show an empty optional card.
+      }
+    }
+    showFactCardModal = true;
+  }
+
+  function listValues(value: string): string[] {
+    return value.split(/[、,，\n]/).map((item) => item.trim()).filter(Boolean);
+  }
+
+  async function startTranscriptWithFactCard() {
+    if (!factCardArchive) return;
+    const archive = factCardArchive;
+    const aliases: Record<string, string> = {};
+    for (const line of factAliases.split(/\n/).map((item) => item.trim()).filter(Boolean)) {
+      const separator = line.includes("=") ? "=" : "：";
+      const [from, to] = line.split(separator).map((item) => item.trim());
+      if (!from || !to) {
+        factCardError = `别名“${line}”格式不正确，请写成：二四七零二点八=24-70 F2.8`;
+        return;
+      }
+      aliases[from] = to;
+    }
+    const factCard = {
+      products: listValues(factProducts),
+      aliases,
+      prices: listValues(factPrices).map(Number).filter(Number.isFinite),
+      conditions: listValues(factConditions),
+      link_numbers: listValues(factLinks).map(Number).filter(Number.isFinite),
+      inventory_phrases: listValues(factInventory),
+    };
+    try {
+      await invoke("save_archive_fact_card", {
+        platform: archive.platform,
+        roomId: String(archive.room_id),
+        liveId: String(archive.live_id),
+        factCard,
+      });
+      localStorage.setItem(`archive-fact-card:${archive.room_id}`, JSON.stringify(factCard));
+    } catch (error) {
+      factCardError = `保存参数卡失败：${error}`;
+      return;
+    }
+    showFactCardModal = false;
+    const key = archiveKey(archive);
+    transcriptGenerating = new Set([...transcriptGenerating, key]);
+    transcriptStatus = `正在助手中为《${archive.title}》生成整场逐字稿...`;
+    window.dispatchEvent(new CustomEvent("bsr:transcribe-archive", { detail: archive }));
+  }
+
+  onMount(() => {
+    const handleReady = (event: Event) => {
+      const archive = (event as CustomEvent).detail as RecordItem;
+      const key = archiveKey(archive);
+      transcriptReady = new Set([...transcriptReady, key]);
+      localStorage.setItem("archive-transcript-ready", JSON.stringify([...transcriptReady]));
+      const next = new Set(transcriptGenerating);
+      next.delete(key);
+      transcriptGenerating = next;
+      transcriptStatus = `《${archive.title}》逐字稿已完成，现在可以点击“分析片段”。`;
+    };
+    const handleFailed = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      const key = archiveKey(detail.archive);
+      const next = new Set(transcriptGenerating);
+      next.delete(key);
+      transcriptGenerating = next;
+      transcriptStatus = `逐字稿生成失败：${detail.error}`;
+    };
+    window.addEventListener("bsr:archive-transcript-ready", handleReady);
+    window.addEventListener("bsr:archive-transcript-failed", handleFailed);
+    return () => {
+      window.removeEventListener("bsr:archive-transcript-ready", handleReady);
+      window.removeEventListener("bsr:archive-transcript-failed", handleFailed);
+    };
+  });
+
+  function isArchiveRecording(archive: RecordItem): boolean {
+    return allRooms.some((room) => room.recording && String(room.live_id) === String(archive.live_id));
+  }
+
+  function analyzeWholeArchive(archive: RecordItem) {
+    if (isArchiveRecording(archive)) return;
+    window.dispatchEvent(new CustomEvent("bsr:open-archive-analysis", { detail: archive }));
+  }
 
   onMount(async () => {
     // 从本地存储恢复分页大小设置
@@ -69,6 +202,19 @@
     }
 
     await loadArchives();
+
+    // A user may open this page just before the recorder creates its database
+    // index. Keep an empty page fresh so an active recording appears without
+    // requiring repeated manual refreshes.
+    emptyRefreshTimer = setInterval(() => {
+      if (allArchives.length === 0 && !isLoading) {
+        void loadArchives();
+      }
+    }, 5000);
+  });
+
+  onDestroy(() => {
+    if (emptyRefreshTimer) clearInterval(emptyRefreshTimer);
   });
 
   /**
@@ -259,6 +405,19 @@
     const endIndex = startIndex + pageSize;
     filteredArchives = filtered.slice(startIndex, endIndex);
 
+    selectedArchives = pruneArchiveSelection(
+      selectedArchives,
+      filteredArchives.map((archive) => archive.live_id)
+    );
+    if (
+      lastSelectedArchiveId &&
+      !filteredArchives.some(
+        (archive) => archive.live_id === lastSelectedArchiveId
+      )
+    ) {
+      lastSelectedArchiveId = null;
+    }
+
     // 更新archives用于其他功能
     archives = filtered;
   }
@@ -356,29 +515,56 @@
   }
 
   function toggleArchiveSelection(liveId: string) {
-    if (selectedArchives.has(liveId)) {
-      selectedArchives.delete(liveId);
-    } else {
-      selectedArchives.add(liveId);
+    const next = new Set(selectedArchives);
+    next.has(liveId) ? next.delete(liveId) : next.add(liveId);
+    selectedArchives = next;
+    lastSelectedArchiveId = liveId;
+  }
+
+  function handleArchiveRowClick(event: MouseEvent, archive: RecordItem) {
+    const target = event.target;
+    if (target instanceof Element && target.closest("[data-no-row-select]")) {
+      return;
     }
-    selectedArchives = selectedArchives; // Trigger reactivity
+    const orderedIds = filteredArchives.map((item) => item.live_id);
+    const additive = event.ctrlKey || event.metaKey;
+    selectedArchives = selectArchiveRange(
+      orderedIds,
+      selectedArchives,
+      archive.live_id,
+      event.shiftKey ? lastSelectedArchiveId : null,
+      additive
+    );
+    lastSelectedArchiveId = archive.live_id;
+  }
+
+  function handleArchiveRowKeydown(event: KeyboardEvent, archive: RecordItem) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    toggleArchiveSelection(archive.live_id);
+  }
+
+  function clearArchiveSelection() {
+    selectedArchives = new Set();
+    lastSelectedArchiveId = null;
   }
 
   function selectAllArchives() {
     const currentArchives = filteredArchives;
     if (selectedArchives.size === currentArchives.length) {
-      selectedArchives.clear();
+      clearArchiveSelection();
     } else {
-      currentArchives.forEach((archive) =>
-        selectedArchives.add(archive.live_id)
+      selectedArchives = new Set(
+        currentArchives.map((archive) => archive.live_id)
       );
+      lastSelectedArchiveId =
+        currentArchives[currentArchives.length - 1]?.live_id || null;
     }
-    selectedArchives = selectedArchives; // Trigger reactivity
   }
 
   async function deleteArchive(archive: RecordItem) {
     try {
-      await invoke("delete_archive", {
+      await invokeSensitive("delete_archive", {
         platform: archive.platform,
         roomId: archive.room_id,
         liveId: archive.live_id,
@@ -388,25 +574,30 @@
       archiveToDelete = null;
     } catch (error) {
       console.error("Failed to delete archive:", error);
+      alert(`删除录播失败：${error}`);
     }
   }
 
   async function deleteSelectedArchives() {
     try {
-      for (const liveId of selectedArchives) {
-        const archive = filteredArchives.find((a) => a.live_id === liveId);
-        if (archive) {
-          await invoke("delete_archive", {
-            platform: archive.platform,
-            roomId: archive.room_id,
-            liveId: archive.live_id,
-          });
+      const failures: string[] = [];
+      const groups = groupArchivesForDeletion(filteredArchives, selectedArchives);
+      for (const group of groups) {
+        try {
+          await invokeSensitive("delete_archives", group);
+        } catch (error) {
+          failures.push(
+            `${group.platform} / 房间 ${group.roomId}（${group.liveIds.length} 个）：${error}`
+          );
         }
       }
       selectedArchives.clear();
       await loadArchives();
       showDeleteConfirm = false;
       archiveToDelete = null;
+      if (failures.length > 0) {
+        alert(`有 ${failures.length} 个录播删除失败：\n${failures.join("\n")}`);
+      }
     } catch (error) {
       console.error("Failed to delete selected archives:", error);
     }
@@ -435,7 +626,9 @@
   }
 </script>
 
-<div class="flex-1 p-6 overflow-auto custom-scrollbar-light bg-gray-50">
+<div
+  class="flex-1 p-6 overflow-auto custom-scrollbar-light bg-gray-50 {selectedArchives.size > 0 ? 'pb-28' : ''}"
+>
   <div class="space-y-6">
     <!-- Header -->
     <div class="flex justify-between items-center">
@@ -463,6 +656,12 @@
     </div>
 
     <!-- 筛选和排序工具栏 -->
+    {#if transcriptStatus}
+      <div class="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-700">
+        {transcriptStatus}
+      </div>
+    {/if}
+
     <div
       class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 space-y-4"
     >
@@ -648,31 +847,6 @@
         </div>
       </div>
 
-      <!-- 批量操作栏 -->
-      {#if selectedArchives.size > 0}
-        <div
-          class="flex justify-between items-center pt-4 border-t border-gray-200 dark:border-gray-700"
-        >
-          <div class="flex items-center space-x-2">
-            <div class="w-2 h-2 bg-amber-500 rounded-full"></div>
-            <span
-              class="text-sm text-amber-700 dark:text-amber-300 font-medium"
-            >
-              已选择 {selectedArchives.size} 项
-            </span>
-          </div>
-          <button
-            class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors flex items-center space-x-2"
-            on:click={() => {
-              showDeleteConfirm = true;
-              archiveToDelete = null;
-            }}
-          >
-            <Trash2 class="w-4 h-4" />
-            <span>删除选中</span>
-          </button>
-        </div>
-      {/if}
     </div>
 
     <!-- Archive List -->
@@ -718,14 +892,22 @@
           <table class="w-full">
             <thead>
               <tr class="border-b border-gray-200 dark:border-gray-700/50">
-                <th class="px-4 py-3 text-left w-12">
-                  <input
-                    type="checkbox"
-                    checked={selectedArchives.size ===
-                      filteredArchives.length && filteredArchives.length > 0}
-                    on:change={selectAllArchives}
-                    class="rounded border-gray-300 dark:border-gray-600"
-                  />
+                <th class="px-3 py-2 text-left w-44">
+                  <label
+                    class="inline-flex min-h-[40px] items-center gap-2 px-2 rounded-lg cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-700/60"
+                    title="选择当前页面全部录播"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedArchives.size ===
+                        filteredArchives.length && filteredArchives.length > 0}
+                      on:change={selectAllArchives}
+                      class="w-5 h-5 rounded-md border-gray-300 dark:border-gray-600 accent-blue-500 cursor-pointer"
+                    />
+                    <span class="text-xs font-medium text-gray-600 dark:text-gray-300 whitespace-nowrap">
+                      全选当前页
+                    </span>
+                  </label>
                 </th>
                 <th
                   class="px-4 py-3 text-left text-sm font-medium text-gray-500 dark:text-gray-400"
@@ -760,15 +942,25 @@
             <tbody class="divide-y divide-gray-200 dark:divide-gray-700/50">
               {#each filteredArchives as archive (getArchiveKey(archive))}
                 <tr
-                  class="group hover:bg-[#f5f5f7] dark:hover:bg-[#3a3a3c] transition-colors"
+                  class="archive-selectable-row group cursor-pointer select-none hover:bg-[#f5f5f7] dark:hover:bg-[#3a3a3c] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500"
+                  class:archive-row-selected={selectedArchives.has(archive.live_id)}
+                  aria-selected={selectedArchives.has(archive.live_id)}
+                  tabindex="0"
+                  on:click={(event) => handleArchiveRowClick(event, archive)}
+                  on:keydown={(event) => handleArchiveRowKeydown(event, archive)}
                 >
-                  <td class="px-4 py-3">
-                    <input
-                      type="checkbox"
-                      checked={selectedArchives.has(archive.live_id)}
-                      on:change={() => toggleArchiveSelection(archive.live_id)}
-                      class="rounded border-gray-300 dark:border-gray-600"
-                    />
+                  <td class="px-3 py-2" data-no-row-select>
+                    <label
+                      class="flex w-10 h-10 items-center justify-center rounded-lg cursor-pointer hover:bg-blue-500/10"
+                      title={selectedArchives.has(archive.live_id) ? "取消选择" : "选择录播"}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedArchives.has(archive.live_id)}
+                        on:change={() => toggleArchiveSelection(archive.live_id)}
+                        class="w-5 h-5 rounded-md border-gray-300 dark:border-gray-600 accent-blue-500 cursor-pointer"
+                      />
+                    </label>
                   </td>
 
                   <td class="px-4 py-3">
@@ -799,6 +991,7 @@
                       {/if}
                       {#if getRoomUrl(archive.platform, archive.room_id)}
                         <a
+                          data-no-row-select
                           href={getRoomUrl(archive.platform, archive.room_id)}
                           target="_blank"
                           rel="noopener noreferrer"
@@ -855,8 +1048,8 @@
                     >
                   </td>
 
-                  <td class="px-4 py-3">
-                    <div class="flex items-center space-x-2">
+                  <td class="px-4 py-3" data-no-row-select>
+                    <div class="flex items-center space-x-2" data-no-row-select>
                       <button
                         class="p-1.5 rounded-lg hover:bg-blue-500/10 transition-colors"
                         title="预览录播"
@@ -870,6 +1063,15 @@
                         on:click={() => openWholeClipModal(archive)}
                       >
                         <FileVideo class="w-4 h-4 text-blue-500" />
+                      </button>
+                      <button
+                        class="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg hover:bg-violet-500/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed text-xs text-violet-600"
+                        title={isArchiveRecording(archive) ? "录制结束后才能分析整场" : "自动生成文稿并分析候选片段"}
+                        disabled={isArchiveRecording(archive)}
+                        on:click={() => analyzeWholeArchive(archive)}
+                      >
+                        <BrainCircuit class="w-4 h-4" />
+                        <span>分析片段</span>
                       </button>
                       <button
                         class="p-1.5 rounded-lg hover:bg-red-500/10 transition-colors"
@@ -892,6 +1094,43 @@
     </div>
   </div>
 </div>
+
+{#if selectedArchives.size > 0}
+  <div
+    class="fixed left-1/2 bottom-6 z-40 -translate-x-1/2 flex h-14 min-w-[360px] max-w-[calc(100vw-2rem)] items-center justify-between gap-6 rounded-lg border border-black/10 dark:border-white/15 bg-white/90 dark:bg-[#2c2c2e]/90 px-3 shadow-xl backdrop-blur-xl"
+    aria-live="polite"
+  >
+    <div class="flex items-center gap-3 pl-2">
+      <span class="flex h-6 min-w-[24px] items-center justify-center rounded-full bg-blue-500 px-1.5 text-xs font-semibold text-white">
+        {selectedArchives.size}
+      </span>
+      <span class="text-sm font-medium text-gray-800 dark:text-gray-100 whitespace-nowrap">
+        已选择录播
+      </span>
+    </div>
+    <div class="flex items-center gap-1">
+      <button
+        class="inline-flex h-10 items-center gap-2 rounded-lg px-3 text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
+        title="取消全部选择"
+        on:click={clearArchiveSelection}
+      >
+        <X class="w-4 h-4" />
+        <span>取消选择</span>
+      </button>
+      <button
+        class="inline-flex h-10 items-center gap-2 rounded-lg bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+        title="删除选中的录播"
+        on:click={() => {
+          showDeleteConfirm = true;
+          archiveToDelete = null;
+        }}
+      >
+        <Trash2 class="w-4 h-4" />
+        <span>删除</span>
+      </button>
+    </div>
+  </div>
+{/if}
 
 <!-- Delete Confirmation Modal -->
 {#if showDeleteConfirm}
@@ -943,6 +1182,54 @@
   </div>
 {/if}
 
+{#if showFactCardModal && factCardArchive}
+  <div class="fixed inset-0 bg-black/25 dark:bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="mac-modal w-[620px] max-h-[90vh] overflow-y-auto bg-white dark:bg-[#323234] rounded-xl shadow-xl">
+      <div class="p-6 space-y-4">
+        <div>
+          <h3 class="text-base font-semibold text-gray-900 dark:text-white">转写参数卡（可选）</h3>
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            只填写已经确认的信息。留空也能转写；未确认的价格、成色和链接号会进入待回听清单。
+          </p>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label class="text-xs text-gray-600 dark:text-gray-300">
+            商品和型号
+            <input class="mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-[#252527] px-3 py-2 text-sm" bind:value={factProducts} placeholder="佳能R6二代、佳能70-200 F2.8" />
+          </label>
+          <label class="text-xs text-gray-600 dark:text-gray-300">
+            已确认价格
+            <input class="mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-[#252527] px-3 py-2 text-sm" bind:value={factPrices} placeholder="5839、6999" />
+          </label>
+          <label class="text-xs text-gray-600 dark:text-gray-300">
+            已确认成色
+            <input class="mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-[#252527] px-3 py-2 text-sm" bind:value={factConditions} placeholder="99新、95新" />
+          </label>
+          <label class="text-xs text-gray-600 dark:text-gray-300">
+            已确认链接号
+            <input class="mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-[#252527] px-3 py-2 text-sm" bind:value={factLinks} placeholder="56、1、2" />
+          </label>
+        </div>
+        <label class="block text-xs text-gray-600 dark:text-gray-300">
+          已确认库存表述
+          <input class="mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-[#252527] px-3 py-2 text-sm" bind:value={factInventory} placeholder="在仓现货" />
+        </label>
+        <label class="block text-xs text-gray-600 dark:text-gray-300">
+          直播间别名（每行一个）
+          <textarea class="mt-1 w-full h-20 resize-none rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-[#252527] px-3 py-2 text-sm" bind:value={factAliases} placeholder={'二四七零二点八=24-70 F2.8\nR六二代=R6二代'}></textarea>
+        </label>
+        {#if factCardError}
+          <p class="text-xs text-red-600">{factCardError}</p>
+        {/if}
+        <div class="flex justify-end gap-3 pt-1">
+          <button class="px-4 py-2 text-sm text-gray-600 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700" on:click={() => (showFactCardModal = false)}>取消</button>
+          <button class="px-4 py-2 text-sm text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg" on:click={startTranscriptWithFactCard}>保存并生成文稿</button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- 生成完整录播Modal -->
 <GenerateWholeClipModal
   bind:showModal={showWholeClipModal}
@@ -971,5 +1258,23 @@
     width: 1rem; /* 16px, same as Tailwind w-4 */
     height: 1rem; /* 16px, same as Tailwind h-4 */
     flex: 0 0 auto;
+  }
+
+  .archive-row-selected {
+    background: rgba(0, 122, 255, 0.09);
+    box-shadow: inset 3px 0 0 #0a84ff;
+  }
+
+  .archive-row-selected:hover {
+    background: rgba(0, 122, 255, 0.13);
+  }
+
+  :global(.dark) .archive-row-selected {
+    background: rgba(10, 132, 255, 0.16);
+    box-shadow: inset 3px 0 0 #64a8ff;
+  }
+
+  :global(.dark) .archive-row-selected:hover {
+    background: rgba(10, 132, 255, 0.21);
   }
 </style>

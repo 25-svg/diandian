@@ -3,7 +3,14 @@ use std::path::Path;
 
 use crate::progress::progress_reporter::ProgressReporterTrait;
 
+pub mod asr_context;
+pub mod asr_evidence;
+pub mod asr_text;
+pub mod funasr;
+pub mod model_manager;
 pub mod powerlive;
+pub mod transcript_artifacts;
+pub mod volcengine;
 pub mod whisper_cpp;
 pub mod whisper_online;
 
@@ -11,9 +18,11 @@ pub mod whisper_online;
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubtitleGeneratorType {
+    FunAsr,
     Whisper,
     WhisperOnline,
     PowerLive,
+    Volcengine,
 }
 
 #[derive(Debug, Clone)]
@@ -91,17 +100,21 @@ impl SubtitleGeneratorType {
     #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
+            SubtitleGeneratorType::FunAsr => "funasr",
             SubtitleGeneratorType::Whisper => "whisper",
             SubtitleGeneratorType::WhisperOnline => "whisper_online",
             SubtitleGeneratorType::PowerLive => "powerlive",
+            SubtitleGeneratorType::Volcengine => "volcengine",
         }
     }
     #[allow(dead_code)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "funasr" => Some(SubtitleGeneratorType::FunAsr),
             "whisper" => Some(SubtitleGeneratorType::Whisper),
             "whisper_online" => Some(SubtitleGeneratorType::WhisperOnline),
             "powerlive" => Some(SubtitleGeneratorType::PowerLive),
+            "volcengine" => Some(SubtitleGeneratorType::Volcengine),
             _ => None,
         }
     }
@@ -123,6 +136,7 @@ mod tests {
 
     #[test]
     fn test_subtitle_generator_type_as_str() {
+        assert_eq!(SubtitleGeneratorType::FunAsr.as_str(), "funasr");
         assert_eq!(SubtitleGeneratorType::Whisper.as_str(), "whisper");
         assert_eq!(
             SubtitleGeneratorType::WhisperOnline.as_str(),
@@ -133,6 +147,10 @@ mod tests {
 
     #[test]
     fn test_subtitle_generator_type_from_str() {
+        assert_eq!(
+            SubtitleGeneratorType::from_str("funasr"),
+            Some(SubtitleGeneratorType::FunAsr)
+        );
         assert_eq!(
             SubtitleGeneratorType::from_str("whisper"),
             Some(SubtitleGeneratorType::Whisper)
@@ -152,9 +170,11 @@ mod tests {
     #[test]
     fn test_subtitle_generator_type_roundtrip() {
         for t in [
+            SubtitleGeneratorType::FunAsr,
             SubtitleGeneratorType::Whisper,
             SubtitleGeneratorType::WhisperOnline,
             SubtitleGeneratorType::PowerLive,
+            SubtitleGeneratorType::Volcengine,
         ] {
             assert_eq!(SubtitleGeneratorType::from_str(t.as_str()), Some(t));
         }

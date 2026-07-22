@@ -26,7 +26,7 @@
       <div
         class="bg-white dark:bg-gray-800 rounded-2xl px-4 py-3 shadow-sm border border-gray-200 dark:border-gray-700"
       >
-        <div class="text-gray-900 dark:text-white text-sm leading-relaxed">
+        <div class="selectable-content text-gray-900 dark:text-white text-sm leading-relaxed">
           {message.content}
         </div>
       </div>

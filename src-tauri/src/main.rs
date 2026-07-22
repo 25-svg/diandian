@@ -13,6 +13,7 @@ mod http_server;
 mod migration;
 mod progress;
 mod recorder_manager;
+mod security;
 mod state;
 mod static_server;
 mod subtitle_generator;
@@ -403,6 +404,53 @@ fn get_migrations() -> Vec<Migration> {
             ",
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 14,
+            description: "add_review_samples_table",
+            sql: r"
+                CREATE TABLE review_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sample_no TEXT NOT NULL UNIQUE,
+                    product TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '',
+                    deal_status TEXT NOT NULL DEFAULT '',
+                    evidence_strength TEXT NOT NULL DEFAULT '',
+                    transcript_path TEXT NOT NULL DEFAULT '',
+                    data_screenshot_path TEXT NOT NULL DEFAULT '',
+                    review_status TEXT NOT NULL DEFAULT '已复盘',
+                    is_b_baseline INTEGER NOT NULL DEFAULT 0,
+                    ops_score INTEGER,
+                    host_score INTEGER,
+                    control_score INTEGER,
+                    main_issue TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    clip_type TEXT NOT NULL DEFAULT '无法判断',
+                    source_video_path TEXT NOT NULL DEFAULT '',
+                    review_file_path TEXT NOT NULL DEFAULT '',
+                    transcription_quality TEXT NOT NULL DEFAULT '',
+                    agent_version TEXT NOT NULL DEFAULT 'V1.1',
+                    calibration_score INTEGER,
+                    fact_accuracy_score INTEGER,
+                    key_action_score INTEGER,
+                    oral_usability_score INTEGER,
+                    training_value_score INTEGER,
+                    review_content TEXT NOT NULL DEFAULT '',
+                    video_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX idx_review_samples_category ON review_samples(category);
+                CREATE INDEX idx_review_samples_clip_type ON review_samples(clip_type);
+                CREATE INDEX idx_review_samples_baseline ON review_samples(is_b_baseline);
+            ",
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 15,
+            description: "add_transcript_dictionary_candidates_table",
+            sql: database::transcript_dictionary_candidate::TRANSCRIPT_DICTIONARY_CANDIDATES_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -644,6 +692,10 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::account::get_account_count,
         crate::handlers::account::get_qr_status,
         crate::handlers::account::get_qr,
+        crate::handlers::account::open_douyin_login,
+        crate::handlers::account::get_douyin_login_cookies,
+        crate::handlers::account::close_douyin_login,
+        crate::handlers::ai::minimax_chat,
         crate::handlers::config::get_config,
         crate::handlers::config::get_static_port,
         crate::handlers::config::set_cache_path,
@@ -656,6 +708,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::config::update_subtitle_generator_type,
         crate::handlers::config::update_openai_api_key,
         crate::handlers::config::update_openai_api_endpoint,
+        crate::handlers::config::update_volcengine_asr_config,
         crate::handlers::config::update_auto_generate,
         crate::handlers::config::update_status_check_interval,
         crate::handlers::config::update_whisper_language,
@@ -674,7 +727,16 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::recorder::get_archive,
         crate::handlers::recorder::get_archives_by_parent_id,
         crate::handlers::recorder::get_archive_subtitle,
+        crate::handlers::recorder::get_archive_transcript_audit,
+        crate::handlers::transcript_review::get_transcript_audit,
+        crate::handlers::recorder::save_archive_fact_card,
+        crate::handlers::recorder::resolve_archive_review_item,
+        crate::handlers::transcript_review::resolve_transcript_correction,
+        crate::handlers::transcript_review::list_transcript_dictionary_candidates,
+        crate::handlers::transcript_review::set_transcript_dictionary_candidate_status,
+        crate::handlers::transcript_review::export_transcript_dictionary_candidates,
         crate::handlers::recorder::generate_archive_subtitle,
+        crate::handlers::recorder::refresh_archive_subtitle,
         crate::handlers::recorder::delete_archive,
         crate::handlers::recorder::delete_archives,
         crate::handlers::recorder::get_danmu_record,
@@ -686,6 +748,10 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::recorder::set_enable,
         crate::handlers::recorder::fetch_hls,
         crate::handlers::recorder::generate_whole_clip,
+        crate::handlers::review_sample::get_review_samples,
+        crate::handlers::review_sample::seed_builtin_review_samples,
+        crate::handlers::review_sample::save_review_sample,
+        crate::handlers::review_sample::delete_review_sample,
         crate::handlers::video::clip_range,
         crate::handlers::video::upload_procedure,
         crate::handlers::video::cancel,

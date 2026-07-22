@@ -26,6 +26,8 @@ pub struct Config {
     pub openai_api_endpoint: String,
     #[serde(default = "default_openai_api_key")]
     pub openai_api_key: String,
+    #[serde(default = "default_admin_mode")]
+    pub admin_mode: bool,
     #[serde(default = "default_clip_name_format")]
     pub clip_name_format: String,
     #[serde(default = "default_auto_generate_config")]
@@ -44,6 +46,18 @@ pub struct Config {
     pub update_interval: Arc<AtomicU64>,
     #[serde(default = "default_powerlive_key")]
     pub powerlive_key: String,
+    #[serde(default)]
+    pub volcengine_api_key: String,
+    #[serde(default)]
+    pub volcengine_app_id: String,
+    #[serde(default)]
+    pub volcengine_access_token: String,
+    #[serde(default = "default_volcengine_resource_id")]
+    pub volcengine_resource_id: String,
+    #[serde(default)]
+    pub volcengine_boosting_table_id: String,
+    #[serde(default)]
+    pub volcengine_correct_table_id: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -57,11 +71,11 @@ fn default_danmu_ass_options() -> Danmu2AssOptions {
 }
 
 fn default_auto_subtitle() -> bool {
-    false
+    true
 }
 
 fn default_subtitle_generator_type() -> String {
-    "whisper".to_string()
+    "funasr".to_string()
 }
 
 fn default_whisper_model() -> String {
@@ -69,7 +83,7 @@ fn default_whisper_model() -> String {
 }
 
 fn default_whisper_prompt() -> String {
-    "这是一段中文 你们好".to_string()
+    "这是一段中文二手相机、镜头直播带货口播。常见词包括：佳能、尼康、索尼、小白兔、70-200、EOS R6 Mark II、R62、RF 24-240、成色、99新、在仓现货、前盖、后盖、遮光罩、脚架环、镜片、卡口、到手价、优惠价、小黄车、置顶链接、UV镜、下单、备注。请忠实转写主播原话，商品型号、链接号和价格数字必须准确，不补写没有听到的内容。".to_string()
 }
 
 fn default_openai_api_endpoint() -> String {
@@ -78,6 +92,10 @@ fn default_openai_api_endpoint() -> String {
 
 fn default_openai_api_key() -> String {
     String::new()
+}
+
+fn default_admin_mode() -> bool {
+    false
 }
 
 fn default_clip_name_format() -> String {
@@ -96,7 +114,7 @@ fn default_status_check_interval() -> u64 {
 }
 
 fn default_whisper_language() -> String {
-    "auto".to_string()
+    "zh".to_string()
 }
 
 fn default_webhook_url() -> String {
@@ -105,6 +123,10 @@ fn default_webhook_url() -> String {
 
 fn default_powerlive_key() -> String {
     String::new()
+}
+
+fn default_volcengine_resource_id() -> String {
+    "volc.seedasr.auc".to_string()
 }
 
 impl Config {
@@ -117,6 +139,13 @@ impl Config {
             if let Ok(mut config) = toml::from_str::<Config>(&content) {
                 config.config_path = config_path.to_str().unwrap().into();
                 config.update_interval = Arc::new(AtomicU64::new(config.status_check_interval));
+                if config.volcengine_resource_id.trim().is_empty()
+                    || config.volcengine_resource_id == "volc.bigasr.auc_turbo"
+                {
+                    log::info!("Migrating Volcengine ASR configuration to Seed ASR 2.0");
+                    config.volcengine_resource_id = default_volcengine_resource_id();
+                    config.save();
+                }
                 return Ok(config);
             }
         }
@@ -134,12 +163,13 @@ impl Config {
             live_end_notify: true,
             clip_notify: true,
             post_notify: true,
-            auto_subtitle: false,
+            auto_subtitle: true,
             subtitle_generator_type: default_subtitle_generator_type(),
             whisper_model: default_whisper_model(),
             whisper_prompt: default_whisper_prompt(),
             openai_api_endpoint: default_openai_api_endpoint(),
             openai_api_key: default_openai_api_key(),
+            admin_mode: default_admin_mode(),
             clip_name_format: default_clip_name_format(),
             auto_generate: default_auto_generate_config(),
             status_check_interval: default_status_check_interval(),
@@ -149,6 +179,12 @@ impl Config {
             danmu_ass_options: default_danmu_ass_options(),
             update_interval: Arc::new(AtomicU64::new(default_status_check_interval())),
             powerlive_key: default_powerlive_key(),
+            volcengine_api_key: String::new(),
+            volcengine_app_id: String::new(),
+            volcengine_access_token: String::new(),
+            volcengine_resource_id: default_volcengine_resource_id(),
+            volcengine_boosting_table_id: String::new(),
+            volcengine_correct_table_id: String::new(),
         };
 
         config.save();

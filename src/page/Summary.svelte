@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get_static_url, invoke } from "../lib/invoker";
+  import { get_static_url, invoke, invokeSensitive } from "../lib/invoker";
   import type { RecorderList, DiskInfo } from "../lib/interface";
   import type { RecordItem } from "../lib/db";
   const INTERVAL = 5000;
@@ -194,8 +194,11 @@
   }
 
   async function deleteRecord(record: RecordItem) {
+    if (!window.confirm(`确定要删除录播“${record.title || record.live_id}”吗？此操作无法撤销。`)) {
+      return;
+    }
     try {
-      await invoke("delete_archive", {
+      await invokeSensitive("delete_archive", {
         platform: record.platform,
         roomId: record.room_id,
         liveId: record.live_id,

@@ -1,10 +1,15 @@
 use crate::database::task::TaskRow;
 use crate::database::video::VideoRow;
 use crate::ffmpeg;
+use crate::handlers::transcript_review::{
+    database_owned_video_path, resolve_canonical_video_source,
+};
 use crate::handlers::utils::get_disk_info_inner;
 use crate::progress::progress_reporter::{EventEmitter, ProgressReporter, ProgressReporterTrait};
 use crate::recorder_manager::ClipRangeParams;
+use crate::security::{audit_tool_failure, audit_tool_success, require_sensitive_write};
 use crate::subtitle_generator::item_to_srt;
+use crate::subtitle_generator::transcript_artifacts::{TranscriptArtifactStore, TranscriptSource};
 use crate::task::{Task, TaskPriority};
 use crate::webhook::events;
 use base64::Engine;
@@ -15,6 +20,33 @@ use serde_json::json;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+struct CanonicalVideoTranscriptContext {
+    source: TranscriptSource,
+    artifact_dir: PathBuf,
+    media_file: PathBuf,
+    video_id: i64,
+}
+
+async fn resolve_video_transcript_context(
+    state: &State,
+    requested_video_id: i64,
+) -> Result<CanonicalVideoTranscriptContext, String> {
+    let output = state.config.read().await.output.clone();
+    let (source, artifact_dir) =
+        resolve_canonical_video_source(&state.db, Path::new(&output), requested_video_id).await?;
+    let TranscriptSource::Video { video_id } = source else {
+        return Err("canonical video resolver returned a non-video source".to_string());
+    };
+    let video = state.db.get_video(video_id).await?;
+    let media_file = database_owned_video_path(Path::new(&output), &video.file)?;
+    Ok(CanonicalVideoTranscriptContext {
+        source: TranscriptSource::Video { video_id },
+        artifact_dir,
+        media_file,
+        video_id,
+    })
+}
 
 /// 检测路径是否为网络协议路径（排除Windows盘符）
 fn is_network_protocol(path_str: &str) -> bool {
@@ -544,7 +576,17 @@ pub async fn upload_procedure(
     room_id: String,
     video_id: i64,
     profile: Profile,
+    idempotency_key: String,
+    confirmation_token: String,
+    trace_id: Option<String>,
 ) -> Result<String, String> {
+    let audit = require_sensitive_write(
+        "post_video_to_bilibili",
+        &idempotency_key,
+        &confirmation_token,
+        trace_id.as_deref(),
+        &format!("upload:bilibili:{uid}:{room_id}:{video_id}:{event_id}"),
+    )?;
     #[cfg(feature = "gui")]
     let emitter = EventEmitter::new(state.app_handle.clone());
     #[cfg(feature = "headless")]
@@ -573,6 +615,7 @@ pub async fn upload_procedure(
                 .db
                 .update_task(&event_id, "success", "投稿成功", None)
                 .await?;
+            audit_tool_success(&audit);
             Ok(bvid)
         }
         Err(e) => {
@@ -581,6 +624,7 @@ pub async fn upload_procedure(
                 .db
                 .update_task(&event_id, "failed", &format!("投稿失败: {e}"), None)
                 .await?;
+            audit_tool_failure(&audit, &e);
             Err(e)
         }
     }
@@ -719,43 +763,109 @@ pub async fn get_video_cover(state: state_type!(), id: i64) -> Result<String, St
         .map_err(|e| e.to_string())
 }
 
-#[cfg_attr(feature = "gui", tauri::command)]
-pub async fn delete_video(state: state_type!(), id: i64) -> Result<(), String> {
-    // get video info from db
-    let video = state.db.get_video(id).await?;
-    let config = state.config.read().await;
+async fn remove_required_media_file(path: &Path) -> Result<(), String> {
+    const ATTEMPTS: usize = 3;
+    let mut last_error = None;
 
-    // Emit webhook events
+    for attempt in 0..ATTEMPTS {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+
+    let error = last_error.expect("delete attempt must record an error");
+    Err(format!(
+        "无法删除视频文件 {}：{}。请关闭正在播放或占用该视频的窗口后重试",
+        path.display(),
+        error
+    ))
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn delete_video(
+    state: state_type!(),
+    id: i64,
+    idempotency_key: String,
+    confirmation_token: String,
+    trace_id: Option<String>,
+) -> Result<(), String> {
+    let audit = require_sensitive_write(
+        "delete_video",
+        &idempotency_key,
+        &confirmation_token,
+        trace_id.as_deref(),
+        &format!("video:{id}"),
+    )?;
+    // get video info from db
+    let video = match state.db.get_video(id).await {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.to_string();
+            audit_tool_failure(&audit, &error);
+            return Err(error);
+        }
+    };
+    let output = state.config.read().await.output.clone();
+    let filepath = Path::new(&output).join(&video.file);
+    let file = Path::new(&filepath);
+    let file_references = match state.db.count_videos_with_file(&video.file).await {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.to_string();
+            audit_tool_failure(&audit, &error);
+            return Err(error);
+        }
+    };
+
+    // Imported aliases can share one physical file. Keep it until the final
+    // database reference is removed.
+    if file_references <= 1 {
+        if let Err(error) = remove_required_media_file(file).await {
+            audit_tool_failure(&audit, &error);
+            return Err(error);
+        }
+        log::info!("已删除视频文件: {}", file.display());
+    }
+
+    if let Err(error) = state.db.delete_video(id).await {
+        let error = error.to_string();
+        audit_tool_failure(&audit, &error);
+        return Err(error);
+    }
+
     let event =
         events::new_webhook_event(events::CLIP_DELETED, events::Payload::Clip(video.clone()));
     if let Err(e) = state.webhook_poster.post_event(&event).await {
         log::error!("Post webhook event error: {e}");
     }
 
-    // delete video from db
-    state.db.delete_video(id).await?;
-
-    // delete video files
-    let filepath = Path::new(&config.output).join(&video.file);
-    let file = Path::new(&filepath);
-    if let Err(e) = std::fs::remove_file(file) {
-        log::warn!("删除视频文件失败: {} - {}", file.display(), e);
-    } else {
-        log::info!("已删除视频文件: {}", file.display());
+    if file_references <= 1 {
+        let srt_path = file.with_extension("srt");
+        let _ = tokio::fs::remove_file(srt_path).await;
+        let transcript_path = TranscriptArtifactStore::video_artifact_dir(file);
+        if tokio::fs::try_exists(&transcript_path)
+            .await
+            .unwrap_or(false)
+        {
+            let _ = tokio::fs::remove_dir_all(transcript_path).await;
+        }
+        let wav_path = file.with_extension("wav");
+        let _ = tokio::fs::remove_file(wav_path).await;
+        let mp3_path = file.with_extension("mp3");
+        let _ = tokio::fs::remove_file(mp3_path).await;
+        let opus_path = file.with_extension("opus");
+        let _ = tokio::fs::remove_file(opus_path).await;
+        let cover_path = Path::new(&output).join(&video.cover);
+        let _ = tokio::fs::remove_file(cover_path).await;
     }
 
-    // delete all related files
-    let srt_path = file.with_extension("srt");
-    let _ = tokio::fs::remove_file(srt_path).await;
-    let wav_path = file.with_extension("wav");
-    let _ = tokio::fs::remove_file(wav_path).await;
-    let mp3_path = file.with_extension("mp3");
-    let _ = tokio::fs::remove_file(mp3_path).await;
-    let opus_path = file.with_extension("opus");
-    let _ = tokio::fs::remove_file(opus_path).await;
-    let cover_path = Path::new(&config.output).join(&video.cover);
-    let _ = tokio::fs::remove_file(cover_path).await;
-
+    audit_tool_success(&audit);
     Ok(())
 }
 
@@ -796,14 +906,20 @@ pub async fn update_video_cover(
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_video_subtitle(state: state_type!(), id: i64) -> Result<String, String> {
     log::debug!("Get video subtitle: {id}");
-    let video = state.db.get_video(id).await?;
-    let filepath = Path::new(state.config.read().await.output.as_str()).join(&video.file);
-    let file = Path::new(&filepath);
-    // read file content
-    if let Ok(content) = std::fs::read_to_string(file.with_extension("srt")) {
-        Ok(content)
-    } else {
-        Ok(String::new())
+    let context = resolve_video_transcript_context(&state, id).await?;
+    if TranscriptArtifactStore::canonical_artifacts_exist(&context.artifact_dir)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return TranscriptArtifactStore::load_from_dir(context.source, context.artifact_dir)
+            .await
+            .map(|bundle| bundle.corrected_srt)
+            .map_err(|error| error.to_string());
+    }
+    match tokio::fs::read_to_string(context.media_file.with_extension("srt")).await {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -839,32 +955,115 @@ async fn generate_video_subtitle_inner(
     };
     state.db.add_task(&task).await?;
     log::info!("Create task: {task:?}");
+
+    let (generator_type, configured_model, config_path) = {
+        let config = state.config.read().await;
+        (
+            config.subtitle_generator_type.clone(),
+            config.whisper_model.clone(),
+            config.config_path.clone(),
+        )
+    };
+    if generator_type == "whisper" && !Path::new(&configured_model).is_file() {
+        reporter
+            .update("首次使用，正在自动准备本地转写模型...")
+            .await;
+        let model_path =
+            crate::subtitle_generator::model_manager::ensure_model(&config_path, &configured_model)
+                .await?;
+        let mut config = state.config.write().await;
+        config.whisper_model = model_path.to_string_lossy().to_string();
+        config.save();
+    }
+
     let config = state.config.read().await;
-    let generator_type = config.subtitle_generator_type.as_str();
+    let generator_type = config.subtitle_generator_type.clone();
     let whisper_model = config.whisper_model.clone();
     let whisper_prompt = config.whisper_prompt.clone();
     let openai_api_key = config.openai_api_key.clone();
     let openai_api_endpoint = config.openai_api_endpoint.clone();
+    let volcengine_api_key = config.volcengine_api_key.clone();
+    let volcengine_app_id = config.volcengine_app_id.clone();
+    let volcengine_access_token = config.volcengine_access_token.clone();
+    let volcengine_resource_id = config.volcengine_resource_id.clone();
+    let volcengine_boosting_table_id = config.volcengine_boosting_table_id.clone();
+    let volcengine_correct_table_id = config.volcengine_correct_table_id.clone();
+    drop(config);
     let language_hint = state.config.read().await.whisper_language.clone();
     let language_hint = language_hint.as_str();
 
-    let video = state.db.get_video(id).await?;
-    let filepath = Path::new(state.config.read().await.output.as_str()).join(&video.file);
-    let file = Path::new(&filepath);
+    let context = resolve_video_transcript_context(state, id).await?;
+    let file = context.media_file.as_path();
 
-    match ffmpeg::generate_video_subtitle(
-        Some(&reporter),
-        file,
-        generator_type,
-        &whisper_model,
-        &whisper_prompt,
-        &openai_api_key,
-        &openai_api_endpoint,
-        language_hint,
-    )
-    .await
-    {
+    let generation_result = if generator_type == "volcengine" {
+        match ffmpeg::generate_volcengine_video_subtitle(
+            Some(&reporter),
+            file,
+            &volcengine_api_key,
+            &volcengine_app_id,
+            &volcengine_access_token,
+            &volcengine_resource_id,
+            &volcengine_boosting_table_id,
+            &volcengine_correct_table_id,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                log::warn!("Volcengine ASR failed, falling back to FunASR: {error}");
+                reporter
+                    .update("火山引擎识别失败，正在自动切换本地识别...")
+                    .await;
+                ffmpeg::generate_video_subtitle(
+                    Some(&reporter),
+                    file,
+                    "funasr",
+                    &whisper_model,
+                    &whisper_prompt,
+                    &openai_api_key,
+                    &openai_api_endpoint,
+                    language_hint,
+                )
+                .await
+            }
+        }
+    } else {
+        ffmpeg::generate_video_subtitle(
+            Some(&reporter),
+            file,
+            &generator_type,
+            &whisper_model,
+            &whisper_prompt,
+            &openai_api_key,
+            &openai_api_endpoint,
+            language_hint,
+        )
+        .await
+    };
+    let generation_result = match generation_result {
         Ok(result) => {
+            let subtitle = result
+                .subtitle_content
+                .iter()
+                .map(item_to_srt)
+                .collect::<String>();
+            TranscriptArtifactStore::initialize_from_asr_outputs(
+                context.source,
+                context.artifact_dir,
+                file,
+                &subtitle,
+                result.generator_type.as_str(),
+            )
+            .await
+            .map(|bundle| (result, bundle.corrected_srt))
+            .map_err(|error| format!("保存规范逐字稿失败: {error}"))
+        }
+        Err(error) => Err(error),
+    };
+
+    match generation_result {
+        Ok((result, canonical_subtitle)) => {
+            write_legacy_video_subtitle(file, &canonical_subtitle).await?;
             reporter.finish(true, "字幕生成完成").await;
             // for local whisper, we need to update the task status to success
             state
@@ -884,17 +1083,7 @@ async fn generate_video_subtitle_inner(
                 )
                 .await?;
 
-            let subtitle = result
-                .subtitle_content
-                .iter()
-                .map(item_to_srt)
-                .collect::<String>();
-
-            let result = update_video_subtitle_inner(state, id, subtitle.clone()).await;
-            if let Err(e) = result {
-                log::error!("Update video subtitle error: {e}");
-            }
-            Ok(subtitle)
+            Ok(canonical_subtitle)
         }
         Err(e) => {
             reporter.finish(false, &format!("字幕生成失败: {e}")).await;
@@ -921,14 +1110,60 @@ async fn update_video_subtitle_inner(
     id: i64,
     subtitle: String,
 ) -> Result<(), String> {
-    let video = state.db.get_video(id).await?;
-    let filepath = Path::new(state.config.read().await.output.as_str()).join(&video.file);
-    let file = Path::new(&filepath);
-    let subtitle_path = file.with_extension("srt");
-    if let Err(e) = std::fs::write(subtitle_path, subtitle) {
-        log::warn!("Update video subtitle error: {e}");
-    }
+    let context = resolve_video_transcript_context(state, id).await?;
+    let file = context.media_file.as_path();
+    let bundle = if TranscriptArtifactStore::canonical_artifacts_exist(&context.artifact_dir)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        TranscriptArtifactStore::apply_manual_edit(context.source, &context.artifact_dir, &subtitle)
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        let legacy = match tokio::fs::read_to_string(file.with_extension("srt")).await {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        if let Some(legacy) = legacy {
+            let initialized = TranscriptArtifactStore::initialize(
+                context.source.clone(),
+                &context.artifact_dir,
+                &legacy,
+                &legacy,
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if initialized.corrected_srt == subtitle {
+                initialized
+            } else {
+                TranscriptArtifactStore::apply_manual_edit(
+                    context.source,
+                    &context.artifact_dir,
+                    &subtitle,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            }
+        } else {
+            TranscriptArtifactStore::initialize_manual_import(
+                context.source,
+                &context.artifact_dir,
+                &subtitle,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        }
+    };
+    write_legacy_video_subtitle(file, &bundle.corrected_srt).await?;
     Ok(())
+}
+
+async fn write_legacy_video_subtitle(file: &Path, subtitle: &str) -> Result<(), String> {
+    tokio::fs::write(file.with_extension("srt"), subtitle)
+        .await
+        .map_err(|error| format!("同步兼容字幕失败: {error}"))
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -992,10 +1227,19 @@ async fn encode_video_subtitle_inner(
     id: i64,
     srt_style: String,
 ) -> Result<VideoRow, String> {
-    let video = state.db.get_video(id).await?;
-    let config = state.config.read().await;
-    let filepath = Path::new(&config.output).join(&video.file);
+    let context = resolve_video_transcript_context(state, id).await?;
+    let video = state.db.get_video(context.video_id).await?;
+    let filepath = context.media_file;
     let subtitle_path = filepath.with_extension("srt");
+    if TranscriptArtifactStore::canonical_artifacts_exist(&context.artifact_dir)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let bundle = TranscriptArtifactStore::load_from_dir(context.source, context.artifact_dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        write_legacy_video_subtitle(&filepath, &bundle.corrected_srt).await?;
+    }
 
     let output_filename =
         ffmpeg::encode_video_subtitle(reporter, &filepath, &subtitle_path, srt_style).await?;
@@ -1049,8 +1293,44 @@ pub async fn generic_ffmpeg_command(
     _state: state_type!(),
     args: Vec<String>,
 ) -> Result<String, String> {
+    if !generic_ffmpeg_command_enabled() {
+        log::warn!(
+            "Rejected generic_ffmpeg_command because BSR_ENABLE_GENERIC_FFMPEG is not enabled"
+        );
+        return Err(
+            "generic_ffmpeg_command is disabled by default. Use fixed FFmpeg tools instead."
+                .to_string(),
+        );
+    }
+
     let args_str: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
     ffmpeg::generic_ffmpeg_command(&args_str).await
+}
+
+fn generic_ffmpeg_command_enabled() -> bool {
+    std::env::var("BSR_ENABLE_GENERIC_FFMPEG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod p0_security_tests {
+    use super::generic_ffmpeg_command_enabled;
+
+    #[test]
+    fn test_generic_ffmpeg_command_disabled_by_default() {
+        std::env::remove_var("BSR_ENABLE_GENERIC_FFMPEG");
+        assert!(!generic_ffmpeg_command_enabled());
+    }
+
+    #[test]
+    fn test_generic_ffmpeg_command_requires_explicit_enable() {
+        std::env::set_var("BSR_ENABLE_GENERIC_FFMPEG", "1");
+        assert!(generic_ffmpeg_command_enabled());
+        std::env::set_var("BSR_ENABLE_GENERIC_FFMPEG", "false");
+        assert!(!generic_ffmpeg_command_enabled());
+        std::env::remove_var("BSR_ENABLE_GENERIC_FFMPEG");
+    }
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -1537,4 +1817,33 @@ pub async fn generate_audio_sample(state: state_type!(), video_id: i64) -> Resul
         let _ = crate::ffmpeg::extract_audio_sample(&video_path).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod delete_file_tests {
+    use super::remove_required_media_file;
+
+    #[tokio::test]
+    async fn missing_media_file_is_already_deleted() {
+        let path = std::env::temp_dir().join(format!(
+            "shadowreplay-missing-video-{}.mp4",
+            uuid::Uuid::new_v4()
+        ));
+
+        assert!(remove_required_media_file(&path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn media_delete_failure_is_returned_to_the_caller() {
+        let path = std::env::temp_dir().join(format!(
+            "shadowreplay-video-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).unwrap();
+
+        let error = remove_required_media_file(&path).await.unwrap_err();
+
+        assert!(error.contains("无法删除视频文件"));
+        std::fs::remove_dir(&path).unwrap();
+    }
 }

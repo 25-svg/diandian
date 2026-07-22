@@ -54,6 +54,20 @@ impl SubtitleGenerator for WhisperCPP {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
+        // whisper.cpp defaults to a conservative thread count. Use most of the
+        // available logical CPUs for offline post-record transcription while
+        // keeping two threads free so the desktop UI remains responsive.
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4);
+        let inference_threads = logical_cpus.saturating_sub(2).clamp(2, 12) as i32;
+        params.set_n_threads(inference_threads);
+        log::info!(
+            "Whisper CPU threads: {} of {} logical CPUs",
+            inference_threads,
+            logical_cpus
+        );
+
         // and set the language
         params.set_language(Some(language_hint));
         params.set_initial_prompt(self.prompt.as_str());

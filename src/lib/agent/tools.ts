@@ -1,6 +1,6 @@
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { invoke } from "../invoker";
+import { invoke, invokeSensitive } from "../invoker";
 import {
   default_profile,
   generateEventId,
@@ -207,17 +207,17 @@ const get_archive = tool(
 
 // @ts-ignore
 const delete_archive = tool(
-  async ({
-    platform,
-    room_id,
-    live_id,
-  }: {
+  async (args: {
     platform: string;
     room_id: string;
     live_id: string;
+    idempotency_key?: string;
+    confirmation_token?: string;
+    trace_id?: string;
   }) => {
-    const result = await invoke("delete_archive", {
-      platform,
+    const { room_id, live_id, ...securityArgs } = args;
+    const result = await invokeSensitive("delete_archive", {
+      ...securityArgs,
       roomId: room_id,
       liveId: live_id,
     });
@@ -240,17 +240,17 @@ const delete_archive = tool(
 
 // @ts-ignore
 const delete_archives = tool(
-  async ({
-    platform,
-    room_id,
-    live_ids,
-  }: {
+  async (args: {
     platform: string;
     room_id: string;
     live_ids: string[];
+    idempotency_key?: string;
+    confirmation_token?: string;
+    trace_id?: string;
   }) => {
-    const result = await invoke("delete_archives", {
-      platform,
+    const { room_id, live_ids, ...securityArgs } = args;
+    const result = await invokeSensitive("delete_archives", {
+      ...securityArgs,
       roomId: room_id,
       liveIds: live_ids,
     });
@@ -387,8 +387,8 @@ const get_video_cover = tool(
 
 // @ts-ignore
 const delete_video = tool(
-  async ({ id }: { id: number }) => {
-    const result = await invoke("delete_video", { id });
+  async (args: { id: number; idempotency_key?: string; confirmation_token?: string; trace_id?: string }) => {
+    const result = await invokeSensitive("delete_video", args);
     return result;
   },
   {
@@ -1071,7 +1071,262 @@ const get_archive_metadata = tool(
   }
 );
 
-const tools = [
+const get_review_samples = tool(
+  async ({ category, baseline_only }: { category?: string; baseline_only?: boolean }) => {
+    const rows = (await invoke("get_review_samples")) as any[];
+    return rows.filter((row) => {
+      if (category && row.category !== category) return false;
+      if (baseline_only && row.is_b_baseline !== 1) return false;
+      return true;
+    });
+  },
+  {
+    name: "get_review_samples",
+    description:
+      "Get saved live-commerce review samples and B baselines for calibration or A/B comparison. The result includes the full saved review content.",
+    schema: z.object({
+      category: z.string().optional().describe("Filter by exact product category"),
+      baseline_only: z.boolean().optional().describe("Only return B baseline samples"),
+    }),
+  }
+);
+
+type ToolPermission = "read" | "write" | "dangerous" | "admin";
+
+type ToolSecurityPolicy = {
+  permission: ToolPermission;
+  writes?: boolean;
+  sensitive?: boolean;
+  disabled?: boolean;
+  resourceScoped?: boolean;
+};
+
+const toolSecurityPolicies: Record<string, ToolSecurityPolicy> = {
+  get_accounts: { permission: "admin", resourceScoped: true },
+  remove_account: { permission: "admin", writes: true, sensitive: true },
+  add_recorder: { permission: "write", writes: true, resourceScoped: true },
+  remove_recorder: { permission: "admin", writes: true, sensitive: true, resourceScoped: true },
+  get_recorder_list: { permission: "read" },
+  get_recorder_info: { permission: "read", resourceScoped: true },
+  get_archives: { permission: "read", resourceScoped: true },
+  get_archive: { permission: "read", resourceScoped: true },
+  delete_archive: { permission: "dangerous", writes: true, sensitive: true, resourceScoped: true },
+  delete_archives: { permission: "dangerous", writes: true, sensitive: true, resourceScoped: true },
+  get_background_tasks: { permission: "read" },
+  delete_background_task: { permission: "admin", writes: true, sensitive: true },
+  get_videos: { permission: "read", resourceScoped: true },
+  get_all_videos: { permission: "admin", resourceScoped: true },
+  get_video: { permission: "read", resourceScoped: true },
+  get_video_cover: { permission: "read", resourceScoped: true },
+  delete_video: { permission: "dangerous", writes: true, sensitive: true, resourceScoped: true },
+  get_video_typelist: { permission: "read" },
+  get_video_subtitle: { permission: "read", resourceScoped: true },
+  generate_video_subtitle: { permission: "write", writes: true, resourceScoped: true },
+  encode_video_subtitle: { permission: "write", writes: true, resourceScoped: true },
+  post_video_to_bilibili: { permission: "dangerous", writes: true, sensitive: true, resourceScoped: true },
+  get_danmu_record: { permission: "read", resourceScoped: true },
+  clip_range: { permission: "write", writes: true, resourceScoped: true },
+  get_recent_record: { permission: "read", resourceScoped: true },
+  get_recent_record_all: { permission: "admin", resourceScoped: true },
+  generic_ffmpeg_command: { permission: "admin", writes: true, sensitive: true, disabled: true },
+  open_clip: { permission: "read", resourceScoped: true },
+  list_folder: { permission: "dangerous", sensitive: true, resourceScoped: true },
+  get_archive_subtitle: { permission: "read", resourceScoped: true },
+  generate_archive_subtitle: { permission: "write", writes: true, resourceScoped: true },
+  extract_video_frames: { permission: "read", resourceScoped: true },
+  get_video_metadata: { permission: "read", resourceScoped: true },
+  analyze_danmu_highlights: { permission: "read", resourceScoped: true },
+  search_danmu_keywords: { permission: "read", resourceScoped: true },
+  merge_videos: { permission: "write", writes: true, resourceScoped: true },
+  extract_video_audio: { permission: "write", writes: true, resourceScoped: true },
+  get_archive_metadata: { permission: "read", resourceScoped: true },
+  get_review_samples: { permission: "admin", resourceScoped: true },
+};
+
+const permissionRank: Record<ToolPermission, number> = {
+  read: 1,
+  write: 2,
+  dangerous: 3,
+  admin: 4,
+};
+
+function getCurrentAgentPermission(): ToolPermission {
+  const configured = localStorage.getItem("mcp_agent_permission") as ToolPermission | null;
+  if (configured && configured in permissionRank) return configured;
+  return "read";
+}
+
+function generateTraceId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `tr_${crypto.randomUUID()}`;
+  }
+  return `tr_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+    .join(",")}}`;
+}
+
+function hashInput(value: unknown): string {
+  const input = stableStringify(value);
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function redactSensitive(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSensitive);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => {
+      if (/cookie|csrf|token|secret|password|api[_-]?key|authorization/i.test(key)) {
+        return [key, "********"];
+      }
+      return [key, redactSensitive(entry)];
+    })
+  );
+}
+
+function appendAuditLog(entry: Record<string, unknown>) {
+  const safeEntry = redactSensitive(entry);
+  const current = JSON.parse(localStorage.getItem("mcp_tool_audit_log") || "[]");
+  current.push(safeEntry);
+  localStorage.setItem("mcp_tool_audit_log", JSON.stringify(current.slice(-500)));
+  invoke("console_log", {
+    level: entry.status === "failed" || entry.status === "rejected" ? "warn" : "info",
+    message: `[mcp-tool-audit] ${JSON.stringify(safeEntry)}`,
+  }).catch(() => undefined);
+}
+
+function extendSchemaForPolicy(schema: any, policy: ToolSecurityPolicy) {
+  if (!schema || typeof schema.extend !== "function") return schema;
+  const extraFields: Record<string, any> = {
+    trace_id: z.string().min(8).max(160).optional().describe("Optional caller-provided trace id"),
+  };
+  if (policy.writes) {
+    extraFields.idempotency_key = z
+      .string()
+      .min(8)
+      .max(128)
+      .describe("Required idempotency key for write tools");
+  }
+  if (policy.sensitive) {
+    extraFields.confirmation_token = z
+      .string()
+      .min(8)
+      .max(160)
+      .describe("Required second-confirmation token for sensitive tools");
+  }
+  return schema.extend(extraFields);
+}
+
+function validateConfirmation(toolName: string, confirmationToken?: string) {
+  return confirmationToken === `confirm:${toolName}`;
+}
+
+async function invokeWithSecurity(originalTool: any, args: Record<string, any>, policy: ToolSecurityPolicy) {
+  const startedAt = performance.now();
+  const traceId = args.trace_id || generateTraceId();
+  const inputHash = hashInput(args);
+  const permission = getCurrentAgentPermission();
+  const auditBase = {
+    trace_id: traceId,
+    tool_name: originalTool.name,
+    permission_required: policy.permission,
+    caller_permission: permission,
+    input_hash: inputHash,
+    idempotency_key: args.idempotency_key,
+    confirmation_id: args.confirmation_token ? hashInput(args.confirmation_token) : undefined,
+  };
+
+  appendAuditLog({ ...auditBase, status: "received", created_at: new Date().toISOString() });
+
+  try {
+    if (policy.disabled) {
+      throw new Error("PERMISSION_DENIED: tool is disabled by P0 security policy");
+    }
+    if (permissionRank[permission] < permissionRank[policy.permission]) {
+      throw new Error(`PERMISSION_DENIED: ${originalTool.name} requires ${policy.permission}`);
+    }
+    if (policy.writes && !args.idempotency_key) {
+      throw new Error("INVALID_ARGUMENT: idempotency_key is required for write tools");
+    }
+    if (policy.sensitive && !validateConfirmation(originalTool.name, args.confirmation_token)) {
+      throw new Error(`CONFIRMATION_REQUIRED: confirmation_token must equal confirm:${originalTool.name}`);
+    }
+
+    const idempotencyStoreKey = policy.writes
+      ? `mcp_idempotency:${originalTool.name}:${args.idempotency_key}`
+      : "";
+    if (policy.writes) {
+      const existing = localStorage.getItem(idempotencyStoreKey);
+      if (existing) {
+        const parsed = JSON.parse(existing);
+        if (parsed.input_hash !== inputHash) {
+          throw new Error("CONFLICT: idempotency_key was already used with different arguments");
+        }
+        appendAuditLog({
+          ...auditBase,
+          status: "succeeded",
+          idempotency_replay: true,
+          duration_ms: Math.round(performance.now() - startedAt),
+          created_at: new Date().toISOString(),
+        });
+        return parsed.result;
+      }
+    }
+
+    const result = await originalTool.invoke(args);
+    if (policy.writes) {
+      localStorage.setItem(
+        idempotencyStoreKey,
+        JSON.stringify({
+          input_hash: inputHash,
+          result,
+          created_at: new Date().toISOString(),
+        })
+      );
+    }
+    appendAuditLog({
+      ...auditBase,
+      status: "succeeded",
+      duration_ms: Math.round(performance.now() - startedAt),
+      created_at: new Date().toISOString(),
+    });
+    return result;
+  } catch (error) {
+    appendAuditLog({
+      ...auditBase,
+      status: "failed",
+      duration_ms: Math.round(performance.now() - startedAt),
+      error_message: error?.message || String(error),
+      created_at: new Date().toISOString(),
+    });
+    throw error;
+  }
+}
+
+function secureTool(originalTool: any) {
+  const policy = toolSecurityPolicies[originalTool.name] || { permission: "read" as ToolPermission };
+  return tool(
+    async (args: Record<string, any>) => invokeWithSecurity(originalTool, args || {}, policy),
+    {
+      name: originalTool.name,
+      description: `${originalTool.description}\n\nSecurity: permission=${policy.permission}; writes=${Boolean(policy.writes)}; sensitive=${Boolean(policy.sensitive)}; disabled=${Boolean(policy.disabled)}.`,
+      schema: extendSchemaForPolicy(originalTool.schema, policy),
+    }
+  );
+}
+
+const rawTools = [
   get_accounts,
   remove_account,
   add_recorder,
@@ -1111,6 +1366,9 @@ const tools = [
   merge_videos,
   extract_video_audio,
   get_archive_metadata,
+  get_review_samples,
 ];
+
+const tools = rawTools.map(secureTool);
 
 export { tools };

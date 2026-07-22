@@ -8,7 +8,9 @@
   export let showDialog = false;
   export let roomId: string | null = null;
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{
+    imported: { videoId?: number; videoIds?: number[] };
+  }>();
   const IMPORTED_VIDEO_ROOM = "bsr:import";
 
   let selectedFilePath: string | null = null;
@@ -67,7 +69,7 @@
         currentImportEventId = null;
         importProgress = "";
         resetBatchImportState();
-        dispatch("imported");
+        dispatch("imported", {});
       }
     } catch (error) {
       console.error(`[ImportDialog] Failed to check task status:`, error);
@@ -295,7 +297,7 @@
             selectedFileSize = 0;
             videoTitle = "";
             resetBatchImportState();
-            dispatch("imported");
+            dispatch("imported", {});
           } else {
             throw new Error(response.message || "批量导入失败");
           }
@@ -374,7 +376,6 @@
             selectedFileSize = 0;
             videoTitle = "";
             resetBatchImportState();
-            dispatch("imported");
           } else {
             alert("导入失败: " + e.payload.message);
             resetBatchImportState();
@@ -389,11 +390,22 @@
         },
       );
 
-      await invoke("batch_import_external_videos", {
+      const result = await invoke<{
+        successful_imports: number;
+        failed_imports: number;
+        imported_video_ids: number[];
+      }>("batch_import_external_videos", {
         eventId: eventId,
         filePaths: selectedFiles,
         roomId: roomId || IMPORTED_VIDEO_ROOM,
       });
+      const videoIds = result?.imported_video_ids || [];
+      if (videoIds.length > 0) {
+        dispatch("imported", {
+          videoId: videoIds[videoIds.length - 1],
+          videoIds,
+        });
+      }
     } catch (error) {
       console.error("批量导入失败:", error);
       alert("批量导入失败: " + error);
@@ -447,7 +459,6 @@
             selectedFileSize = 0;
             videoTitle = "";
             resetBatchImportState();
-            dispatch("imported");
           } else {
             alert("导入失败: " + e.payload.message);
             resetBatchImportState();
@@ -462,14 +473,16 @@
         },
       );
 
-      await invoke("import_external_video", {
+      const importedVideo = await invoke<{ id: number }>("import_external_video", {
         eventId: eventId,
         filePath: selectedFilePath,
         title: videoTitle,
         roomId: roomId || IMPORTED_VIDEO_ROOM,
       });
-
-      // 注意：成功处理移到了progressFinishedListener中
+      dispatch("imported", {
+        videoId: importedVideo.id,
+        videoIds: [importedVideo.id],
+      });
     } catch (error) {
       console.error("导入失败:", error);
       alert("导入失败: " + error);

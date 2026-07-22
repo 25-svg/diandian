@@ -41,6 +41,9 @@ export default defineConfig(async ({ mode }) => {
     server: {
       port: 8054,
       strictPort: true,
+      watch: {
+        ignored: ["**/src-tauri/target/**"],
+      },
     },
     // to make use of `TAURI_DEBUG` and other env variables
     // https://tauri.studio/v1/api/config#buildconfig.beforedevcommand

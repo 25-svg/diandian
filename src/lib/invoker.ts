@@ -6,6 +6,7 @@ import { open as tauri_open } from "@tauri-apps/plugin-shell";
 import { onOpenUrl as tauri_onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { io, Socket } from "socket.io-client";
 import type { Config } from "./interface";
+import { buildSensitiveCommandArgs } from "./sensitiveCommand";
 
 declare global {
   interface Window {
@@ -99,6 +100,28 @@ async function invoke<T>(
     // 将 HTTP 错误转换为 Tauri 风格的错误
     throw new Error(`Failed to invoke ${command}:\n${error}`);
   }
+}
+
+async function invokeSensitive<T>(
+  command: string,
+  args: Record<string, any>
+): Promise<T> {
+  const providedIdempotencyKey = args.idempotency_key;
+  const providedTraceId = args.trace_id;
+  const commandArgs = { ...args };
+  delete commandArgs.idempotency_key;
+  delete commandArgs.confirmation_token;
+  delete commandArgs.trace_id;
+
+  const suffix = crypto.randomUUID();
+  const securedArgs = buildSensitiveCommandArgs(
+    command,
+    commandArgs,
+    TAURI_ENV,
+    providedIdempotencyKey || `${command}-${Date.now()}-${suffix}`,
+    providedTraceId || `ui-${suffix}`
+  );
+  return invoke<T>(command, securedArgs);
 }
 
 async function get(url: string) {
@@ -300,4 +323,5 @@ export {
   onOpenUrl,
   get_static_url,
   normalizeEndpoint,
+  invokeSensitive,
 };

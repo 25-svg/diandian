@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use crate::database::account::AccountRow;
+use crate::security::{audit_tool_failure, audit_tool_success, require_sensitive_write};
 use crate::state::State;
 use crate::state_type;
 use chrono::Utc;
@@ -9,6 +10,8 @@ use recorder::platforms::{bilibili, douyin, huya, kuaishou, tiktok, PlatformType
 use recorder::UserInfo;
 
 use hyper::header::HeaderValue;
+#[cfg(feature = "gui")]
+use tauri::Manager;
 #[cfg(feature = "gui")]
 use tauri::State as TauriState;
 
@@ -218,13 +221,33 @@ pub async fn remove_account(
     state: state_type!(),
     platform: String,
     uid: String,
+    idempotency_key: String,
+    confirmation_token: String,
+    trace_id: Option<String>,
 ) -> Result<(), String> {
+    let audit = require_sensitive_write(
+        "remove_account",
+        &idempotency_key,
+        &confirmation_token,
+        trace_id.as_deref(),
+        &format!("account:{platform}:{uid}"),
+    )?;
     if platform == "bilibili" {
         let account = state.db.get_account(&platform, &uid).await?;
         let client = reqwest::Client::new();
         let _ = bilibili::api::logout(&client, &account.to_account()).await;
     }
-    Ok(state.db.remove_account(&platform, &uid).await?)
+    match state.db.remove_account(&platform, &uid).await {
+        Ok(result) => {
+            audit_tool_success(&audit);
+            Ok(result)
+        }
+        Err(error) => {
+            let error = error.to_string();
+            audit_tool_failure(&audit, &error);
+            Err(error)
+        }
+    }
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -248,6 +271,99 @@ pub async fn get_qr(_state: state_type!()) -> Result<QrInfo, ()> {
         Ok(qr_info) => Ok(qr_info),
         Err(_e) => Err(()),
     }
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub async fn open_douyin_login(state: state_type!()) -> Result<(), String> {
+    const LABEL: &str = "douyin-login";
+
+    if let Some(window) = state.app_handle.get_webview_window(LABEL) {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &state.app_handle,
+        LABEL,
+        tauri::WebviewUrl::External(
+            "https://www.douyin.com/"
+                .parse()
+                .map_err(|e| format!("Invalid Douyin login URL: {e}"))?,
+        ),
+    )
+    .title("抖音扫码登录")
+    .inner_size(1100.0, 760.0)
+    .center()
+    .initialization_script(
+        r#"
+        (() => {
+          const timer = setInterval(() => {
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
+            const label = nodes.find((node) =>
+              node.textContent && node.textContent.trim() === '登录' && node.offsetParent !== null
+            );
+            const target = label && (label.closest('button, [role="button"]') || label);
+            if (target) {
+              target.click();
+              clearInterval(timer);
+            }
+          }, 400);
+          setTimeout(() => clearInterval(timer), 15000);
+        })();
+        "#,
+    )
+    .build()
+    .map_err(|e| format!("打开抖音登录窗口失败: {e}"))?;
+
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub async fn get_douyin_login_cookies(state: state_type!()) -> Result<Option<String>, String> {
+    let Some(window) = state.app_handle.get_webview_window("douyin-login") else {
+        return Ok(None);
+    };
+
+    // This is an async command: WebView2 cookie reads must not run in a synchronous
+    // event handler on Windows, otherwise the WebView callback can deadlock.
+    let cookies = window
+        .cookies_for_url(
+            "https://www.douyin.com/"
+                .parse()
+                .map_err(|e| format!("Invalid Douyin URL: {e}"))?,
+        )
+        .map_err(|e| format!("读取抖音登录状态失败: {e}"))?;
+
+    let logged_in = cookies.iter().any(|cookie| {
+        matches!(
+            cookie.name(),
+            "sessionid" | "sessionid_ss" | "sid_guard" | "sid_tt"
+        ) && !cookie.value().is_empty()
+    });
+
+    if !logged_in {
+        return Ok(None);
+    }
+
+    let cookie_header = cookies
+        .iter()
+        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Ok(Some(cookie_header))
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub async fn close_douyin_login(state: state_type!()) -> Result<(), String> {
+    if let Some(window) = state.app_handle.get_webview_window("douyin-login") {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

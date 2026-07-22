@@ -75,6 +75,46 @@ export interface VideoItem {
   platform?: string;
 }
 
+export interface ReviewSample {
+  id: number;
+  sample_no: string;
+  product: string;
+  category: string;
+  deal_status: string;
+  evidence_strength: string;
+  transcript_path: string;
+  data_screenshot_path: string;
+  review_status: string;
+  is_b_baseline: number;
+  ops_score: number | null;
+  host_score: number | null;
+  control_score: number | null;
+  main_issue: string;
+  notes: string;
+  clip_type: string;
+  source_video_path: string;
+  review_file_path: string;
+  transcription_quality: string;
+  agent_version: string;
+  calibration_score: number | null;
+  fact_accuracy_score: number | null;
+  key_action_score: number | null;
+  oral_usability_score: number | null;
+  training_value_score: number | null;
+  review_content: string;
+  video_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ReviewSampleInput = Omit<
+  ReviewSample,
+  "id" | "is_b_baseline" | "created_at" | "updated_at"
+> & {
+  id?: number;
+  is_b_baseline: boolean;
+};
+
 export interface Profile {
   videos: Video[];
   cover: string;
@@ -145,6 +185,13 @@ export interface Config {
   whisper_prompt: string;
   openai_api_endpoint: string;
   openai_api_key: string;
+  volcengine_api_key: string;
+  volcengine_app_id: string;
+  volcengine_access_token: string;
+  volcengine_resource_id: string;
+  volcengine_boosting_table_id: string;
+  volcengine_correct_table_id: string;
+  admin_mode: boolean;
   clip_name_format: string;
   auto_generate: AutoGenerateConfig;
   status_check_interval: number;

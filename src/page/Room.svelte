@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke, open, onOpenUrl, get_static_url, get } from "../lib/invoker";
+  import { invoke, invokeSensitive, open, onOpenUrl, get_static_url, get } from "../lib/invoker";
   import { message } from "@tauri-apps/plugin-dialog";
   import { fade, scale } from "svelte/transition";
   import { Dropdown, DropdownItem } from "flowbite-svelte";
@@ -74,6 +74,7 @@
     }
     console.log("get avatar url:", url);
     const response = await get(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const blob = await response.blob();
     const avatar_url = URL.createObjectURL(blob);
     avatar_cache.set(user_id, avatar_url);
@@ -87,6 +88,7 @@
     }
     console.log("get image url:", url);
     const response = await get(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const blob = await response.blob();
     const cover_url = URL.createObjectURL(blob);
     image_cache.set(url, cover_url);
@@ -110,29 +112,41 @@
       return 0;
     });
 
-    // process room cover
-    for (const room of new_summary.recorders) {
-      if (room.user_info.user_avatar != "") {
-        room.user_info.user_avatar = await get_avatar_url(
-          room.user_info.user_id,
-          room.user_info.user_avatar,
-        );
-      } else {
-        room.user_info.user_avatar = default_avatar(room.room_info.platform);
-      }
-
-      if (room.room_info.room_cover != "") {
-        room.room_info.room_cover = await get_image_url(
-          room.room_info.room_cover,
-        );
-      } else if (room.user_info.user_avatar != "") {
-        room.room_info.room_cover = room.user_info.user_avatar;
-      } else {
-        room.room_info.room_cover = default_cover(room.room_info.platform);
-      }
+    // Render cards immediately with local placeholders. Douyin image hosts can
+    // be slow or temporarily unreachable; they must not block the room list.
+    const remoteImages = new_summary.recorders.map((room) => ({
+      room,
+      avatar: room.user_info.user_avatar,
+      cover: room.room_info.room_cover,
+    }));
+    for (const { room } of remoteImages) {
+      room.user_info.user_avatar = default_avatar(room.room_info.platform);
+      room.room_info.room_cover = default_cover(room.room_info.platform);
     }
-
     summary = new_summary;
+
+    await Promise.all(
+      remoteImages.map(async ({ room, avatar, cover }) => {
+        if (avatar) {
+          try {
+            room.user_info.user_avatar = await get_avatar_url(
+              room.user_info.user_id,
+              avatar,
+            );
+          } catch (error) {
+            console.warn("加载直播间头像失败，使用默认图标", error);
+          }
+        }
+        if (cover) {
+          try {
+            room.room_info.room_cover = await get_image_url(cover);
+          } catch (error) {
+            console.warn("加载直播间封面失败，使用默认封面", error);
+          }
+        }
+      }),
+    );
+    summary = { ...new_summary, recorders: [...new_summary.recorders] };
   }
   update_summary();
   setInterval(update_summary, 5000);
@@ -1002,7 +1016,8 @@
                           class="p-1.5 rounded-lg hover:bg-red-500/10 transition-colors"
                           title="删除记录"
                           on:click={() => {
-                            invoke("delete_archive", {
+                            if (!window.confirm(`确定要删除录播“${archive.title || archive.live_id}”吗？此操作无法撤销。`)) return;
+                            invokeSensitive("delete_archive", {
                               platform: archiveRoom.room_info.platform,
                               roomId: archiveRoom.room_info.room_id,
                               liveId: archive.live_id,

@@ -116,7 +116,7 @@
                 class="bg-gray-50 dark:bg-gray-700 rounded-lg p-3 border border-gray-200 dark:border-gray-600"
               >
                 <div
-                  class="text-sm text-gray-700 dark:text-gray-300 leading-relaxed"
+                  class="selectable-content text-sm text-gray-700 dark:text-gray-300 leading-relaxed"
                 >
                   {message.content || "无响应内容"}
                 </div>

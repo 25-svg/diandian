@@ -41,6 +41,34 @@ impl Database {
         )
     }
 
+    pub async fn get_video_source(&self, id: i64) -> Result<(i64, String), DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        Ok(
+            sqlx::query_as::<_, (i64, String)>("SELECT id, file FROM videos WHERE id = $1")
+                .bind(id)
+                .fetch_one(&lock)
+                .await?,
+        )
+    }
+
+    pub async fn list_video_sources(&self) -> Result<Vec<(i64, String)>, DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        Ok(
+            sqlx::query_as::<_, (i64, String)>("SELECT id, file FROM videos ORDER BY id ASC")
+                .fetch_all(&lock)
+                .await?,
+        )
+    }
+
+    pub async fn count_videos_with_file(&self, file: &str) -> Result<i64, DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        let (count,) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM videos WHERE file = $1")
+            .bind(file)
+            .fetch_one(&lock)
+            .await?;
+        Ok(count)
+    }
+
     pub async fn update_video(&self, video_row: &VideoRow) -> Result<(), DatabaseError> {
         let lock = self.db.read().await.clone().unwrap();
         sqlx::query("UPDATE videos SET status = $1, bvid = $2, title = $3, desc = $4, tags = $5, area = $6, note = $7 WHERE id = $8")

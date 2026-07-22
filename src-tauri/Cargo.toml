@@ -37,7 +37,7 @@ async-ffmpeg-sidecar = "0.0.1"
 chrono = { version = "0.4.24", features = ["serde"] }
 toml = "0.7.3"
 regex = "1.7.3"
-tokio = { version = "1.27.0", features = ["process"] }
+tokio = { version = "1.27.0", features = ["process", "io-util"] }
 platform-dirs = "0.3.0"
 pct-str = "1.2.0"
 md5 = "0.7.0"
@@ -148,6 +148,9 @@ optional = true
 version = "2"
 features = []
 optional = true
+
+[dev-dependencies]
+tempfile = "3"
 
 
 [workspace.dependencies]

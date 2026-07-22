@@ -39,3 +39,9 @@ docs/.vitepress/dist
 *.debug.map
 
 .cargo
+
+# Local ASR development and packaged runtime artifacts
+.funasr-venv/
+build/
+src-tauri/resources/funasr-runtime/
+src-tauri/target-funasr-check*/

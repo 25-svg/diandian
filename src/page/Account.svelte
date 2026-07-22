@@ -14,6 +14,9 @@
 
   async function update_accounts() {
     let new_account_info = (await invoke("get_accounts")) as AccountInfo;
+    // Render account identity immediately. Remote avatar loading is optional and
+    // must never keep an already-saved account out of the list.
+    account_info = new_account_info;
     for (const account of new_account_info.accounts) {
       if (account.avatar === "") {
         account.avatar = platform_avatar(account.platform);
@@ -23,23 +26,36 @@
         account.avatar = avatar_cache.get(account.avatar);
         continue;
       }
-      const avatar_response = await get(account.avatar);
-      const avatar_blob = await avatar_response.blob();
-      const avatar_url = URL.createObjectURL(avatar_blob);
-      avatar_cache.set(account.avatar, avatar_url);
-      account.avatar = avatar_url;
+      try {
+        const originalAvatar = account.avatar;
+        const avatar_response = await get(originalAvatar);
+        if (!avatar_response.ok) {
+          throw new Error(`HTTP ${avatar_response.status}`);
+        }
+        const avatar_blob = await avatar_response.blob();
+        const avatar_url = URL.createObjectURL(avatar_blob);
+        avatar_cache.set(originalAvatar, avatar_url);
+        account.avatar = avatar_url;
+      } catch (error) {
+        console.warn("加载账号头像失败，使用平台默认图标", error);
+        account.avatar = platform_avatar(account.platform);
+      }
     }
-    account_info = new_account_info;
+    account_info = {
+      ...new_account_info,
+      accounts: [...new_account_info.accounts],
+    };
   }
 
   update_accounts();
 
   let addModal = false;
   let activeTab = "qr"; // 'qr' or 'manual'
-  let selectedPlatform = "bilibili"; // 'bilibili' or 'douyin'
+  let selectedPlatform = "douyin";
   let oauth_key = "";
   let check_interval = null;
   let cookie_str = "";
+  let douyinLoginStatus = "点击下方按钮，打开抖音官方扫码登录窗口";
 
   let manualModal = false;
 
@@ -104,6 +120,43 @@
       });
       await update_accounts();
       addModal = false;
+    }
+  }
+
+  async function handle_douyin_login() {
+    if (check_interval) {
+      clearInterval(check_interval);
+    }
+    douyinLoginStatus = "请在新窗口中使用抖音 App 扫码并确认登录";
+    try {
+      await invoke("open_douyin_login");
+      check_interval = setInterval(check_douyin_login, 2000);
+    } catch (e) {
+      douyinLoginStatus = `打开登录窗口失败：${e}`;
+    }
+  }
+
+  async function check_douyin_login() {
+    try {
+      const cookies = (await invoke("get_douyin_login_cookies")) as
+        | string
+        | null;
+      if (!cookies) return;
+
+      douyinLoginStatus = "登录成功，正在保存账号…";
+      clearInterval(check_interval);
+      await invoke("add_account", {
+        cookies,
+        platform: "douyin",
+      });
+      // The account is already saved at this point. Closing the login window or
+      // loading a remote avatar must not turn a successful login into an error.
+      await invoke("close_douyin_login").catch(console.warn);
+      await update_accounts();
+      addModal = false;
+    } catch (e) {
+      clearInterval(check_interval);
+      douyinLoginStatus = `登录信息校验失败：${e}`;
     }
   }
 
@@ -172,9 +225,7 @@
       <button
         on:click={() => {
           addModal = true;
-          if (activeTab === "qr") {
-            requestAnimationFrame(handle_qr);
-          }
+          activeTab = "qr";
         }}
         class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center space-x-2"
       >
@@ -267,9 +318,7 @@
         class="w-full p-4 rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
         on:click={() => {
           addModal = true;
-          if (activeTab === "qr") {
-            requestAnimationFrame(handle_qr);
-          }
+          activeTab = "qr";
         }}
       >
         <div class="flex flex-col items-center justify-center space-y-2">
@@ -310,7 +359,7 @@
 
       <div class="p-6 space-y-6">
         <!-- Platform Selection -->
-        <div class="space-y-2">
+        <div class="hidden">
           <label
             for="platform"
             class="block text-sm font-medium text-gray-700 dark:text-gray-300"
@@ -340,7 +389,7 @@
                 : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}"
               on:click={() => {
                 selectedPlatform = "douyin";
-                activeTab = "manual";
+                activeTab = "qr";
               }}
             >
               抖音
@@ -422,6 +471,26 @@
               </div>
               <p class="text-sm text-center text-gray-600 dark:text-gray-400">
                 请使用 BiliBili App 扫描二维码登录
+              </p>
+            </div>
+          {:else if selectedPlatform === "douyin" && activeTab === "qr"}
+            <div class="flex flex-col items-center space-y-4 py-2">
+              <div
+                class="w-16 h-16 rounded-2xl bg-black flex items-center justify-center"
+              >
+                <img src="/imgs/douyin.png" alt="抖音" class="w-10 h-10" />
+              </div>
+              <p class="text-sm text-center text-gray-600 dark:text-gray-400">
+                {douyinLoginStatus}
+              </p>
+              <button
+                class="w-full px-4 py-2.5 bg-black hover:bg-gray-800 text-white text-sm font-medium rounded-lg transition-colors"
+                on:click={handle_douyin_login}
+              >
+                打开抖音扫码登录
+              </button>
+              <p class="text-xs text-gray-400 text-center">
+                登录信息只保存在本机，无需复制或查看 Cookie
               </p>
             </div>
           {:else}

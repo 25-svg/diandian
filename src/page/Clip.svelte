@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke, TAURI_ENV, get_static_url } from "../lib/invoker";
+  import { invoke, invokeSensitive, TAURI_ENV, get_static_url } from "../lib/invoker";
   import type { VideoItem } from "../lib/interface";
   import ImportVideoDialog from "../lib/components/ImportVideoDialog.svelte";
   import { onMount, onDestroy, tick } from "svelte";
@@ -21,6 +21,7 @@
     Download,
     RotateCw,
     Edit,
+    FileSearch,
   } from "lucide-svelte";
   import { AnnotationOutline } from "flowbite-svelte-icons";
   import BilibiliIcon from "../lib/components/BilibiliIcon.svelte";
@@ -357,24 +358,33 @@
 
   async function deleteVideo(video: VideoItem) {
     try {
-      await invoke("delete_video", { id: video.id });
+      await invokeSensitive("delete_video", { id: video.id });
       await loadVideos();
       showDeleteConfirm = false;
       videoToDelete = null;
     } catch (error) {
       console.error("Failed to delete video:", error);
+      alert(`删除失败：${error}`);
     }
   }
 
   async function deleteSelectedVideos() {
     try {
+      const failures: string[] = [];
       for (const id of selectedVideos) {
-        await invoke("delete_video", { id });
+        try {
+          await invokeSensitive("delete_video", { id });
+        } catch (error) {
+          failures.push(`视频 ${id}：${error}`);
+        }
       }
       selectedVideos.clear();
       await loadVideos();
       showDeleteConfirm = false;
       videoToDelete = null;
+      if (failures.length > 0) {
+        alert(`有 ${failures.length} 个视频删除失败：\n${failures.join("\n")}`);
+      }
     } catch (error) {
       console.error("Failed to delete selected videos:", error);
     }
@@ -388,9 +398,16 @@
     }
   }
 
-  function handleVideoImported() {
-    // 视频导入完成后刷新列表
-    loadVideos();
+  function analyzeVideo(video: VideoItem) {
+    window.dispatchEvent(new CustomEvent("bsr:open-video-analysis", { detail: video }));
+  }
+
+  async function handleVideoImported(event: CustomEvent<{ videoId?: number }>) {
+    await loadVideos();
+    if (!event.detail?.videoId) return;
+    const importedVideo = videos.find((item) => item.id === event.detail.videoId)
+      || await invoke<VideoItem>("get_video", { id: event.detail.videoId });
+    analyzeVideo(importedVideo);
   }
 
   function handleImageError(event: Event) {
@@ -711,7 +728,7 @@
                   />
                 </th>
                 <th
-                  class="px-4 py-3 text-left text-sm font-medium text-gray-500 dark:text-gray-400 w-28"
+                  class="px-4 py-3 text-left text-sm font-medium text-gray-500 dark:text-gray-400 w-36"
                   >直播间</th
                 >
                 <th
@@ -979,8 +996,15 @@
                     </div>
                   </td>
 
-                  <td class="px-4 py-3 w-28">
+                  <td class="px-4 py-3 w-36">
                     <div class="flex items-center space-x-2">
+                      <button
+                        class="p-1.5 rounded-lg hover:bg-purple-500/10 transition-colors"
+                        title="分析视频"
+                        on:click={() => analyzeVideo(video)}
+                      >
+                        <FileSearch class="w-4 h-4 text-purple-500" />
+                      </button>
                       <button
                         class="p-1.5 rounded-lg hover:bg-blue-500/10 transition-colors"
                         title="播放"

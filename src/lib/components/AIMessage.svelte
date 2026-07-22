@@ -2,6 +2,7 @@
   import {
     Bot,
     Check,
+    Copy,
     X,
     AlertTriangle,
   } from "lucide-svelte";
@@ -28,16 +29,52 @@
     ? new Date(message.additional_kwargs.timestamp as string)
     : new Date();
 
-  // 将 Markdown 转换为 HTML
-  $: htmlContent = marked(
+  let copied = false;
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $: plainContent =
     typeof message.content === "string"
       ? message.content
       : Array.isArray(message.content)
         ? message.content
             .map((c) => (typeof c === "string" ? c : JSON.stringify(c)))
             .join("\n")
-        : JSON.stringify(message.content)
-  );
+        : JSON.stringify(message.content);
+
+  // 将 Markdown 转换为 HTML
+  $: htmlContent = marked(plainContent);
+
+  async function copyMessage() {
+    try {
+      let succeeded = false;
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(plainContent);
+          succeeded = true;
+        } catch {
+          // Some WebView environments expose Clipboard API but deny it.
+        }
+      }
+      if (!succeeded) {
+        const textarea = document.createElement("textarea");
+        textarea.value = plainContent;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        succeeded = document.execCommand("copy");
+        textarea.remove();
+        if (!succeeded) throw new Error("copy command failed");
+      }
+      copied = true;
+      if (copyResetTimer) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => (copied = false), 1600);
+    } catch (error) {
+      console.error("复制助手回复失败", error);
+      copied = false;
+    }
+  }
 
   // 检查消息是否包含表格
   $: hasTable = message.content && typeof message.content === 'string' &&
@@ -81,6 +118,21 @@
         <span class="text-xs text-gray-500 dark:text-gray-400">
           {formatTime(messageTime)}
         </span>
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-gray-500 transition-colors hover:bg-gray-200/70 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-100"
+          title={copied ? "已复制" : "复制整条回复"}
+          aria-label={copied ? "已复制" : "复制整条回复"}
+          on:click={copyMessage}
+        >
+          {#if copied}
+            <Check class="h-3.5 w-3.5 text-emerald-500" />
+            <span>已复制</span>
+          {:else}
+            <Copy class="h-3.5 w-3.5" />
+            <span>复制</span>
+          {/if}
+        </button>
       </div>
 
       <div
@@ -110,7 +162,7 @@
         {/if}
 
         <div
-          class="text-gray-900 dark:text-white text-sm leading-relaxed prose prose-sm max-w-none [&_.prose]:bg-transparent [&_.prose_*]:bg-transparent [&_p]:bg-transparent [&_div]:bg-transparent [&_span]:bg-transparent [&_code]:bg-gray-100 dark:bg-gray-700 [&_pre]:bg-gray-100 dark:bg-gray-700 [&_blockquote]:bg-transparent [&_ul]:bg-transparent [&_ol]:bg-transparent [&_li]:bg-transparent [&_h1]:bg-transparent [&_h2]:bg-transparent [&_h3]:bg-transparent [&_h4]:bg-transparent [&_h5]:bg-transparent [&_h6]:bg-transparent [&_p]:m-0 [&_p]:p-0 [&_div]:m-0 [&_div]:p-0 [&_ul]:m-0 [&_ul]:p-0 [&_ol]:m-0 [&_ol]:p-0 [&_li]:m-0 [&_li]:p-0 [&_li]:mb-0 [&_li]:mt-0 [&_h1]:m-0 [&_h1]:p-0 [&_h2]:m-0 [&_h2]:p-0 [&_h3]:m-0 [&_h3]:p-0 [&_h4]:m-0 [&_h4]:p-0 [&_h5]:m-0 [&_h5]:p-0 [&_h6]:m-0 [&_h6]:p-0 [&_blockquote]:m-0 [&_blockquote]:p-0"
+          class="selectable-content text-gray-900 dark:text-white text-sm leading-relaxed prose prose-sm max-w-none [&_.prose]:bg-transparent [&_.prose_*]:bg-transparent [&_p]:bg-transparent [&_div]:bg-transparent [&_span]:bg-transparent [&_code]:bg-gray-100 dark:bg-gray-700 [&_pre]:bg-gray-100 dark:bg-gray-700 [&_blockquote]:bg-transparent [&_ul]:bg-transparent [&_ol]:bg-transparent [&_li]:bg-transparent [&_h1]:bg-transparent [&_h2]:bg-transparent [&_h3]:bg-transparent [&_h4]:bg-transparent [&_h5]:bg-transparent [&_h6]:bg-transparent [&_p]:m-0 [&_p]:p-0 [&_div]:m-0 [&_div]:p-0 [&_ul]:m-0 [&_ul]:p-0 [&_ol]:m-0 [&_ol]:p-0 [&_li]:m-0 [&_li]:p-0 [&_li]:mb-0 [&_li]:mt-0 [&_h1]:m-0 [&_h1]:p-0 [&_h2]:m-0 [&_h2]:p-0 [&_h3]:m-0 [&_h3]:p-0 [&_h4]:m-0 [&_h4]:p-0 [&_h5]:m-0 [&_h5]:p-0 [&_h6]:m-0 [&_h6]:p-0 [&_blockquote]:m-0 [&_blockquote]:p-0"
         >
           {#if hasTable}
             <div class="table-container">

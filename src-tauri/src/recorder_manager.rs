@@ -6,7 +6,8 @@ use crate::database::video::VideoRow;
 use crate::database::{Database, DatabaseError};
 use crate::ffmpeg::{encode_video_danmu, transcode, Range};
 use crate::progress::progress_reporter::{EventEmitter, ProgressReporter, ProgressReporterTrait};
-use crate::subtitle_generator::item_to_srt;
+use crate::subtitle_generator::transcript_artifacts::{TranscriptArtifactStore, TranscriptSource};
+use crate::subtitle_generator::{item_to_srt, GenerateResult, SubtitleGeneratorType};
 use crate::task::{Task, TaskManager, TaskPriority};
 use crate::webhook::events::{self, Payload};
 use crate::webhook::poster::WebhookPoster;
@@ -47,6 +48,100 @@ use tauri::AppHandle;
 pub struct RecorderList {
     pub count: usize,
     pub recorders: Vec<RecorderInfo>,
+}
+
+async fn remove_archive_cache_dir(path: &Path) -> Result<(), RecorderManagerError> {
+    const ATTEMPTS: usize = 3;
+    let mut last_error = None;
+
+    for attempt in 0..ATTEMPTS {
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    let error = last_error.expect("archive delete attempt must record an error");
+    Err(RecorderManagerError::HLSError {
+        err: format!(
+            "无法删除录播缓存 {}：{}。请关闭正在播放该录播的窗口后重试",
+            path.display(),
+            error
+        ),
+    })
+}
+
+#[cfg(test)]
+mod archive_delete_tests {
+    use super::remove_archive_cache_dir;
+
+    #[tokio::test]
+    async fn missing_archive_cache_is_already_deleted() {
+        let path = std::env::temp_dir().join(format!(
+            "shadowreplay-missing-archive-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        assert!(remove_archive_cache_dir(&path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_cache_delete_failure_is_returned() {
+        let path = std::env::temp_dir().join(format!(
+            "shadowreplay-archive-file-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"not a directory").unwrap();
+
+        let error = remove_archive_cache_dir(&path).await.unwrap_err();
+
+        assert!(error.to_string().contains("无法删除录播缓存"));
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSubtitleRefreshResult {
+    pub subtitle: String,
+    pub decision: String,
+    pub similarity: f64,
+    pub old_length: usize,
+    pub new_length: usize,
+}
+
+fn normalize_transcript_for_comparison(value: &str) -> Vec<char> {
+    value
+        .lines()
+        .filter(|line| !line.contains("-->") && !line.trim().chars().all(|ch| ch.is_ascii_digit()))
+        .flat_map(|line| line.chars())
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn transcript_bigram_similarity(left: &str, right: &str) -> f64 {
+    let make_bigrams = |value: &str| -> HashSet<String> {
+        let chars = normalize_transcript_for_comparison(value);
+        chars
+            .windows(2)
+            .map(|pair| pair.iter().collect::<String>())
+            .collect()
+    };
+    let left_bigrams = make_bigrams(left);
+    let right_bigrams = make_bigrams(right);
+    if left_bigrams.is_empty() || right_bigrams.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_bigrams.intersection(&right_bigrams).count() as f64;
+    let union = left_bigrams.union(&right_bigrams).count() as f64;
+    let containment = intersection / left_bigrams.len().min(right_bigrams.len()) as f64;
+    let jaccard = intersection / union.max(1.0);
+    jaccard.max(containment * 0.82)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -384,12 +479,16 @@ impl RecorderManager {
         room_id: &str,
         recorder: &RecorderInfo,
     ) {
-        if !self.config.read().await.auto_generate.enabled {
+        let (auto_generate, auto_subtitle) = {
+            let config = self.config.read().await;
+            (config.auto_generate.enabled, config.auto_subtitle)
+        };
+        if !auto_generate && !auto_subtitle {
             return;
         }
 
         let recorder_id = format!("{}:{}", platform.as_str(), room_id);
-        log::info!("Start auto generate for {recorder_id}");
+        log::info!("Start post-record processing for {recorder_id}");
         let live_id = recorder.live_id.clone();
         let live_record = self.db.get_record(room_id, &live_id).await;
         if live_record.is_err() {
@@ -398,6 +497,104 @@ impl RecorderManager {
         }
 
         let live_record = live_record.unwrap();
+
+        if auto_subtitle {
+            let subtitle_task = self
+                .db
+                .generate_task(
+                    "generate_archive_subtitle",
+                    "等待生成整场逐字稿",
+                    &serde_json::json!({
+                        "platform": platform.as_str(),
+                        "room_id": room_id,
+                        "live_id": live_id,
+                    })
+                    .to_string(),
+                )
+                .await;
+
+            match subtitle_task {
+                Ok(task) => {
+                    let self_clone = self.clone();
+                    let task_id = task.id.clone();
+                    let subtitle_room_id = room_id.to_string();
+                    let subtitle_live_id = live_id.clone();
+                    let reporter =
+                        ProgressReporter::new(self.db.clone(), &self.emitter, &task.id).await;
+
+                    match reporter {
+                        Ok(reporter) => {
+                            if let Err(error) = self
+                                .task_manager
+                                .add_task(Task::new(task.id, TaskPriority::Normal, async move {
+                                    let _ = self_clone
+                                        .db
+                                        .update_task(
+                                            &task_id,
+                                            "processing",
+                                            "正在生成整场逐字稿",
+                                            None,
+                                        )
+                                        .await;
+                                    match self_clone
+                                        .generate_archive_subtitle(
+                                            platform,
+                                            &subtitle_room_id,
+                                            &subtitle_live_id,
+                                            Some(&reporter),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            reporter.finish(true, "整场逐字稿生成完成").await;
+                                            let _ = self_clone
+                                                .db
+                                                .update_task(
+                                                    &task_id,
+                                                    "success",
+                                                    "整场逐字稿生成完成",
+                                                    None,
+                                                )
+                                                .await;
+                                            Ok(())
+                                        }
+                                        Err(error) => {
+                                            reporter
+                                                .finish(
+                                                    false,
+                                                    &format!("整场逐字稿生成失败: {error}"),
+                                                )
+                                                .await;
+                                            let _ = self_clone
+                                                .db
+                                                .update_task(
+                                                    &task_id,
+                                                    "failed",
+                                                    &format!("整场逐字稿生成失败: {error}"),
+                                                    None,
+                                                )
+                                                .await;
+                                            Err(error.to_string())
+                                        }
+                                    }
+                                }))
+                                .await
+                            {
+                                log::error!("Failed to queue archive subtitle task: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("Failed to create archive subtitle reporter: {error}");
+                        }
+                    }
+                }
+                Err(error) => log::error!("Failed to create archive subtitle task: {error}"),
+            }
+        }
+
+        if !auto_generate {
+            return;
+        }
 
         let Ok(task) = self
             .db
@@ -674,7 +871,7 @@ impl RecorderManager {
     /// Remove a recorder from the manager
     ///
     /// This will stop the recorder and remove it from the manager
-    /// and remove the related cache folder
+    /// while preserving historical archive files.
     pub async fn remove_recorder(
         &self,
         platform: PlatformType,
@@ -708,17 +905,6 @@ impl RecorderManager {
         // remove from to_remove
         log::debug!("Remove from to_remove: {recorder_id}");
         self.to_remove.write().await.remove(&recorder_id);
-
-        // remove related cache folder
-        let cache_folder = format!(
-            "{}/{}/{}",
-            self.config.read().await.cache,
-            platform.as_str(),
-            room_id
-        );
-        log::debug!("Remove cache folder: {cache_folder}");
-        let _ = tokio::fs::remove_dir_all(cache_folder).await;
-        log::info!("Recorder {room_id} cache folder removed");
 
         Ok(recorder)
     }
@@ -1205,6 +1391,43 @@ impl RecorderManager {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<RecordRow>, RecorderManagerError> {
+        // A recording can keep writing HLS segments after its database row was
+        // removed (for example, when an in-progress archive was deleted).  The
+        // archive page is driven by the database, so repair the index from the
+        // live recorder before returning the list.
+        for recorder_ref in self.recorders.read().await.values() {
+            let recorder = recorder_ref.info().await;
+            if recorder.recording && recorder.room_info.room_id == room_id {
+                let platform =
+                    PlatformType::from_str(&recorder.room_info.platform).map_err(|_| {
+                        RecorderManagerError::InvalidPlatformType {
+                            platform: recorder.room_info.platform.clone(),
+                        }
+                    })?;
+                if self
+                    .db
+                    .get_record(room_id, &recorder.live_id)
+                    .await
+                    .is_err()
+                {
+                    log::warn!(
+                        "Repairing missing record index for active recording {}:{}",
+                        room_id,
+                        recorder.live_id
+                    );
+                    self.db
+                        .add_record(
+                            platform,
+                            &recorder.platform_live_id,
+                            &recorder.live_id,
+                            room_id,
+                            &recorder.room_info.room_title,
+                            None,
+                        )
+                        .await?;
+                }
+            }
+        }
         Ok(self.db.get_records(room_id, offset, limit).await?)
     }
 
@@ -1243,11 +1466,35 @@ impl RecorderManager {
         Ok(subtitle_content)
     }
 
+    pub async fn save_archive_fact_card(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+        fact_card: serde_json::Value,
+    ) -> Result<(), RecorderManagerError> {
+        let work_dir = CachePath::new(
+            self.config.read().await.cache.clone().into(),
+            platform,
+            room_id,
+            live_id,
+        );
+        let bytes = serde_json::to_vec_pretty(&fact_card).map_err(|error| {
+            RecorderManagerError::SubtitleGenerationFailed {
+                error: format!("参数卡格式错误: {error}"),
+            }
+        })?;
+        tokio::fs::write(work_dir.full_path().join("tmp.facts.json"), &bytes).await?;
+        tokio::fs::write(work_dir.full_path().join("transcript.facts.json"), bytes).await?;
+        Ok(())
+    }
+
     pub async fn generate_archive_subtitle(
         &self,
         platform: PlatformType,
         room_id: &str,
         live_id: &str,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<String, RecorderManagerError> {
         // generate subtitle file under work_dir
         let work_dir = CachePath::new(
@@ -1257,7 +1504,6 @@ impl RecorderManager {
             live_id,
         );
         let subtitle_file_path = work_dir.with_filename("subtitle.srt");
-        let mut subtitle_file = File::create(subtitle_file_path.full_path()).await?;
         // first generate a tmp clip file
         // generate a tmp m3u8 index file
         let m3u8_index_file_path = work_dir.with_filename("tmp.m3u8");
@@ -1277,6 +1523,9 @@ impl RecorderManager {
 
         // Generate a tmp mp4 clip file first
         let clip_file_path = work_dir.with_filename("tmp.mp4");
+        if let Some(reporter) = reporter {
+            reporter.update("正在准备整场录播音频...").await;
+        }
         if let Err(e) = crate::ffmpeg::playlist::clip_from_playlist(
             None::<&crate::progress::progress_reporter::ProgressReporter>,
             Path::new(&m3u8_index_file_path.full_path()),
@@ -1291,7 +1540,29 @@ impl RecorderManager {
         }
         log::info!("[{}]Temp clip file generated: {}", room_id, clip_file_path);
 
-        // Read config to determine generator type
+        // Read config to determine generator type. For the local engine, prepare
+        // the managed model automatically on first use so non-technical users do
+        // not need to configure a filesystem path.
+        let (generator_type, configured_model, config_path) = {
+            let config = self.config.read().await;
+            (
+                config.subtitle_generator_type.clone(),
+                config.whisper_model.clone(),
+                config.config_path.clone(),
+            )
+        };
+        if generator_type == "whisper" && !Path::new(&configured_model).is_file() {
+            let model_path = crate::subtitle_generator::model_manager::ensure_model(
+                &config_path,
+                &configured_model,
+            )
+            .await
+            .map_err(|error| RecorderManagerError::SubtitleGenerationFailed { error })?;
+            let mut config = self.config.write().await;
+            config.whisper_model = model_path.to_string_lossy().to_string();
+            config.save();
+        }
+
         let config = self.config.read().await;
         let generator_type = config.subtitle_generator_type.as_str();
 
@@ -1333,21 +1604,166 @@ impl RecorderManager {
             opus_file_path
         } else {
             // For whisper/whisper_online, use mp4 directly
-            clip_file_path
+            clip_file_path.clone()
         };
 
-        // generate subtitle file
-        let result = crate::ffmpeg::generate_video_subtitle(
-            None,
-            Path::new(&media_file_path.full_path()),
-            &config.subtitle_generator_type,
-            &config.whisper_model,
-            &config.whisper_prompt,
-            &config.openai_api_key,
-            &config.openai_api_endpoint,
-            &config.whisper_language,
-        )
-        .await;
+        // Long local recordings are split into stable 10-minute units before
+        // Whisper processing. Each unit is persisted so an interrupted job can
+        // resume without retranscribing the completed parts.
+        let result = if config.subtitle_generator_type == "volcengine" {
+            match crate::ffmpeg::generate_volcengine_video_subtitle(
+                reporter,
+                Path::new(&media_file_path.full_path()),
+                &config.volcengine_api_key,
+                &config.volcengine_app_id,
+                &config.volcengine_access_token,
+                &config.volcengine_resource_id,
+                &config.volcengine_boosting_table_id,
+                &config.volcengine_correct_table_id,
+            )
+            .await
+            {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    log::warn!("火山ASR失败，自动回退FunASR: {error}");
+                    if let Some(reporter) = reporter {
+                        reporter.update("火山ASR不可用，正在使用本地FunASR").await;
+                    }
+                    crate::ffmpeg::generate_video_subtitle(
+                        reporter,
+                        Path::new(&media_file_path.full_path()),
+                        "funasr",
+                        &config.whisper_model,
+                        &config.whisper_prompt,
+                        &config.openai_api_key,
+                        &config.openai_api_endpoint,
+                        &config.whisper_language,
+                    )
+                    .await
+                }
+            }
+        } else if config.subtitle_generator_type == "whisper" {
+            let chunk_dir = work_dir.full_path().join("transcript_chunks");
+            tokio::fs::create_dir_all(&chunk_dir).await?;
+            let chunk_pattern = chunk_dir.join("chunk_%04d.wav");
+            let has_audio_chunks = std::fs::read_dir(&chunk_dir)
+                .map(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("wav")
+                    })
+                })
+                .unwrap_or(false);
+
+            if !has_audio_chunks {
+                let output = crate::ffmpeg::ffmpeg_command()
+                    .args(["-i", clip_file_path.full_path().to_str().unwrap()])
+                    .args(["-vn", "-ar", "16000", "-ac", "1"])
+                    .args(["-c:a", "pcm_s16le"])
+                    .args(["-f", "segment", "-segment_time", "600"])
+                    .args(["-reset_timestamps", "1", "-y"])
+                    .arg(&chunk_pattern)
+                    .output()
+                    .await
+                    .map_err(|error| RecorderManagerError::SubtitleGenerationFailed {
+                        error: format!("切分整场直播音频失败: {error}"),
+                    })?;
+                if !output.status.success() {
+                    return Err(RecorderManagerError::SubtitleGenerationFailed {
+                        error: format!(
+                            "切分整场直播音频失败: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ),
+                    });
+                }
+            }
+
+            let mut chunk_paths = std::fs::read_dir(&chunk_dir)
+                .map_err(|error| RecorderManagerError::SubtitleGenerationFailed {
+                    error: format!("读取转写分段失败: {error}"),
+                })?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wav"))
+                .collect::<Vec<_>>();
+            chunk_paths.sort();
+
+            let mut full_result = GenerateResult {
+                subtitle_id: String::new(),
+                subtitle_content: vec![],
+                generator_type: SubtitleGeneratorType::Whisper,
+            };
+
+            for (index, chunk_path) in chunk_paths.iter().enumerate() {
+                if let Some(reporter) = reporter {
+                    reporter
+                        .update(&format!(
+                            "正在转写第 {}/{} 段",
+                            index + 1,
+                            chunk_paths.len()
+                        ))
+                        .await;
+                }
+                let cached_srt = chunk_path.with_extension("srt");
+                let chunk_result = if cached_srt.is_file() {
+                    let content = std::fs::read_to_string(&cached_srt).map_err(|error| {
+                        RecorderManagerError::SubtitleGenerationFailed {
+                            error: format!("读取已完成分段字幕失败: {error}"),
+                        }
+                    })?;
+                    GenerateResult {
+                        subtitle_id: String::new(),
+                        subtitle_content: srtparse::from_str(&content).map_err(|error| {
+                            RecorderManagerError::SubtitleGenerationFailed {
+                                error: format!("解析已完成分段字幕失败: {error}"),
+                            }
+                        })?,
+                        generator_type: SubtitleGeneratorType::Whisper,
+                    }
+                } else {
+                    let generated = crate::ffmpeg::generate_video_subtitle(
+                        None,
+                        chunk_path,
+                        &config.subtitle_generator_type,
+                        &config.whisper_model,
+                        &config.whisper_prompt,
+                        &config.openai_api_key,
+                        &config.openai_api_endpoint,
+                        &config.whisper_language,
+                    )
+                    .await
+                    .map_err(|error| {
+                        RecorderManagerError::SubtitleGenerationFailed {
+                            error: format!(
+                                "第 {}/{} 段转写失败: {error}",
+                                index + 1,
+                                chunk_paths.len()
+                            ),
+                        }
+                    })?;
+                    let content = generated
+                        .subtitle_content
+                        .iter()
+                        .map(item_to_srt)
+                        .collect::<String>();
+                    tokio::fs::write(&cached_srt, content).await?;
+                    generated
+                };
+                full_result.concat_with_offset_ms(&chunk_result, index as u64 * 600_000);
+            }
+            Ok(full_result)
+        } else {
+            crate::ffmpeg::generate_video_subtitle(
+                None,
+                Path::new(&media_file_path.full_path()),
+                &config.subtitle_generator_type,
+                &config.whisper_model,
+                &config.whisper_prompt,
+                &config.openai_api_key,
+                &config.openai_api_endpoint,
+                &config.whisper_language,
+            )
+            .await
+        };
         // write subtitle file
         if let Err(e) = result {
             return Err(RecorderManagerError::SubtitleGenerationFailed {
@@ -1356,13 +1772,68 @@ impl RecorderManager {
         }
         log::info!("[{room_id}]Subtitle generated");
         let result = result.unwrap();
+        let actual_generator = result.generator_type.as_str();
         let subtitle_content = result
             .subtitle_content
             .iter()
             .map(item_to_srt)
             .collect::<String>();
-        subtitle_file.write_all(subtitle_content.as_bytes()).await?;
+        // Do not truncate the existing transcript until ASR has completed.
+        // This keeps the last known-good transcript intact when a provider fails.
+        tokio::fs::write(subtitle_file_path.full_path(), subtitle_content.as_bytes()).await?;
         log::info!("[{room_id}]Subtitle file written");
+
+        TranscriptArtifactStore::initialize_from_asr_outputs(
+            TranscriptSource::Archive {
+                platform: platform.as_str().to_string(),
+                room_id: room_id.to_string(),
+                live_id: live_id.to_string(),
+            },
+            work_dir.full_path(),
+            media_file_path.full_path(),
+            &subtitle_content,
+            actual_generator,
+        )
+        .await
+        .map_err(|error| RecorderManagerError::SubtitleGenerationFailed {
+            error: format!("保存规范逐字稿失败: {error}"),
+        })?;
+
+        // FunASR writes auditable side artifacts next to the temporary media.
+        // Promote them to stable archive filenames before tmp.mp4 is removed.
+        if actual_generator == "funasr" {
+            for (source_name, target_name) in [
+                ("tmp.asr.raw.txt", "transcript.raw.txt"),
+                ("tmp.asr.raw.srt", "transcript.raw.srt"),
+                ("tmp.asr.corrected.txt", "transcript.corrected.txt"),
+                ("tmp.asr.corrected.srt", "transcript.corrected.srt"),
+                ("tmp.asr.changes.json", "transcript.changes.json"),
+                ("tmp.asr.review.json", "transcript.review.json"),
+            ] {
+                let source = work_dir.full_path().join(source_name);
+                let target = work_dir.full_path().join(target_name);
+                if source.is_file() {
+                    let _ = tokio::fs::remove_file(&target).await;
+                    tokio::fs::rename(&source, &target).await.map_err(|error| {
+                        RecorderManagerError::SubtitleGenerationFailed {
+                            error: format!("保存逐字稿审计文件 {target_name} 失败: {error}"),
+                        }
+                    })?;
+                }
+            }
+        }
+        if actual_generator == "volcengine" {
+            let source = work_dir.full_path().join("tmp.mp4.asr.audit.json");
+            let target = work_dir.full_path().join("transcript.audit.json");
+            if source.is_file() {
+                let _ = tokio::fs::remove_file(&target).await;
+                tokio::fs::rename(&source, &target).await.map_err(|error| {
+                    RecorderManagerError::SubtitleGenerationFailed {
+                        error: format!("保存逐字稿审计文件 transcript.audit.json 失败: {error}"),
+                    }
+                })?;
+            }
+        }
         // remove tmp files
         tokio::fs::remove_file(&m3u8_index_file_path.full_path()).await?;
 
@@ -1377,19 +1848,87 @@ impl RecorderManager {
         Ok(subtitle_content)
     }
 
+    pub async fn refresh_archive_subtitle(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> Result<ArchiveSubtitleRefreshResult, RecorderManagerError> {
+        let existing = self
+            .get_archive_subtitle(platform, room_id, live_id)
+            .await
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let generated = self
+            .generate_archive_subtitle(platform, room_id, live_id, None)
+            .await?;
+
+        let work_dir = CachePath::new(
+            self.config.read().await.cache.clone().into(),
+            platform,
+            room_id,
+            live_id,
+        );
+        let subtitle_path = work_dir.with_filename("subtitle.srt");
+        let candidate_path = work_dir.with_filename("subtitle.refresh-candidate.srt");
+        tokio::fs::write(candidate_path.full_path(), generated.as_bytes()).await?;
+
+        let Some(previous) = existing else {
+            return Ok(ArchiveSubtitleRefreshResult {
+                subtitle: generated.clone(),
+                decision: "created".to_string(),
+                similarity: 0.0,
+                old_length: 0,
+                new_length: generated.len(),
+            });
+        };
+
+        let similarity = transcript_bigram_similarity(&previous, &generated);
+        let old_length = previous.len();
+        let new_length = generated.len();
+        if similarity >= 0.48 {
+            tokio::fs::write(subtitle_path.full_path(), previous.as_bytes()).await?;
+            Ok(ArchiveSubtitleRefreshResult {
+                subtitle: previous,
+                decision: "kept".to_string(),
+                similarity,
+                old_length,
+                new_length,
+            })
+        } else {
+            let previous_path = work_dir.with_filename("subtitle.previous.srt");
+            tokio::fs::write(previous_path.full_path(), previous.as_bytes()).await?;
+            Ok(ArchiveSubtitleRefreshResult {
+                subtitle: generated,
+                decision: "replaced".to_string(),
+                similarity,
+                old_length,
+                new_length,
+            })
+        }
+    }
+
     pub async fn delete_archive(
         &self,
         platform: PlatformType,
         room_id: &str,
         live_id: &str,
     ) -> Result<RecordRow, RecorderManagerError> {
+        if let Some(recorder) = self.get_recorder_info(platform, room_id).await {
+            if recorder.recording && recorder.live_id == live_id {
+                return Err(RecorderManagerError::Recording {
+                    live_id: live_id.to_string(),
+                });
+            }
+        }
         log::info!("Deleting archive {room_id}:{live_id}");
-        let to_delete = self.db.remove_record(live_id).await?;
         let cache_folder = Path::new(self.config.read().await.cache.as_str())
             .join(platform.as_str())
             .join(room_id)
             .join(live_id);
-        let _ = tokio::fs::remove_dir_all(cache_folder).await;
+        let to_delete = self.db.get_record(room_id, live_id).await?;
+        remove_archive_cache_dir(&cache_folder).await?;
+        self.db.remove_record(live_id).await?;
         Ok(to_delete)
     }
 

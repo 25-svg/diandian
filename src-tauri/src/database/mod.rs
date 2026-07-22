@@ -7,7 +7,9 @@ pub mod account;
 pub mod message;
 pub mod record;
 pub mod recorder;
+pub mod review_sample;
 pub mod task;
+pub mod transcript_dictionary_candidate;
 pub mod video;
 
 pub struct Database {
@@ -28,6 +30,10 @@ pub enum DatabaseError {
     DB(#[from] sqlx::Error),
     #[error("SQL is incorret: {sql}")]
     Sql { sql: String },
+    #[error("invalid transcript dictionary candidate status: {0}")]
+    InvalidTranscriptDictionaryCandidateStatus(String),
+    #[error("invalid transcript dictionary candidate minimal metadata: {0}")]
+    InvalidTranscriptDictionaryCandidateMetadata(String),
 }
 
 impl From<DatabaseError> for String {

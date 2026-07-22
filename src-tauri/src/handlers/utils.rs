@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::state::State;
 use crate::state_type;
@@ -218,6 +218,8 @@ pub async fn open_live(
     platform: String,
     room_id: String,
     live_id: String,
+    start: Option<u64>,
+    end: Option<u64>,
 ) -> Result<(), String> {
     log::info!("Open player window: {room_id} {live_id}");
     // trim @ from room_id
@@ -232,10 +234,12 @@ pub async fn open_live(
             format!("Live:{clean_room_id}:{live_id}"),
             tauri::WebviewUrl::App(
                 format!(
-                    "index_live.html?platform={}&room_id={}&live_id={}",
+                    "index_live.html?platform={}&room_id={}&live_id={}&start={}&end={}",
                     platform.as_str(),
                     room_id,
-                    live_id
+                    live_id,
+                    start.unwrap_or(0),
+                    end.unwrap_or(0),
                 )
                 .into(),
             ),
@@ -291,9 +295,28 @@ pub async fn open_clip(state: state_type!(), video_id: i64) -> Result<(), String
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
-pub async fn list_folder(_state: state_type!(), path: String) -> Result<Vec<String>, String> {
-    let path = PathBuf::from(path);
-    let entries = std::fs::read_dir(path);
+pub async fn list_folder(state: state_type!(), path: String) -> Result<Vec<String>, String> {
+    let requested_path = resolve_existing_path(&PathBuf::from(path))?;
+    let config = state.config.read().await.clone();
+    let allowed_roots = [
+        resolve_or_create_allowed_root(&config.cache)?,
+        resolve_or_create_allowed_root(&config.output)?,
+    ];
+
+    if !allowed_roots
+        .iter()
+        .any(|allowed_root| requested_path.starts_with(allowed_root))
+    {
+        log::warn!(
+            "Rejected list_folder outside allowed roots: {}",
+            requested_path.display()
+        );
+        return Err(
+            "Directory access denied: path is outside allowed cache/output roots".to_string(),
+        );
+    }
+
+    let entries = std::fs::read_dir(&requested_path);
     if entries.is_err() {
         return Err(format!("Read directory failed: {}", entries.err().unwrap()));
     }
@@ -302,6 +325,37 @@ pub async fn list_folder(_state: state_type!(), path: String) -> Result<Vec<Stri
         files.push(entry.path().to_str().unwrap().to_string());
     }
     Ok(files)
+}
+
+fn resolve_existing_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("Resolve current dir failed: {e}"))?
+            .join(path)
+    };
+    absolute
+        .canonicalize()
+        .map_err(|e| format!("Resolve path failed: {e}"))
+}
+
+fn resolve_or_create_allowed_root(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("Resolve current dir failed: {e}"))?
+            .join(path)
+    };
+    if !absolute.exists() {
+        std::fs::create_dir_all(&absolute)
+            .map_err(|e| format!("Create allowed directory failed: {e}"))?;
+    }
+    absolute
+        .canonicalize()
+        .map_err(|e| format!("Resolve allowed directory failed: {e}"))
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -386,6 +440,30 @@ pub fn sanitize_filename_advanced(name: &str, max_length: Option<usize>) -> Stri
 
 #[cfg(test)]
 mod tests {
+    use super::{resolve_existing_path, resolve_or_create_allowed_root};
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_resolve_or_create_allowed_root_creates_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("bsr_allowed_root_test_{}", uuid::Uuid::new_v4()));
+
+        assert!(!dir.exists());
+        let resolved = resolve_or_create_allowed_root(dir.to_str().unwrap()).unwrap();
+        assert!(resolved.exists());
+        assert!(resolved.is_absolute());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_resolve_existing_path_rejects_missing_path() {
+        let missing = PathBuf::from(format!("missing_bsr_path_{}", uuid::Uuid::new_v4()));
+
+        let result = resolve_existing_path(&missing);
+        assert!(result.is_err());
+    }
+
     #[test]
     #[cfg(feature = "headless")]
     fn test_sanitize_filename_advanced() {

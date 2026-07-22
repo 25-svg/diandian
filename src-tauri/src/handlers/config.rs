@@ -10,7 +10,14 @@ use tauri::State as TauriState;
 
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_config(state: state_type!()) -> Result<Config, ()> {
-    Ok(state.config.read().await.clone())
+    let mut config = state.config.read().await.clone();
+    // Configuration screens only need to know whether a key is configured.
+    // Never send provider secrets into WebView JavaScript or browser storage.
+    config.openai_api_key.clear();
+    config.powerlive_key.clear();
+    config.volcengine_api_key.clear();
+    config.volcengine_access_token.clear();
+    Ok(config)
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -239,6 +246,38 @@ pub async fn update_openai_api_endpoint(
     log::info!("Updating openai api endpoint to {openai_api_endpoint}");
     let mut config = state.config.write().await;
     config.openai_api_endpoint = openai_api_endpoint;
+    config.save();
+    Ok(())
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn update_volcengine_asr_config(
+    state: state_type!(),
+    api_key: String,
+    app_id: String,
+    access_token: String,
+    resource_id: String,
+    boosting_table_id: String,
+    correct_table_id: String,
+) -> Result<(), String> {
+    let mut config = state.config.write().await;
+    if !api_key.trim().is_empty() {
+        config.volcengine_api_key = api_key.trim().to_string();
+    }
+    config.volcengine_app_id = app_id.trim().to_string();
+    if !access_token.trim().is_empty() {
+        config.volcengine_access_token = access_token.trim().to_string();
+    }
+    config.volcengine_resource_id = if resource_id.trim().is_empty() {
+        "volc.seedasr.auc".to_string()
+    } else {
+        match resource_id.trim() {
+            "volc.bigasr.auc_turbo" => "volc.seedasr.auc".to_string(),
+            value => value.to_string(),
+        }
+    };
+    config.volcengine_boosting_table_id = boosting_table_id.trim().to_string();
+    config.volcengine_correct_table_id = correct_table_id.trim().to_string();
     config.save();
     Ok(())
 }

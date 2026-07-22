@@ -3,7 +3,7 @@
 
   export let showSettings: boolean;
   export let settings: {
-    provider: "openai" | "ollama";
+    provider: "openai" | "minimax" | "ollama";
     endpoint: string;
     api_key: string;
     model: string;
@@ -13,6 +13,19 @@
   export let onClose: () => void;
   export let onSave: () => void;
   export let onLoadModels: () => void;
+
+  function selectProvider(provider: "openai" | "minimax" | "ollama") {
+    settings.provider = provider;
+    if (provider === "minimax") {
+      settings.endpoint = "https://api.minimaxi.com/anthropic";
+      settings.model = "MiniMax-VL-01";
+    } else if (provider === "openai" && settings.endpoint.includes("minimaxi.com")) {
+      settings.endpoint = "https://api.openai.com/v1";
+      settings.model = "";
+    } else if (provider === "ollama") {
+      settings.endpoint = "http://localhost:11434";
+    }
+  }
 </script>
 
 {#if showSettings}
@@ -38,13 +51,29 @@
           <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
             选择 AI 提供商
           </label>
-          <div class="grid grid-cols-2 gap-3">
+          <div class="grid grid-cols-3 gap-3">
+            <button
+              type="button"
+              class="relative p-4 rounded-xl border-2 transition-all {settings.provider === 'minimax'
+                ? 'border-gray-900 dark:border-gray-100 bg-gray-50 dark:bg-gray-800'
+                : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'}"
+              on:click={() => selectProvider('minimax')}
+            >
+              {#if settings.provider === 'minimax'}
+                <div class="absolute top-3 right-3 w-2 h-2 bg-gray-900 dark:bg-gray-100 rounded-full"></div>
+              {/if}
+              <div class="text-center space-y-2">
+                <div class="text-2xl">🌸</div>
+                <div class="text-sm font-medium text-gray-900 dark:text-gray-100">MiniMax</div>
+                <div class="text-xs text-gray-500 dark:text-gray-500">推荐使用</div>
+              </div>
+            </button>
             <button
               type="button"
               class="relative p-4 rounded-xl border-2 transition-all {settings.provider === 'openai'
                 ? 'border-gray-900 dark:border-gray-100 bg-gray-50 dark:bg-gray-800'
                 : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'}"
-              on:click={() => settings.provider = 'openai'}
+              on:click={() => selectProvider('openai')}
             >
               {#if settings.provider === 'openai'}
                 <div class="absolute top-3 right-3 w-2 h-2 bg-gray-900 dark:bg-gray-100 rounded-full"></div>
@@ -61,7 +90,7 @@
               class="relative p-4 rounded-xl border-2 transition-all {settings.provider === 'ollama'
                 ? 'border-gray-900 dark:border-gray-100 bg-gray-50 dark:bg-gray-800'
                 : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'}"
-              on:click={() => settings.provider = 'ollama'}
+              on:click={() => selectProvider('ollama')}
             >
               {#if settings.provider === 'ollama'}
                 <div class="absolute top-3 right-3 w-2 h-2 bg-gray-900 dark:bg-gray-100 rounded-full"></div>
@@ -84,7 +113,11 @@
             id="endpoint"
             type="text"
             bind:value={settings.endpoint}
-            placeholder={settings.provider === 'ollama' ? 'http://localhost:11434' : 'https://api.openai.com/v1'}
+            placeholder={settings.provider === 'ollama'
+              ? 'http://localhost:11434'
+              : settings.provider === 'minimax'
+                ? 'https://api.minimaxi.com/anthropic'
+                : 'https://api.openai.com/v1'}
             class="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent text-sm"
           />
           <p class="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
@@ -95,7 +128,7 @@
         </div>
 
         <!-- API Key (only for OpenAI) -->
-        {#if settings.provider === 'openai'}
+        {#if settings.provider !== 'ollama'}
           <div>
             <label for="api_key" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
               API Key
@@ -104,7 +137,7 @@
               id="api_key"
               type="password"
               bind:value={settings.api_key}
-              placeholder="sk-..."
+              placeholder={settings.provider === 'minimax' ? 'MiniMax API Key' : 'sk-...'}
               class="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent text-sm"
             />
             <p class="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
@@ -119,7 +152,7 @@
             <label for="model" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
               模型名称
             </label>
-            {#if settings.provider === 'openai'}
+            {#if settings.provider !== 'ollama'}
               <button
                 type="button"
                 class="text-xs text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -135,7 +168,11 @@
             type="text"
             bind:value={settings.model}
             list="model-options"
-            placeholder={settings.provider === 'ollama' ? 'llama2, mistral, qwen...' : 'gpt-4, gpt-3.5-turbo...'}
+            placeholder={settings.provider === 'ollama'
+              ? 'llama2, mistral, qwen...'
+              : settings.provider === 'minimax'
+                ? 'MiniMax-VL-01'
+                : 'gpt-4, gpt-3.5-turbo...'}
             class="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent text-sm"
           />
           <datalist id="model-options">
@@ -148,6 +185,11 @@
               ? '输入已安装的 Ollama 模型名称'
               : '输入模型名称或从列表中选择'}
           </p>
+          {#if settings.provider === 'minimax'}
+            <p class="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
+              使用 MiniMax Anthropic 兼容协议，与 CC Switch 配置一致。
+            </p>
+          {/if}
         </div>
       </div>
 

@@ -25,9 +25,16 @@
     post_notify: true,
     auto_cleanup: true,
     auto_subtitle: false,
-    subtitle_generator_type: "whisper",
+    subtitle_generator_type: "funasr",
     openai_api_endpoint: "",
     openai_api_key: "",
+    volcengine_api_key: "",
+    volcengine_app_id: "",
+    volcengine_access_token: "",
+    volcengine_resource_id: "volc.seedasr.auc",
+    volcengine_boosting_table_id: "",
+    volcengine_correct_table_id: "",
+    admin_mode: false,
     powerlive_key: "",
     whisper_model: "",
     whisper_prompt: "",
@@ -62,7 +69,6 @@
   async function get_config() {
     let config: Config = await invoke("get_config");
     setting_model = config;
-    console.log(config);
   }
 
   async function browse_folder() {
@@ -519,6 +525,7 @@
                     </p>
                   </div>
                   <div class="flex items-center space-x-2">
+                    {#if setting_model.admin_mode}
                     <select
                       class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white"
                       bind:value={setting_model.subtitle_generator_type}
@@ -533,14 +540,56 @@
                         }
                       }}
                     >
-                      <option value="whisper">本地 Whisper</option>
+                      <option value="funasr">中文直播识别（推荐）</option>
+                      <option value="volcengine">火山录音文件识别 2.0（推荐）</option>
+                      <option value="whisper">本地 Whisper（备用）</option>
                       <option value="whisper_online">在线 Whisper API</option>
                       <option value="powerlive">PowerLive</option>
                     </select>
+                    {:else}
+                      <span class="px-3 py-2 rounded-lg bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-300 text-sm">
+                        中文直播识别（自动）
+                      </span>
+                    {/if}
                   </div>
                 </div>
               </div>
               <!-- Whisper Model Path -->
+              {#if setting_model.admin_mode}
+              {#if setting_model.subtitle_generator_type === "volcengine"}
+                <div class="p-4 space-y-3 border-t border-gray-100 dark:border-gray-700">
+                  <div>
+                    <h3 class="text-sm font-medium text-gray-900 dark:text-white">火山录音文件识别 2.0</h3>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">
+                      已固定使用 Seed ASR 2.0 标准版。新控制台填写 API Key；旧控制台填写 App ID 和 Access Token。密钥留空表示保留已保存值。
+                    </p>
+                  </div>
+                  <div class="grid grid-cols-1 gap-3 max-w-2xl">
+                    <input type="password" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_api_key} placeholder="API Key（新控制台，可选）" />
+                    <input type="text" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_app_id} placeholder="App ID（旧控制台）" />
+                    <input type="password" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_access_token} placeholder="Access Token（旧控制台）" />
+                    <div class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border text-sm text-gray-700 dark:text-gray-200">
+                      模型版本：录音文件识别 2.0（volc.seedasr.auc）
+                    </div>
+                    <input type="text" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_boosting_table_id} placeholder="热词表 ID（boosting_table_id）" />
+                    <input type="text" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_correct_table_id} placeholder="替换词表 ID（correct_table_id）" />
+                    <button class="w-fit px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                      on:click={async () => {
+                        await invoke("update_volcengine_asr_config", {
+                          apiKey: setting_model.volcengine_api_key,
+                          appId: setting_model.volcengine_app_id,
+                          accessToken: setting_model.volcengine_access_token,
+                          resourceId: setting_model.volcengine_resource_id,
+                          boostingTableId: setting_model.volcengine_boosting_table_id,
+                          correctTableId: setting_model.volcengine_correct_table_id,
+                        });
+                        setting_model.volcengine_api_key = "";
+                        setting_model.volcengine_access_token = "";
+                        alert("火山录音文件识别 2.0 配置已保存");
+                      }}>保存火山 ASR 配置</button>
+                  </div>
+                </div>
+              {/if}
               {#if setting_model.subtitle_generator_type === "powerlive"}
                 <div class="p-4">
                   <div class="flex items-center justify-between">
@@ -697,6 +746,7 @@
                     </div>
                   </div>
                 </div>
+              {/if}
               {/if}
             </div>
           </div>

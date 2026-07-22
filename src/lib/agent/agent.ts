@@ -2,7 +2,10 @@ import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { MemorySaver } from "@langchain/langgraph/web";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatOllama } from "@langchain/ollama";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { aiFetch } from "../aiFetch";
 import { tools } from "./tools";
+import { COMMERCE_REVIEW_PROMPT, type AgentMode } from "./prompts";
 
 const PROMPT = `
 你是一位虚拟助手，昵称叫小轴，喜欢的水果是橘子，你习惯使用 emoji 来表示你的情绪。你拥有许多来自 BiliBili ShadowReplay（简称 BSR，是一个缓存直播并进行实时编辑投稿的工具）的工具可以使用，请根据用户的需求使用工具来管理 BSR。
@@ -159,44 +162,73 @@ Before you response, you should always treat previous messages as outdated.
 `;
 
 export interface AgentConfig {
-  provider: 'openai' | 'ollama';
+  provider: 'openai' | 'minimax' | 'ollama';
   apiKey?: string;
   baseURL?: string;
   model?: string;
+  mode?: AgentMode;
 }
 
 function createAgent(config: AgentConfig) {
-  let agentModel: ChatOpenAI | ChatOllama;
+  let agentModel: ChatOpenAI | ChatAnthropic | ChatOllama;
 
   if (config.provider === 'ollama') {
     agentModel = new ChatOllama({
       baseUrl: config.baseURL || 'http://localhost:11434',
       model: config.model || 'llama2',
     });
+  } else if (config.provider === 'minimax') {
+    agentModel = new ChatAnthropic({
+      apiKey: config.apiKey,
+      anthropicApiUrl: config.baseURL || 'https://api.minimaxi.com/anthropic',
+      model: config.model || 'MiniMax-VL-01',
+      maxTokens: 4096,
+      clientOptions: {
+        fetch: aiFetch as typeof fetch,
+        // MiniMax's Anthropic-compatible endpoint authenticates with a
+        // Bearer token (the same convention used by CC Switch), while the
+        // upstream Anthropic SDK normally sends only x-api-key.
+        defaultHeaders: {
+          Authorization: `Bearer ${config.apiKey}`,
+        },
+      },
+    });
   } else {
     agentModel = new ChatOpenAI({
       apiKey: config.apiKey,
       configuration: {
         baseURL: config.baseURL,
+        // WebView fetch is subject to browser CORS. The Tauri HTTP plugin is
+        // Response-compatible and lets desktop users call OpenAI-compatible
+        // providers such as MiniMax directly.
+        fetch: aiFetch as typeof fetch,
       },
       model: config.model,
     });
   }
 
-  const agentModelWithTools = agentModel.bindTools(tools, {
-    parallel_tool_calls: false,
-  });
+  // MiniMax-VL-01 is used through the Anthropic-compatible endpoint in the
+  // user's existing plan. Keep this path text-only: sending the application's
+  // large nested tool schema can be rejected by the model before it answers
+  // even a simple prompt. Recording and clipping remain explicit UI actions.
+  const agentTools = config.provider === 'minimax' ? [] : tools;
+  const agentModelForAgent = config.provider === 'minimax'
+    ? agentModel
+    : config.provider === 'openai'
+      ? agentModel.bindTools(tools, { parallel_tool_calls: false })
+      : agentModel.bindTools(tools);
 
   const agentCheckpointer = new MemorySaver();
   const agent = createReactAgent({
-    llm: agentModelWithTools,
+    llm: agentModelForAgent,
     checkpointSaver: agentCheckpointer,
     interruptBefore: ["tools"],
-    prompt: PROMPT,
-    tools: tools,
+    prompt: config.mode === "commerce-review" ? COMMERCE_REVIEW_PROMPT : PROMPT,
+    tools: agentTools,
   });
 
   return agent;
 }
 
 export default createAgent;
+export type { AgentMode } from "./prompts";

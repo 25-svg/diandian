@@ -30,6 +30,10 @@ void whisper_rs_params_set_max_len(struct whisper_full_params * params, int valu
     params->max_len = value;
 }
 
+void whisper_rs_params_set_n_threads(struct whisper_full_params * params, int value) {
+    params->n_threads = value;
+}
+
 void whisper_rs_params_set_language(struct whisper_full_params * params, const char * value) {
     params->language = value;
 }

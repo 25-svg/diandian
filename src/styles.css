@@ -8,7 +8,27 @@ body {
   width: 100%;
   user-select: none;
   cursor: default;
+  margin: 0;
+  overflow: hidden;
+  color: #1d1d1f;
+  background: #eef0f4;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
+
+button, input, select, textarea { font-family: inherit; }
+input, textarea, [contenteditable="true"], .selectable-content, .selectable-content * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+.selectable-content { cursor: text; }
+.selectable-content button, .selectable-content button * {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: pointer;
+}
+::selection { color: #07192b; background: rgba(0, 122, 255, .22); }
 
 /* Hide Safari AirPlay button on video elements */
 video::-webkit-media-controls-wireless-playback-picker-button {
@@ -41,22 +61,22 @@ video::-webkit-media-controls-start-playback-button {
 }
 
 ::-webkit-scrollbar-track {
-  background: #1c1c1e;
+  background: transparent;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #3c3c3e;
+  background: rgba(99, 99, 102, .28);
   border-radius: 4px;
   transition: background-color 0.2s ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #4c4c4e;
+  background: rgba(99, 99, 102, .48);
 }
 
 ::-webkit-scrollbar-corner {
-  background: #1c1c1e;
+  background: transparent;
 }
 
 /* 针对侧边栏的特殊滚动条样式 */

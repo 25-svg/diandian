@@ -152,6 +152,8 @@
         return "切片投稿";
       case "generate_video_subtitle":
         return "生成字幕";
+      case "generate_archive_subtitle":
+        return "生成整场逐字稿";
       case "encode_video_subtitle":
         return "压制字幕";
       case "generate_whole_clip":
@@ -169,6 +171,8 @@
         return "bg-green-500";
       case "generate_video_subtitle":
         return "bg-blue-500";
+      case "generate_archive_subtitle":
+        return "bg-cyan-500";
       case "encode_video_subtitle":
         return "bg-orange-500";
       default:

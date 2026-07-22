@@ -7,7 +7,11 @@ use crate::{
     config::Config,
     constants::API_PORT,
     database::{
-        message::MessageRow, record::RecordRow, recorder::RecorderRow, task::TaskRow,
+        message::MessageRow,
+        record::RecordRow,
+        recorder::RecorderRow,
+        review_sample::{ReviewSampleInput, ReviewSampleRow},
+        task::TaskRow,
         video::VideoRow,
     },
     handlers::{
@@ -29,6 +33,10 @@ use crate::{
             get_recent_record, get_recorder_list, get_room_info, get_today_record_count,
             get_total_length, remove_recorder, send_danmaku, set_enable, ExportDanmuOptions,
         },
+        review_sample::{
+            delete_review_sample, get_review_samples, save_review_sample,
+            seed_builtin_review_samples,
+        },
         task::{delete_task, get_tasks},
         utils::{console_log, get_disk_info, list_folder, sanitize_filename_advanced, DiskInfo},
         video::{
@@ -43,6 +51,7 @@ use crate::{
     },
     http_server::websocket,
     recorder_manager::{ClipRangeParams, GenerateWholeClipParams, RecorderList},
+    security::{audit_tool_failure, audit_tool_success, require_sensitive_write},
     state::State,
 };
 use axum::extract::Query;
@@ -119,6 +128,351 @@ impl Display for ApiError {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpInitializeResponse {
+    protocol_version: String,
+    server_info: McpServerInfo,
+    capabilities: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerInfo {
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpToolsListResponse {
+    tools: Vec<McpToolManifest>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct McpToolManifest {
+    name: &'static str,
+    description: &'static str,
+    input_schema: serde_json::Value,
+    permission: &'static str,
+    writes: bool,
+    sensitive: bool,
+    disabled: bool,
+    audit_log: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpToolCallRequest {
+    name: String,
+    arguments: serde_json::Value,
+    trace_id: Option<String>,
+    idempotency_key: Option<String>,
+    confirmation_token: Option<String>,
+}
+
+async fn handler_mcp_initialize() -> Json<ApiResponse<McpInitializeResponse>> {
+    Json(ApiResponse::success(McpInitializeResponse {
+        protocol_version: "2024-11-05".to_string(),
+        server_info: McpServerInfo {
+            name: "bili-shadowreplay-mcp".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        capabilities: serde_json::json!({
+            "tools": {
+                "listChanged": false
+            }
+        }),
+    }))
+}
+
+async fn handler_mcp_tools_list() -> Json<ApiResponse<McpToolsListResponse>> {
+    Json(ApiResponse::success(McpToolsListResponse {
+        tools: mcp_tool_manifest(),
+    }))
+}
+
+async fn handler_mcp_tools_call(
+    state: axum::extract::State<State>,
+    Json(request): Json<McpToolCallRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let trace_id = request
+        .trace_id
+        .clone()
+        .unwrap_or_else(|| format!("tr_{}", uuid::Uuid::new_v4()));
+    let started = std::time::Instant::now();
+
+    let manifest = mcp_tool_manifest()
+        .into_iter()
+        .find(|tool| tool.name == request.name)
+        .ok_or_else(|| ApiError(format!("NOT_FOUND: unknown MCP tool {}", request.name)))?;
+
+    log::info!(
+        target: "mcp_audit",
+        "trace_id={} tool={} status=received permission={} writes={} sensitive={}",
+        trace_id,
+        manifest.name,
+        manifest.permission,
+        manifest.writes,
+        manifest.sensitive
+    );
+
+    if manifest.permission != "read" || manifest.disabled || manifest.sensitive || manifest.writes {
+        log::warn!(
+            target: "mcp_audit",
+            "trace_id={} tool={} status=rejected duration_ms={} error_code=PERMISSION_DENIED",
+            trace_id,
+            manifest.name,
+            started.elapsed().as_millis()
+        );
+        return Err(ApiError(format!(
+            "PERMISSION_DENIED: MCP tool {} is not enabled until P0 auth/confirmation/idempotency enforcement is complete",
+            manifest.name
+        )));
+    }
+
+    let result = match request.name.as_str() {
+        "get_recorder_list" => serde_json::to_value(get_recorder_list(state.0).await?)
+            .map_err(|e| ApiError(e.to_string()))?,
+        _ => {
+            return Err(ApiError(format!(
+                "PERMISSION_DENIED: MCP tool {} is listed but not callable before resource ownership checks are wired",
+                request.name
+            )));
+        }
+    };
+
+    log::info!(
+        target: "mcp_audit",
+        "trace_id={} tool={} status=succeeded duration_ms={} idempotency_key_present={} confirmation_token_present={} args={}",
+        trace_id,
+        manifest.name,
+        started.elapsed().as_millis(),
+        request.idempotency_key.is_some(),
+        request.confirmation_token.is_some(),
+        redact_mcp_value(&request.arguments)
+    );
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+fn redact_mcp_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    if key.to_ascii_lowercase().contains("cookie")
+                        || key.to_ascii_lowercase().contains("csrf")
+                        || key.to_ascii_lowercase().contains("token")
+                        || key.to_ascii_lowercase().contains("secret")
+                        || key.to_ascii_lowercase().contains("password")
+                        || key.to_ascii_lowercase().contains("key")
+                    {
+                        (
+                            key.clone(),
+                            serde_json::Value::String("********".to_string()),
+                        )
+                    } else {
+                        (key.clone(), redact_mcp_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_mcp_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn mcp_tool_manifest() -> Vec<McpToolManifest> {
+    vec![
+        mcp_tool(
+            "get_accounts",
+            "Get all available accounts with credentials redacted",
+            serde_json::json!({"type":"object","additionalProperties":false}),
+            "admin",
+            false,
+            false,
+            false,
+        ),
+        mcp_tool(
+            "remove_account",
+            "Remove an account",
+            serde_json::json!({"type":"object","required":["platform","uid","idempotency_key","confirmation_token"],"properties":{"platform":{"type":"string","enum":["bilibili","douyin"]},"uid":{"type":"number"},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "admin",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "add_recorder",
+            "Add a recorder",
+            serde_json::json!({"type":"object","required":["platform","room_id","extra","idempotency_key"],"properties":{"platform":{"type":"string","enum":["bilibili","douyin"]},"room_id":{"type":"string","minLength":1,"maxLength":128},"extra":{"type":"string","maxLength":512},"idempotency_key":{"type":"string","minLength":8,"maxLength":128}},"additionalProperties":false}),
+            "write",
+            true,
+            false,
+            false,
+        ),
+        mcp_tool(
+            "remove_recorder",
+            "Remove a recorder",
+            serde_json::json!({"type":"object","required":["platform","room_id","idempotency_key","confirmation_token"],"properties":{"platform":{"type":"string","enum":["bilibili","douyin"]},"room_id":{"type":"string","minLength":1,"maxLength":128},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "admin",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "get_recorder_list",
+            "Get recorder list",
+            serde_json::json!({"type":"object","additionalProperties":false}),
+            "read",
+            false,
+            false,
+            false,
+        ),
+        mcp_tool(
+            "delete_archive",
+            "Delete an archive",
+            serde_json::json!({"type":"object","required":["platform","room_id","live_id","idempotency_key","confirmation_token"],"properties":{"platform":{"type":"string"},"room_id":{"type":"string","minLength":1,"maxLength":128},"live_id":{"type":"string","minLength":1,"maxLength":128},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "dangerous",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "delete_archives",
+            "Delete multiple archives",
+            serde_json::json!({"type":"object","required":["platform","room_id","live_ids","idempotency_key","confirmation_token"],"properties":{"platform":{"type":"string"},"room_id":{"type":"string","minLength":1,"maxLength":128},"live_ids":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":50},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "dangerous",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "delete_background_task",
+            "Delete a background task",
+            serde_json::json!({"type":"object","required":["id","idempotency_key","confirmation_token"],"properties":{"id":{"type":"string","minLength":1,"maxLength":128},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "admin",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "delete_video",
+            "Delete a video",
+            serde_json::json!({"type":"object","required":["id","idempotency_key","confirmation_token"],"properties":{"id":{"type":"number"},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "dangerous",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "post_video_to_bilibili",
+            "Post a video to bilibili",
+            serde_json::json!({"type":"object","required":["uid","room_id","video_id","title","desc","tag","tid","idempotency_key","confirmation_token"],"properties":{"uid":{"type":"number"},"room_id":{"type":"string","minLength":1,"maxLength":128},"video_id":{"type":"number"},"title":{"type":"string","minLength":1,"maxLength":80},"desc":{"type":"string","maxLength":2000},"tag":{"type":"string","minLength":1,"maxLength":500},"tid":{"type":"number"},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
+            "dangerous",
+            true,
+            true,
+            false,
+        ),
+        mcp_tool(
+            "generic_ffmpeg_command",
+            "Run generic ffmpeg args. Disabled by P0 security policy.",
+            serde_json::json!({"type":"object","required":["args"],"properties":{"args":{"type":"array","items":{"type":"string","maxLength":512},"maxItems":64}},"additionalProperties":false}),
+            "admin",
+            true,
+            true,
+            true,
+        ),
+        mcp_tool(
+            "list_folder",
+            "List files under configured cache/output allowlist only",
+            serde_json::json!({"type":"object","required":["path"],"properties":{"path":{"type":"string","minLength":1,"maxLength":1024}},"additionalProperties":false}),
+            "dangerous",
+            false,
+            true,
+            false,
+        ),
+    ]
+}
+
+fn mcp_tool(
+    name: &'static str,
+    description: &'static str,
+    input_schema: serde_json::Value,
+    permission: &'static str,
+    writes: bool,
+    sensitive: bool,
+    disabled: bool,
+) -> McpToolManifest {
+    McpToolManifest {
+        name,
+        description,
+        input_schema,
+        permission,
+        writes,
+        sensitive,
+        disabled,
+        audit_log: true,
+    }
+}
+
+#[cfg(test)]
+mod mcp_contract_tests {
+    use super::mcp_tool_manifest;
+
+    #[test]
+    fn test_mcp_manifest_includes_required_p0_tools() {
+        let tools = mcp_tool_manifest();
+        assert!(tools.iter().any(|tool| tool.name == "get_recorder_list"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "generic_ffmpeg_command"));
+        assert!(tools.iter().any(|tool| tool.name == "list_folder"));
+    }
+
+    #[test]
+    fn test_generic_ffmpeg_is_disabled_in_mcp_manifest() {
+        let tools = mcp_tool_manifest();
+        let ffmpeg = tools
+            .iter()
+            .find(|tool| tool.name == "generic_ffmpeg_command")
+            .unwrap();
+        assert!(ffmpeg.disabled);
+        assert!(ffmpeg.sensitive);
+        assert!(ffmpeg.writes);
+    }
+
+    #[test]
+    fn test_sensitive_write_tools_require_idempotency_and_confirmation_schema() {
+        let tools = mcp_tool_manifest();
+        for name in [
+            "remove_account",
+            "delete_archive",
+            "delete_archives",
+            "delete_background_task",
+            "delete_video",
+            "post_video_to_bilibili",
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(|value| value.as_array())
+                .unwrap();
+            assert!(required
+                .iter()
+                .any(|value| value.as_str() == Some("idempotency_key")));
+            assert!(required
+                .iter()
+                .any(|value| value.as_str() == Some("confirmation_token")));
+        }
+    }
+}
+
 async fn handler_get_accounts(
     state: axum::extract::State<State>,
 ) -> Result<Json<ApiResponse<AccountInfo>>, ApiError> {
@@ -149,13 +503,27 @@ async fn handler_add_account(
 struct RemoveAccountRequest {
     platform: String,
     uid: String,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_remove_account(
     state: axum::extract::State<State>,
     Json(account): Json<RemoveAccountRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    remove_account(state.0, account.platform, account.uid).await?;
+    remove_account(
+        state.0,
+        account.platform,
+        account.uid,
+        account.idempotency_key,
+        account.confirmation_token,
+        account.trace_id,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -414,6 +782,46 @@ async fn handler_get_messages(
     Ok(Json(ApiResponse::success(messages)))
 }
 
+async fn handler_get_review_samples(
+    state: axum::extract::State<State>,
+) -> Result<Json<ApiResponse<Vec<ReviewSampleRow>>>, ApiError> {
+    let samples = get_review_samples(state.0).await?;
+    Ok(Json(ApiResponse::success(samples)))
+}
+
+async fn handler_seed_builtin_review_samples(
+    state: axum::extract::State<State>,
+) -> Result<Json<ApiResponse<Vec<ReviewSampleRow>>>, ApiError> {
+    let samples = seed_builtin_review_samples(state.0).await?;
+    Ok(Json(ApiResponse::success(samples)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SaveReviewSampleRequest {
+    sample: ReviewSampleInput,
+}
+
+async fn handler_save_review_sample(
+    state: axum::extract::State<State>,
+    Json(param): Json<SaveReviewSampleRequest>,
+) -> Result<Json<ApiResponse<ReviewSampleRow>>, ApiError> {
+    let sample = save_review_sample(state.0, param.sample).await?;
+    Ok(Json(ApiResponse::success(sample)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DeleteReviewSampleRequest {
+    id: i64,
+}
+
+async fn handler_delete_review_sample(
+    state: axum::extract::State<State>,
+    Json(param): Json<DeleteReviewSampleRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    delete_review_sample(state.0, param.id).await?;
+    Ok(Json(ApiResponse::success(())))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadMessageRequest {
@@ -478,15 +886,27 @@ async fn handler_add_recorder(
 struct RemoveRecorderRequest {
     platform: String,
     room_id: String,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_remove_recorder(
     state: axum::extract::State<State>,
     Json(param): Json<RemoveRecorderRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    remove_recorder(state.0, param.platform, param.room_id)
-        .await
-        .expect("Failed to remove recorder");
+    remove_recorder(
+        state.0,
+        param.platform,
+        param.room_id,
+        param.idempotency_key,
+        param.confirmation_token,
+        param.trace_id,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -583,13 +1003,28 @@ struct DeleteArchiveRequest {
     platform: String,
     room_id: String,
     live_id: String,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_delete_archive(
     state: axum::extract::State<State>,
     Json(param): Json<DeleteArchiveRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    delete_archive(state.0, param.platform, param.room_id, param.live_id).await?;
+    delete_archive(
+        state.0,
+        param.platform,
+        param.room_id,
+        param.live_id,
+        param.idempotency_key,
+        param.confirmation_token,
+        param.trace_id,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -599,13 +1034,28 @@ struct DeleteArchivesRequest {
     platform: String,
     room_id: String,
     live_ids: Vec<String>,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_delete_archives(
     state: axum::extract::State<State>,
     Json(param): Json<DeleteArchivesRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    delete_archives(state.0, param.platform, param.room_id, param.live_ids).await?;
+    delete_archives(
+        state.0,
+        param.platform,
+        param.room_id,
+        param.live_ids,
+        param.idempotency_key,
+        param.confirmation_token,
+        param.trace_id,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -712,6 +1162,12 @@ struct UploadProcedureRequest {
     room_id: String,
     video_id: i64,
     profile: Profile,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_upload_procedure(
@@ -725,6 +1181,9 @@ async fn handler_upload_procedure(
         param.room_id,
         param.video_id,
         param.profile,
+        param.idempotency_key,
+        param.confirmation_token,
+        param.trace_id,
     )
     .await?;
     Ok(Json(ApiResponse::success(param.event_id)))
@@ -811,13 +1270,26 @@ async fn handler_get_video_cover(
 #[serde(rename_all = "camelCase")]
 struct DeleteVideoRequest {
     id: i64,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_delete_video(
     state: axum::extract::State<State>,
     Json(param): Json<DeleteVideoRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    delete_video(state.0, param.id).await?;
+    delete_video(
+        state.0,
+        param.id,
+        param.idempotency_key,
+        param.confirmation_token,
+        param.trace_id,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -1461,13 +1933,26 @@ async fn handler_export_danmu(
 #[serde(rename_all = "camelCase")]
 struct DeleteTaskRequest {
     id: String,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_delete_task(
     state: axum::extract::State<State>,
     Json(params): Json<DeleteTaskRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    delete_task(state.0, &params.id).await?;
+    delete_task(
+        state.0,
+        &params.id,
+        params.idempotency_key,
+        params.confirmation_token,
+        params.trace_id,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -1482,14 +1967,35 @@ async fn handler_get_tasks(
 #[serde(rename_all = "camelCase")]
 struct GenericFfmpegCommandRequest {
     args: Vec<String>,
+    #[serde(alias = "idempotency_key")]
+    idempotency_key: String,
+    #[serde(alias = "confirmation_token")]
+    confirmation_token: String,
+    #[serde(alias = "trace_id")]
+    trace_id: Option<String>,
 }
 
 async fn handler_generic_ffmpeg_command(
     state: axum::extract::State<State>,
     Json(params): Json<GenericFfmpegCommandRequest>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let result = generic_ffmpeg_command(state.0, params.args).await?;
-    Ok(Json(ApiResponse::success(result)))
+    let audit = require_sensitive_write(
+        "generic_ffmpeg_command",
+        &params.idempotency_key,
+        &params.confirmation_token,
+        params.trace_id.as_deref(),
+        &format!("ffmpeg_args_count:{}", params.args.len()),
+    )?;
+    match generic_ffmpeg_command(state.0, params.args).await {
+        Ok(result) => {
+            audit_tool_success(&audit);
+            Ok(Json(ApiResponse::success(result)))
+        }
+        Err(error) => {
+            audit_tool_failure(&audit, &error);
+            Err(error.into())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1798,12 +2304,25 @@ pub async fn start_api_server(state: State) {
             .route(
                 "/api/upload_and_import_files",
                 post(handler_upload_and_import_files),
+            )
+            .route("/api/save_review_sample", post(handler_save_review_sample))
+            .route(
+                "/api/seed_builtin_review_samples",
+                post(handler_seed_builtin_review_samples),
+            )
+            .route(
+                "/api/delete_review_sample",
+                post(handler_delete_review_sample),
             );
     } else {
         log::info!("Running in readonly mode, some api routes are disabled");
     }
 
     app = app
+        // MCP protocol commands
+        .route("/mcp/initialize", post(handler_mcp_initialize))
+        .route("/mcp/tools/list", post(handler_mcp_tools_list))
+        .route("/mcp/tools/call", post(handler_mcp_tools_call))
         // Config commands
         .route("/api/get_config", post(handler_get_config))
         .route("/api/get_static_port", post(handler_get_static_port))
@@ -1811,6 +2330,7 @@ pub async fn start_api_server(state: State) {
         .route("/api/get_messages", post(handler_get_messages))
         .route("/api/read_message", post(handler_read_message))
         .route("/api/delete_message", post(handler_delete_message))
+        .route("/api/get_review_samples", post(handler_get_review_samples))
         // Recorder commands
         .route("/api/get_recorder_list", post(handler_get_recorder_list))
         .route("/api/get_room_info", post(handler_get_room_info))

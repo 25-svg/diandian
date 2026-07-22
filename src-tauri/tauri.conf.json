@@ -7,6 +7,10 @@
   },
   "bundle": {
     "active": true,
+    "resources": [
+      "ffmpeg.exe",
+      "ffprobe.exe"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -16,7 +20,7 @@
     ],
     "targets": "all"
   },
-  "productName": "bili-shadowreplay",
+  "productName": "典典直播切片",
   "version": "../package.json",
   "identifier": "cn.vjoi.bilishadowreplay",
   "plugins": {

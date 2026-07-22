@@ -48,16 +48,14 @@ fn macos_deployment_target() -> Option<String> {
 }
 
 fn cuda_root() -> Option<PathBuf> {
-    env::var_os("CUDA_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("CUDACXX").and_then(|value| {
-                let nvcc = PathBuf::from(value);
-                nvcc.parent()
-                    .and_then(|bin| bin.parent())
-                    .map(PathBuf::from)
-            })
+    env::var_os("CUDA_PATH").map(PathBuf::from).or_else(|| {
+        env::var_os("CUDACXX").and_then(|value| {
+            let nvcc = PathBuf::from(value);
+            nvcc.parent()
+                .and_then(|bin| bin.parent())
+                .map(PathBuf::from)
         })
+    })
 }
 
 fn main() {
@@ -76,6 +74,14 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let cuda_enabled = env::var("CARGO_FEATURE_CUDA").is_ok();
     let metal_enabled = target_os == "macos";
+
+    // Rust's MSVC target links the dynamic release CRT in both debug and release
+    // builds. Keep whisper.cpp on the same runtime to avoid /MDd vs /MD linker
+    // conflicts when running `tauri dev` on Windows.
+    if target_os == "windows" {
+        config.profile("Release");
+        config.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL");
+    }
 
     match target_os.as_str() {
         "macos" => {

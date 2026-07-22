@@ -1,5 +1,9 @@
 use std::str::FromStr;
 
+use super::transcript_review::{
+    load_legacy_archive_transcript_audit, resolve_legacy_archive_review_item,
+    LegacyTranscriptAuditBundle,
+};
 use crate::danmu2ass;
 use crate::database::record::RecordRow;
 use crate::database::recorder::RecorderRow;
@@ -7,9 +11,13 @@ use crate::database::task::TaskRow;
 use crate::progress::progress_reporter::EventEmitter;
 use crate::progress::progress_reporter::ProgressReporter;
 use crate::progress::progress_reporter::ProgressReporterTrait;
-use crate::recorder_manager::{GenerateWholeClipParams, RecorderList};
+use crate::recorder_manager::{
+    ArchiveSubtitleRefreshResult, GenerateWholeClipParams, RecorderList,
+};
+use crate::security::{audit_tool_failure, audit_tool_success, require_sensitive_write};
 use crate::state::State;
 use crate::state_type;
+use crate::subtitle_generator::transcript_artifacts::TranscriptSource;
 use crate::task::Task;
 use crate::task::TaskPriority;
 use crate::webhook::events;
@@ -140,8 +148,18 @@ pub async fn remove_recorder(
     state: state_type!(),
     platform: String,
     room_id: String,
+    idempotency_key: String,
+    confirmation_token: String,
+    trace_id: Option<String>,
 ) -> Result<(), String> {
     log::info!("Remove recorder: {platform} {room_id}");
+    let audit = require_sensitive_write(
+        "remove_recorder",
+        &idempotency_key,
+        &confirmation_token,
+        trace_id.as_deref(),
+        &format!("recorder:{platform}:{room_id}"),
+    )?;
     let platform = PlatformType::from_str(&platform).unwrap();
     match state
         .recorder_manager
@@ -162,11 +180,14 @@ pub async fn remove_recorder(
                 log::error!("Post webhook event error: {e}");
             }
             log::info!("Removed recorder: {} {}", platform.as_str(), room_id);
+            audit_tool_success(&audit);
             Ok(())
         }
         Err(e) => {
             log::error!("Failed to remove recorder: {e}");
-            Err(e.to_string())
+            let error = e.to_string();
+            audit_tool_failure(&audit, &error);
+            Err(error)
         }
     }
 }
@@ -255,8 +276,72 @@ pub async fn generate_archive_subtitle(
     let platform = PlatformType::from_str(&platform)?;
     Ok(state
         .recorder_manager
-        .generate_archive_subtitle(platform, &room_id, &live_id)
+        .generate_archive_subtitle(platform, &room_id, &live_id, None)
         .await?)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn refresh_archive_subtitle(
+    state: state_type!(),
+    platform: String,
+    room_id: String,
+    live_id: String,
+) -> Result<ArchiveSubtitleRefreshResult, String> {
+    let platform = PlatformType::from_str(&platform)?;
+    Ok(state
+        .recorder_manager
+        .refresh_archive_subtitle(platform, &room_id, &live_id)
+        .await?)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_archive_transcript_audit(
+    state: state_type!(),
+    platform: String,
+    room_id: String,
+    live_id: String,
+) -> Result<LegacyTranscriptAuditBundle, String> {
+    load_legacy_archive_transcript_audit(
+        &state,
+        TranscriptSource::Archive {
+            platform,
+            room_id,
+            live_id,
+        },
+    )
+    .await
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn save_archive_fact_card(
+    state: state_type!(),
+    platform: String,
+    room_id: String,
+    live_id: String,
+    fact_card: serde_json::Value,
+) -> Result<(), String> {
+    let platform = PlatformType::from_str(&platform)?;
+    Ok(state
+        .recorder_manager
+        .save_archive_fact_card(platform, &room_id, &live_id, fact_card)
+        .await?)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn resolve_archive_review_item(
+    state: state_type!(),
+    platform: String,
+    room_id: String,
+    live_id: String,
+    index: usize,
+    correction: String,
+) -> Result<LegacyTranscriptAuditBundle, String> {
+    let source = TranscriptSource::Archive {
+        platform,
+        room_id,
+        live_id,
+    };
+    resolve_legacy_archive_review_item(&state, source, index, correction).await
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -265,12 +350,30 @@ pub async fn delete_archive(
     platform: String,
     room_id: String,
     live_id: String,
+    idempotency_key: String,
+    confirmation_token: String,
+    trace_id: Option<String>,
 ) -> Result<(), String> {
+    let audit = require_sensitive_write(
+        "delete_archive",
+        &idempotency_key,
+        &confirmation_token,
+        trace_id.as_deref(),
+        &format!("archive:{platform}:{room_id}:{live_id}"),
+    )?;
     let platform = PlatformType::from_str(&platform)?;
-    let to_delete = state
+    let to_delete = match state
         .recorder_manager
         .delete_archive(platform, &room_id, &live_id)
-        .await?;
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.to_string();
+            audit_tool_failure(&audit, &error);
+            return Err(error);
+        }
+    };
     state
         .db
         .new_message(
@@ -284,6 +387,7 @@ pub async fn delete_archive(
     if let Err(e) = state.webhook_poster.post_event(&event).await {
         log::error!("Post webhook event error: {e}");
     }
+    audit_tool_success(&audit);
     Ok(())
 }
 
@@ -293,9 +397,19 @@ pub async fn delete_archives(
     platform: String,
     room_id: String,
     live_ids: Vec<String>,
+    idempotency_key: String,
+    confirmation_token: String,
+    trace_id: Option<String>,
 ) -> Result<(), String> {
+    let audit = require_sensitive_write(
+        "delete_archives",
+        &idempotency_key,
+        &confirmation_token,
+        trace_id.as_deref(),
+        &format!("archives:{platform}:{room_id}:{}", live_ids.join(",")),
+    )?;
     let platform = PlatformType::from_str(&platform)?;
-    let to_deletes = state
+    let to_deletes = match state
         .recorder_manager
         .delete_archives(
             platform,
@@ -305,7 +419,15 @@ pub async fn delete_archives(
                 .map(std::string::String::as_str)
                 .collect::<Vec<&str>>(),
         )
-        .await?;
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.to_string();
+            audit_tool_failure(&audit, &error);
+            return Err(error);
+        }
+    };
     state
         .db
         .new_message(
@@ -321,6 +443,7 @@ pub async fn delete_archives(
             log::error!("Post webhook event error: {e}");
         }
     }
+    audit_tool_success(&audit);
     Ok(())
 }
 

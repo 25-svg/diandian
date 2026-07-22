@@ -30,6 +30,7 @@
   import TypeSelect from "./TypeSelect.svelte";
   import {
     invoke,
+    invokeSensitive,
     TAURI_ENV,
     listen,
     log,
@@ -1350,8 +1351,15 @@
             class="text-red-500 hover:text-red-400 transition-colors duration-200 px-2 py-1.5 rounded-md hover:bg-red-500/10"
             on:click={async () => {
               if (!video) return;
+              if (!window.confirm(`确定要删除“${video.title || video.file}”吗？此操作无法撤销。`)) return;
+              const source = video.file;
               try {
-                await invoke("delete_video", { id: video.id });
+                if (videoElement) {
+                  videoElement.pause();
+                  videoElement.removeAttribute("src");
+                  videoElement.load();
+                }
+                await invokeSensitive("delete_video", { id: video.id });
                 // 更新视频列表
                 await onVideoListUpdate?.();
                 // 如果列表不为空，选择新的视频
@@ -1364,6 +1372,10 @@
                 }
               } catch (error) {
                 console.error(error);
+                if (videoElement) {
+                  videoElement.src = source;
+                  videoElement.load();
+                }
                 alert("删除失败：" + error);
               }
             }}
