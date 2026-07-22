@@ -182,7 +182,7 @@ impl SupportCandidateStatus {
 pub fn evaluate_admission(gates: &HardGateResult, score: &ScoreBreakdown) -> CandidateAdmission {
     if !gates.all_pass() {
         CandidateAdmission::Blocked
-    } else if score.total() > 85 {
+    } else if score.total() >= 85 {
         CandidateAdmission::CandidateQueue
     } else if score.total() >= 70 {
         CandidateAdmission::ReviewOnly

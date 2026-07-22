@@ -5,7 +5,7 @@
 - Added the `master-script` workspace crate with `serde` and `thiserror` dependencies.
 - Implemented bounded `ScoreBreakdown` construction with caps of `25, 25, 20, 15, 10, 5` and a computed total.
 - Implemented `HardGateResult::all_pass()` as the conjunction of exactly seven booleans; `reasons` remains UI evidence only.
-- Implemented deterministic admission thresholds: `Blocked` for any failed gate, `AnalysisOnly` below 70, `ReviewOnly` from 70 through 85, and `CandidateQueue` above 85.
+- Implemented deterministic admission thresholds: `Blocked` for any failed gate, `AnalysisOnly` from 0 through 69, `ReviewOnly` from 70 through 84, and `CandidateQueue` from 85 through 100.
 - Implemented the exact `MasterSectionKind` and `SupportCandidateStatus` variants with snake_case serde and `as_str()` values.
 - Implemented strict three-component ASCII decimal version parsing with `u64` components and checked patch increment.
 
@@ -69,6 +69,108 @@ rustfmt --edition 2021 --check 'crates/master-script/src/lib.rs' 'crates/master-
 ```
 
 Output: exit code `0`, no output.
+
+## Business threshold change: score 85 admission
+
+This section supersedes the historical 85/86 boundary evidence elsewhere in this report. The binding rule is now: after all hard gates pass, `85-100` is `CandidateQueue`, `70-84` is `ReviewOnly`, and `0-69` is `AnalysisOnly`.
+
+### Threshold fix summary
+
+- Changed the boundary test first from 85/86 to 84/85 while leaving production unchanged.
+- Changed `evaluate_admission` from `score.total() > 85` to `score.total() >= 85`.
+- Preserved private score dimensions, read-only accessors, bounded construction, recomputing deserialization, and derived serialization.
+- Updated the design specification and implementation plan, including Task 2 persistence, Task 6 comparison, Task 8 UI, Task 10 E2E, manual acceptance, and execution checkpoints.
+
+### Threshold RED evidence
+
+Command, run from `src-tauri` before the production change:
+
+```powershell
+cargo test -p master-script
+```
+
+Output:
+
+```text
+running 9 tests
+test admits_scores_at_85_after_all_gates_pass ... FAILED
+
+assertion `left == right` failed
+left: ReviewOnly
+right: CandidateQueue
+
+test result: FAILED. 8 passed; 1 failed; 0 ignored
+error: test failed, to rerun pass `-p master-script --test scoring`
+```
+
+### Threshold GREEN evidence
+
+Command:
+
+```powershell
+cargo test -p master-script
+```
+
+Output:
+
+```text
+running 9 tests
+test a_failed_gate_blocks_a_perfect_score ... ok
+test admits_scores_at_85_after_all_gates_pass ... ok
+test gate_reasons_do_not_change_a_passing_gate_result ... ok
+test increments_patch_and_reports_patch_overflow ... ok
+test rejects_non_strict_patch_versions ... ok
+test score_round_trip_exposes_read_only_dimensions_and_derived_total ... ok
+test serializes_master_section_kinds_and_support_statuses_as_snake_case ... ok
+test tampered_serialized_total_cannot_admit_a_low_score ... ok
+test validates_dimension_caps ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored
+```
+
+Focused formatting command:
+
+```powershell
+rustfmt --edition 2021 --check 'crates/master-script/src/lib.rs' 'crates/master-script/tests/scoring.rs'
+```
+
+Output: exit code `0`, no output.
+
+### Document consistency evidence
+
+Forbidden-old-semantics scan:
+
+```powershell
+rg -n -i '高于\s*85|above\s+85|>\s*85|86-100|70-85|85\s*(不|does not|creates none)|score_85_cannot|85/86|86-point|score 86|总分 86|\b86\b' docs/superpowers/specs/2026-07-22-master-script-baseline-analysis-design.md docs/superpowers/plans/2026-07-22-master-script-baseline-analysis.md
+```
+
+Output: no matches (`NO_FORBIDDEN_OLD_SEMANTICS`).
+
+Positive boundary scan:
+
+```powershell
+rg -n '85-100|70-84|0-69|score_84|score_85|84/85|总分 84|总分 85|at least 85|达到 85|85 分及以上|score 84|score 85' docs/superpowers/specs/2026-07-22-master-script-baseline-analysis-design.md docs/superpowers/plans/2026-07-22-master-script-baseline-analysis.md
+```
+
+Output confirmed:
+
+```text
+plan: Total score `85-100` enters the support-candidate queue; `70-84` is review-only and `0-69` is analysis-only.
+plan: score_84 => ReviewOnly; score_85 => CandidateQueue.
+plan Task 2: score_84_cannot_be_persisted_as_queued.
+plan Task 8: score 84 displays review-only; score 85 displays entered-candidate.
+plan Task 10: score 85 creates one pending candidate; score 84 creates none.
+spec: `85-100` candidate queue; `70-84` review; `0-69` analysis.
+spec acceptance: total 84 does not enter; total 85 with all gates enters.
+```
+
+Final diff validation:
+
+```powershell
+git diff --check
+```
+
+Output: exit code `0`; only existing Git LF-to-CRLF conversion warnings were printed.
 
 ## Second review fix: immutable score dimensions
 

@@ -17,7 +17,7 @@ fn passing_gates() -> HardGateResult {
 }
 
 #[test]
-fn admits_only_scores_above_85_after_all_gates_pass() {
+fn admits_scores_at_85_after_all_gates_pass() {
     let score_69 = ScoreBreakdown::new(20, 20, 15, 10, 4, 0).unwrap();
     assert_eq!(
         evaluate_admission(&passing_gates(), &score_69),
@@ -30,15 +30,15 @@ fn admits_only_scores_above_85_after_all_gates_pass() {
         CandidateAdmission::ReviewOnly
     );
 
-    let score_85 = ScoreBreakdown::new(20, 20, 18, 13, 9, 5).unwrap();
+    let score_84 = ScoreBreakdown::new(20, 20, 17, 13, 9, 5).unwrap();
     assert_eq!(
-        evaluate_admission(&passing_gates(), &score_85),
+        evaluate_admission(&passing_gates(), &score_84),
         CandidateAdmission::ReviewOnly
     );
 
-    let score_86 = ScoreBreakdown::new(21, 20, 18, 13, 9, 5).unwrap();
+    let score_85 = ScoreBreakdown::new(20, 20, 18, 13, 9, 5).unwrap();
     assert_eq!(
-        evaluate_admission(&passing_gates(), &score_86),
+        evaluate_admission(&passing_gates(), &score_85),
         CandidateAdmission::CandidateQueue
     );
 }

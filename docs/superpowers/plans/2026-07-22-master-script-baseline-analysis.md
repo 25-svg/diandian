@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a recoverable multi-product master-script pipeline, compare later transaction clips against the published master, and route only gate-passing scores above 85 into a human-reviewed support-script queue.
+**Goal:** Build a recoverable multi-product master-script pipeline, compare later transaction clips against the published master, and route only gate-passing scores of at least 85 into a human-reviewed support-script queue.
 
 **Architecture:** Add a focused Rust domain crate for immutable score and lifecycle rules, persist master jobs/versions/sections/support candidates in SQLite, and add controlled atomic Markdown writes beside the existing read-only Obsidian snapshot. Reuse the current transcript artifacts, Volcengine ten-minute ASR chunks, MiniMax client, and three-column analysis page; keep source transcript, faithful master text, and AI rewrite candidates as distinct assets.
 
@@ -15,7 +15,7 @@
 - Raw ASR, reviewed transcript, structured master, support candidate, and AI rewrite candidate remain separate.
 - Dynamic price, inventory, discount, condition, link number, and transaction status must never be inferred from parameter cards or context.
 - A score is valid only after all hard gates pass and must be recomputed locally from six bounded integer dimensions totaling 100.
-- Total score `86-100` enters the support-candidate queue; `85` does not.
+- Total score `85-100` enters the support-candidate queue; `70-84` is review-only and `0-69` is analysis-only.
 - Queue admission never modifies the published master. Only an explicit human approval creates a new immutable master version.
 - Every master section and support candidate retains source identity, absolute time range, transcript evidence, model version, and prompt version.
 - Database migrations are immutable after release. New schema changes always receive a new migration number after version 18.
@@ -56,11 +56,11 @@ fn passing_gates() -> HardGateResult {
 }
 
 #[test]
-fn admits_only_scores_above_85_after_all_gates_pass() {
+fn admits_scores_at_85_after_all_gates_pass() {
+    let score_84 = ScoreBreakdown::new(20, 20, 17, 13, 9, 5).unwrap();
+    assert_eq!(evaluate_admission(&passing_gates(), &score_84), CandidateAdmission::ReviewOnly);
     let score_85 = ScoreBreakdown::new(20, 20, 18, 13, 9, 5).unwrap();
-    assert_eq!(evaluate_admission(&passing_gates(), &score_85), CandidateAdmission::ReviewOnly);
-    let score_86 = ScoreBreakdown::new(21, 20, 18, 13, 9, 5).unwrap();
-    assert_eq!(evaluate_admission(&passing_gates(), &score_86), CandidateAdmission::CandidateQueue);
+    assert_eq!(evaluate_admission(&passing_gates(), &score_85), CandidateAdmission::CandidateQueue);
 }
 
 #[test]
@@ -115,8 +115,8 @@ impl ScoreBreakdown {
 
 pub fn evaluate_admission(gates: &HardGateResult, score: &ScoreBreakdown) -> CandidateAdmission {
     if !gates.all_pass() { CandidateAdmission::Blocked }
-    else if score.total > 85 { CandidateAdmission::CandidateQueue }
-    else if score.total >= 70 { CandidateAdmission::ReviewOnly }
+    else if score.total() >= 85 { CandidateAdmission::CandidateQueue }
+    else if score.total() >= 70 { CandidateAdmission::ReviewOnly }
     else { CandidateAdmission::AnalysisOnly }
 }
 ```
@@ -125,7 +125,7 @@ pub fn evaluate_admission(gates: &HardGateResult, score: &ScoreBreakdown) -> Can
 
 Run: `cargo test -p master-script`
 
-Expected: all tests PASS, including exact boundary checks for 69, 70, 85, and 86.
+Expected: all tests PASS, including exact boundary checks for 69, 70, 84, and 85.
 
 - [ ] **Step 5: Commit**
 
@@ -210,7 +210,7 @@ async fn published_master_versions_are_immutable() {
 #[tokio::test]
 async fn support_candidate_dedupes_by_source_time_and_master_version() {
     let (db, master, section) = seeded_master().await;
-    let input = queued_candidate(master.id, section.id, 86);
+    let input = queued_candidate(master.id, section.id, 85);
     let first = db.insert_support_candidate(input.clone()).await.unwrap();
     let second = db.insert_support_candidate(input).await.unwrap();
     assert_eq!(first.id, second.id);
@@ -218,15 +218,15 @@ async fn support_candidate_dedupes_by_source_time_and_master_version() {
 }
 
 #[tokio::test]
-async fn score_85_cannot_be_persisted_as_queued() {
+async fn score_84_cannot_be_persisted_as_queued() {
     let (db, master, section) = seeded_master().await;
-    let error = db.insert_support_candidate(queued_candidate(master.id, section.id, 85))
+    let error = db.insert_support_candidate(queued_candidate(master.id, section.id, 84))
         .await.unwrap_err();
     assert!(matches!(error, DatabaseError::InvalidMasterScriptState(_)));
 }
 ```
 
-`seeded_master()` creates an in-memory database, one source, published V1.0 and one product section. `queued_candidate()` creates passing gates and a valid bounded `ScoreBreakdown`; for total 85 it deliberately requests `CandidateQueue` so the persistence boundary must reject it.
+`seeded_master()` creates an in-memory database, one source, published V1.0 and one product section. `queued_candidate()` creates passing gates and a valid bounded `ScoreBreakdown`; for total 84 it deliberately requests `CandidateQueue` so the persistence boundary must reject it.
 
 - [ ] **Step 2: Verify the tests fail**
 
@@ -511,7 +511,7 @@ git commit -m "feat: build faithful multi-product master scripts"
 
 - [ ] **Step 1: Write failing comparison tests**
 
-Cover exact product/section match, no-match response without a score, stale master version detection, score dimension cap rejection, hard-gate block despite 100 model points, and 86-point queue admission.
+Cover exact product/section match, no-match response without a score, stale master version detection, score dimension cap rejection, hard-gate block despite 100 model points, and 85-point queue admission.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -612,7 +612,7 @@ git commit -m "feat: add master script import and preview workflow"
 
 - [ ] **Step 1: Write failing analysis-state tests**
 
-Test that score 85 displays `仅保留复盘`, score 86 plus passing gates displays `已进入候选辅稿`, blocked 100 displays the blocking reason, unmatched sections display `请选择母稿位置后重新评分`, and stale responses cannot replace a newly selected candidate.
+Test that score 84 displays `仅保留复盘`, score 85 plus passing gates displays `已进入候选辅稿`, blocked 100 displays the blocking reason, unmatched sections display `请选择母稿位置后重新评分`, and stale responses cannot replace a newly selected candidate.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -702,7 +702,7 @@ git commit -m "feat: review support scripts and version the master"
 
 - [ ] **Step 1: Add an end-to-end fixture test**
 
-Use a short synthetic multi-product SRT and fake model responses. Assert: V1.0 has ordered sections, a gate-passing score 86 creates one pending candidate, score 85 creates none, approval plus publish creates V1.1, V1.0 hash remains unchanged, and every candidate links to source/time/master section.
+Use a short synthetic multi-product SRT and fake model responses. Assert: V1.0 has ordered sections, a gate-passing score 85 creates one pending candidate, score 84 creates none, approval plus publish creates V1.1, V1.0 hash remains unchanged, and every candidate links to source/time/master section.
 
 - [ ] **Step 2: Run the complete automated suite**
 
@@ -727,7 +727,7 @@ Expected: every command exits 0. Record any pre-existing compiler warnings separ
 
 - [ ] **Step 3: Run manual desktop acceptance**
 
-Use the provided `C:/Users/10230/Downloads/Video/直播大屏·专业版_4.ts` only after making a safety copy or recording its SHA-256. Verify: import, resumable progress, parameter-card terminology, transcript review, multi-product section preview, V1.0 publish, later clip comparison, 85/86 boundary, queue review, and V1.1 publication. Confirm source video and previous master hashes are unchanged.
+Use the provided `C:/Users/10230/Downloads/Video/直播大屏·专业版_4.ts` only after making a safety copy or recording its SHA-256. Verify: import, resumable progress, parameter-card terminology, transcript review, multi-product section preview, V1.0 publish, later clip comparison, 84/85 boundary, queue review, and V1.1 publication. Confirm source video and previous master hashes are unchanged.
 
 - [ ] **Step 4: Verify desktop layout**
 
@@ -747,6 +747,6 @@ git commit -m "test: verify master script baseline workflow"
 ## Execution Checkpoints
 
 - After Task 3: review domain, schema, and controlled-write security before processing real media.
-- After Task 6: review a synthetic master and the exact 85/86 scoring boundary before frontend integration.
+- After Task 6: review a synthetic master and the exact 84/85 scoring boundary before frontend integration.
 - After Task 9: review the complete workflow with fixture media before using the six-hour company recording.
 - After Task 10: copy reviewed commits back to the user's dirty main worktree using blob-level conflict checks; never reset or overwrite unrelated user changes.
