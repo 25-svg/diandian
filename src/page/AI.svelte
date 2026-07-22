@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { aiFetch } from "../lib/aiFetch";
   import { invoke } from "../lib/invoker";
-  import { Settings, Send, Sparkles, Trash2, Zap, MessageSquare, Bot, Upload, Database } from "lucide-svelte";
+  import { Settings, Send, Sparkles, Trash2, Zap, MessageSquare, Bot, Upload, Database, Clipboard } from "lucide-svelte";
   import createAgent, { type AgentMode } from "../lib/agent/agent";
   import { COMMERCE_REVIEW_PROMPT } from "../lib/agent/prompts";
   import { tools } from "../lib/agent/tools";
@@ -18,6 +18,7 @@
   import SettingsModal from "../lib/components/ai/SettingsModal.svelte";
   import ImportVideoDialog from "../lib/components/ImportVideoDialog.svelte";
   import MasterSourceDialog from "../lib/components/master/MasterSourceDialog.svelte";
+  import SupportCandidateQueue from "../lib/components/master/SupportCandidateQueue.svelte";
   import ReviewSampleDialog from "../lib/components/ai/ReviewSampleDialog.svelte";
   import type { ReviewSample, VideoItem } from "../lib/interface";
 
@@ -30,6 +31,7 @@
   let agentMode: AgentMode = "commerce-review";
   let showImportDialog = false;
   let masterSourceVideo: VideoItem | null = null;
+  let showSupportCandidateQueue = false;
   let showSampleDialog = false;
   let importWorkflowStatus = "";
   let adminMode = false;
@@ -1259,6 +1261,15 @@
               {#if agentMode === "commerce-review"}
                 <button
                   class="px-2.5 py-1.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors flex items-center space-x-1.5 text-sm"
+                  on:click={() => showSupportCandidateQueue = true}
+                  disabled={isProcessing}
+                  title="审核达到 85 分的候选辅稿"
+                >
+                  <Clipboard class="w-3.5 h-3.5" />
+                  <span>候选辅稿</span>
+                </button>
+                <button
+                  class="px-2.5 py-1.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors flex items-center space-x-1.5 text-sm"
                   on:click={() => showSampleDialog = true}
                   disabled={isProcessing}
                   title="打开M1样本库"
@@ -1320,6 +1331,10 @@
       on:close={() => masterSourceVideo = null}
       on:published={handleMasterPublished}
     />
+  {/if}
+
+  {#if showSupportCandidateQueue}
+    <SupportCandidateQueue on:close={() => showSupportCandidateQueue = false} />
   {/if}
 
   <ReviewSampleDialog

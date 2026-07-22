@@ -89,6 +89,28 @@ export type MasterComparisonResult = {
   };
   candidate: { id: number; status: string } | null;
 };
+export type SupportCandidate = {
+  id: number;
+  candidateKey: string;
+  masterScriptId: number;
+  masterSectionId: number;
+  sourceKey: string;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  hostText: string;
+  comparisonJson: string;
+  totalScore: number;
+  admission: CandidateAdmission;
+  status: SupportCandidateStatus;
+  createdAt: string;
+};
+export type MasterUpgradePreview = {
+  baseMasterId: number;
+  scriptKey: string;
+  currentVersion: string;
+  nextVersion: string;
+  sections: Array<{ sectionId: number; sectionKey: string; currentText: string; nextText: string; candidateIds: number[] }>;
+};
 
 export function masterStatusLabel(status: MasterSourceStatus): string {
   return ({
@@ -134,6 +156,24 @@ export function supportAdmissionPresentation(
     return { tone: "neutral", label: "仅保留复盘", detail: `本地复核分 ${total}，未达到 85 分` };
   }
   return { tone: "neutral", label: "仅作分析参考", detail: `本地复核分 ${total}` };
+}
+
+export type CandidateDecisionLabel = "通过并加入新版本" | "保留候选" | "退回修改" | "不采用";
+export type SupportCandidateStatus = "pending_review" | "approved" | "held" | "returned" | "rejected" | "merged";
+
+export function candidateDecisionStatus(label: CandidateDecisionLabel): SupportCandidateStatus {
+  return ({
+    "通过并加入新版本": "approved",
+    "保留候选": "held",
+    "退回修改": "returned",
+    "不采用": "rejected",
+  } satisfies Record<CandidateDecisionLabel, SupportCandidateStatus>)[label];
+}
+
+export function upgradePublishGate(confirmed: boolean, approvedCount: number): { allowed: boolean; reason: string } {
+  if (!confirmed) return { allowed: false, reason: "请先确认母稿差异" };
+  if (approvedCount < 1) return { allowed: false, reason: "至少选择一条已通过的候选辅稿" };
+  return { allowed: true, reason: "可以发布母稿新版本" };
 }
 
 export function startMasterIngest(request: {
@@ -183,6 +223,22 @@ export function compareHighlightToMaster(request: {
   sectionKind: MasterSectionKind;
 }) {
   return invokeCommand<MasterComparisonResult>("compare_highlight_to_master", { request });
+}
+
+export function listSupportCandidates(status?: SupportCandidateStatus) {
+  return invokeCommand<SupportCandidate[]>("list_support_candidates", { status: status || null });
+}
+
+export function decideSupportCandidate(id: number, nextStatus: SupportCandidateStatus) {
+  return invokeCommand<SupportCandidate>("decide_support_candidate", { id, nextStatus });
+}
+
+export function previewMasterUpgrade(scriptKey: string, candidateIds: number[]) {
+  return invokeCommand<MasterUpgradePreview>("preview_master_upgrade", { request: { scriptKey, candidateIds } });
+}
+
+export function publishMasterUpgrade(scriptKey: string, candidateIds: number[], diffConfirmed: boolean) {
+  return invokeCommand<PublishedMaster>("publish_master_upgrade", { request: { scriptKey, candidateIds, diffConfirmed } });
 }
 
 async function invokeCommand<T>(command: string, args: Record<string, unknown>): Promise<T> {

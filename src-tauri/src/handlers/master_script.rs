@@ -21,6 +21,7 @@ use master_ingest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -82,6 +83,41 @@ pub struct MasterIngestResponse {
 pub struct MasterBaseline {
     pub master: MasterScriptRow,
     pub sections: Vec<crate::database::master_script::MasterSectionRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterUpgradeRequest {
+    pub script_key: String,
+    pub candidate_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterUpgradeSection {
+    pub section_id: i64,
+    pub section_key: String,
+    pub current_text: String,
+    pub next_text: String,
+    pub candidate_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterUpgradePreview {
+    pub base_master_id: i64,
+    pub script_key: String,
+    pub current_version: String,
+    pub next_version: String,
+    pub sections: Vec<MasterUpgradeSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishMasterUpgradeRequest {
+    pub script_key: String,
+    pub candidate_ids: Vec<i64>,
+    pub diff_confirmed: bool,
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -282,6 +318,253 @@ pub async fn get_master_baseline(
         .await
         .map_err(String::from)?;
     Ok(MasterBaseline { master, sections })
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn list_support_candidates(
+    state: state_type!(),
+    status: Option<String>,
+) -> Result<Vec<crate::database::master_script::SupportCandidateRow>, String> {
+    state
+        .db
+        .list_support_candidates(status.as_deref())
+        .await
+        .map_err(String::from)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn decide_support_candidate(
+    state: state_type!(),
+    id: i64,
+    next_status: String,
+) -> Result<crate::database::master_script::SupportCandidateRow, String> {
+    state
+        .db
+        .decide_support_candidate(id, &next_status)
+        .await
+        .map_err(String::from)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn preview_master_upgrade(
+    state: state_type!(),
+    request: MasterUpgradeRequest,
+) -> Result<MasterUpgradePreview, String> {
+    build_upgrade_preview(&state, request).await
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn publish_master_upgrade(
+    state: state_type!(),
+    request: PublishMasterUpgradeRequest,
+) -> Result<MasterScriptRow, String> {
+    if !request.diff_confirmed {
+        return Err("请先确认母稿差异".into());
+    }
+    let preview = build_upgrade_preview(
+        &state,
+        MasterUpgradeRequest {
+            script_key: request.script_key,
+            candidate_ids: request.candidate_ids,
+        },
+    )
+    .await?;
+    let base = state
+        .db
+        .get_master_version(preview.base_master_id)
+        .await
+        .map_err(String::from)?;
+    let current_sections = state
+        .db
+        .list_master_sections(base.id)
+        .await
+        .map_err(String::from)?;
+    let changes = preview
+        .sections
+        .iter()
+        .map(|section| (section.section_id, section))
+        .collect::<HashMap<_, _>>();
+    let next_sections = current_sections
+        .iter()
+        .map(|section| {
+            let change = changes.get(&section.id);
+            Ok(NewMasterSection {
+                section_key: section.section_key.clone(),
+                position: section.position,
+                section_kind: parse_stored_section_kind(&section.section_kind)?,
+                product_card_id: section.product_card_id.clone(),
+                title: section.title.clone(),
+                source_start_ms: section.source_start_ms,
+                source_end_ms: section.source_end_ms,
+                host_text: section.host_text.clone(),
+                master_text: change
+                    .map(|value| value.next_text.clone())
+                    .unwrap_or_else(|| section.master_text.clone()),
+                metadata_json: if let Some(change) = change {
+                    json!({"baseMetadata": section.metadata_json, "supportCandidateIds": change.candidate_ids}).to_string()
+                } else {
+                    section.metadata_json.clone()
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let vault = configured_vault(&state).await?;
+    let base_path = PathBuf::from("10-企业母稿")
+        .join(&preview.script_key)
+        .join(format!("V{}", preview.next_version));
+    let index_relative = base_path.join("README.md");
+    let index = render_upgrade_index(&base, &preview.next_version, &next_sections);
+    let mut files = vec![(index_relative.clone(), index.clone())];
+    for section in &next_sections {
+        let key = builder::safe_key(&section.section_key)?;
+        files.push((
+            base_path.join(format!("{:02}-{key}.md", section.position)),
+            render_upgrade_section(&preview.script_key, &preview.next_version, section),
+        ));
+    }
+    let mut created = Vec::new();
+    for (relative, content) in files {
+        if let Err(error) = write_new_master_file(&vault, &relative, &content, &mut created).await {
+            cleanup_created_files(&vault, &created).await;
+            return Err(error);
+        }
+    }
+    let published = state
+        .db
+        .publish_master_version(NewMasterVersion {
+            script_key: preview.script_key.clone(),
+            version: preview.next_version.clone(),
+            source_id: base.source_id,
+            title: base.title,
+            index_relative_path: normalized_path(&index_relative),
+            content_hash: builder::content_hash(&index),
+            sections: next_sections,
+        })
+        .await;
+    let published = match published {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_created_files(&vault, &created).await;
+            return Err(error.to_string());
+        }
+    };
+    for candidate_id in preview
+        .sections
+        .iter()
+        .flat_map(|section| section.candidate_ids.iter())
+    {
+        state
+            .db
+            .decide_support_candidate(*candidate_id, "merged")
+            .await
+            .map_err(String::from)?;
+    }
+    Ok(published)
+}
+
+async fn build_upgrade_preview(
+    state: &State,
+    request: MasterUpgradeRequest,
+) -> Result<MasterUpgradePreview, String> {
+    let script_key = builder::safe_key(&request.script_key)?;
+    let ids = request.candidate_ids.into_iter().collect::<HashSet<_>>();
+    if ids.is_empty() {
+        return Err("至少选择一条已通过的候选辅稿".into());
+    }
+    let base = state
+        .db
+        .get_latest_published_master(&script_key)
+        .await
+        .map_err(String::from)?;
+    let candidates = state
+        .db
+        .list_support_candidates(Some("approved"))
+        .await
+        .map_err(String::from)?
+        .into_iter()
+        .filter(|candidate| ids.contains(&candidate.id))
+        .collect::<Vec<_>>();
+    if candidates.len() != ids.len() {
+        return Err("所选候选辅稿尚未全部通过人工审核".into());
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.master_script_id != base.id)
+    {
+        return Err("母稿已更新，请先按最新版本重新评分".into());
+    }
+    let sections = state
+        .db
+        .list_master_sections(base.id)
+        .await
+        .map_err(String::from)?;
+    let mut changes = Vec::new();
+    for section in sections {
+        let selected = candidates
+            .iter()
+            .filter(|candidate| candidate.master_section_id == section.id)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        let support_text = selected
+            .iter()
+            .map(|candidate| candidate.host_text.trim())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        changes.push(MasterUpgradeSection {
+            section_id: section.id,
+            section_key: section.section_key,
+            current_text: section.master_text.clone(),
+            next_text: format!(
+                "{}\n\n## 候选辅稿\n{}",
+                section.master_text.trim(),
+                support_text
+            ),
+            candidate_ids: selected.iter().map(|candidate| candidate.id).collect(),
+        });
+    }
+    Ok(MasterUpgradePreview {
+        base_master_id: base.id,
+        script_key,
+        current_version: base.version.clone(),
+        next_version: master_script::next_patch_version(&base.version)
+            .map_err(|error| error.to_string())?,
+        sections: changes,
+    })
+}
+
+fn parse_stored_section_kind(value: &str) -> Result<master_script::MasterSectionKind, String> {
+    match value {
+        "opening" => Ok(master_script::MasterSectionKind::Opening),
+        "product" => Ok(master_script::MasterSectionKind::Product),
+        "transition" => Ok(master_script::MasterSectionKind::Transition),
+        "scenario" => Ok(master_script::MasterSectionKind::Scenario),
+        "closing" => Ok(master_script::MasterSectionKind::Closing),
+        _ => Err(format!("母稿章节类型无效：{value}")),
+    }
+}
+
+fn render_upgrade_index(
+    base: &MasterScriptRow,
+    version: &str,
+    sections: &[NewMasterSection],
+) -> String {
+    let links = sections
+        .iter()
+        .map(|section| {
+            format!(
+                "- [[{:02}-{}|{}]]",
+                section.position, section.section_key, section.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("---\nid: {}\ntype: master_script\nversion: {}\nbase_version: {}\nstatus: published\n---\n\n# {}\n\n{}\n", base.script_key, version, base.version, base.title, links)
+}
+
+fn render_upgrade_section(script_key: &str, version: &str, section: &NewMasterSection) -> String {
+    format!("---\nmaster_id: {script_key}\nversion: {version}\nposition: {}\nkind: {}\nsource_start_ms: {}\nsource_end_ms: {}\n---\n\n# {}\n\n{}\n", section.position, section.section_kind.as_str(), section.source_start_ms, section.source_end_ms, section.title, section.master_text)
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]

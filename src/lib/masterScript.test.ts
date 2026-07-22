@@ -4,6 +4,8 @@ import {
   masterPublishGate,
   masterStatusLabel,
   supportAdmissionPresentation,
+  candidateDecisionStatus,
+  upgradePublishGate,
 } from "./masterScript.js";
 
 assert.equal(masterStatusLabel("transcribing"), "正在生成母稿逐字稿");
@@ -28,5 +30,12 @@ assert.deepEqual(supportAdmissionPresentation("blocked", 100, ["价格仍待确�
   label: "暂不能进入候选辅稿",
   detail: "价格仍待确认",
 });
+assert.equal(candidateDecisionStatus("通过并加入新版本"), "approved");
+assert.equal(candidateDecisionStatus("保留候选"), "held");
+assert.equal(candidateDecisionStatus("退回修改"), "returned");
+assert.equal(candidateDecisionStatus("不采用"), "rejected");
+assert.deepEqual(upgradePublishGate(false, 1), { allowed: false, reason: "请先确认母稿差异" });
+assert.deepEqual(upgradePublishGate(true, 0), { allowed: false, reason: "至少选择一条已通过的候选辅稿" });
+assert.deepEqual(upgradePublishGate(true, 2), { allowed: true, reason: "可以发布母稿新版本" });
 
 console.log("master script UI rules passed");

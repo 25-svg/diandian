@@ -555,21 +555,26 @@ pub async fn decide_support_candidate(
     id: i64,
     next_status: &str,
 ) -> Result<SupportCandidateRow, StoreError> {
-    if !matches!(next_status, "approved" | "held" | "returned" | "rejected") {
+    let required_status = if next_status == "merged" {
+        "approved"
+    } else if matches!(next_status, "approved" | "held" | "returned" | "rejected") {
+        "pending_review"
+    } else {
         return Err(invalid_state(format!(
             "support candidate cannot be directly changed to {next_status}"
         )));
-    }
+    };
 
     sqlx::query_as::<_, SupportCandidateRow>(
         "UPDATE support_script_candidates SET status = $1, decided_at = datetime('now') \
-         WHERE id = $2 AND status = 'pending_review' RETURNING *",
+         WHERE id = $2 AND status = $3 RETURNING *",
     )
     .bind(next_status)
     .bind(id)
+    .bind(required_status)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| invalid_state(format!("candidate {id} is not pending review")))
+    .ok_or_else(|| invalid_state(format!("candidate {id} is not {required_status}")))
 }
 
 fn same_candidate_payload(
@@ -1041,8 +1046,12 @@ mod master_script_store_tests {
             .await
             .unwrap();
         assert_eq!(approved.status, "approved");
+        let merged = decide_support_candidate(&pool, candidate.id, "merged")
+            .await
+            .unwrap();
+        assert_eq!(merged.status, "merged");
         assert!(matches!(
-            decide_support_candidate(&pool, candidate.id, "merged").await,
+            decide_support_candidate(&pool, candidate.id, "rejected").await,
             Err(StoreError::InvalidMasterScriptState(_))
         ));
     }
