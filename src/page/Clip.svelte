@@ -22,6 +22,7 @@
     RotateCw,
     Edit,
     FileSearch,
+    BookOpenCheck,
   } from "lucide-svelte";
   import { AnnotationOutline } from "flowbite-svelte-icons";
   import BilibiliIcon from "../lib/components/BilibiliIcon.svelte";
@@ -402,6 +403,10 @@
     window.dispatchEvent(new CustomEvent("bsr:open-video-analysis", { detail: video }));
   }
 
+  function buildMasterFromVideo(video: VideoItem) {
+    window.dispatchEvent(new CustomEvent("bsr:build-master", { detail: video }));
+  }
+
   async function handleVideoImported(event: CustomEvent<{ videoId?: number }>) {
     await loadVideos();
     if (!event.detail?.videoId) return;
@@ -728,7 +733,7 @@
                   />
                 </th>
                 <th
-                  class="px-4 py-3 text-left text-sm font-medium text-gray-500 dark:text-gray-400 w-36"
+                  class="px-4 py-3 text-left text-sm font-medium text-gray-500 dark:text-gray-400 w-44"
                   >直播间</th
                 >
                 <th
@@ -996,8 +1001,15 @@
                     </div>
                   </td>
 
-                  <td class="px-4 py-3 w-36">
+                  <td class="px-4 py-3 w-44">
                     <div class="flex items-center space-x-2">
+                      <button
+                        class="p-1.5 rounded-lg hover:bg-emerald-500/10 transition-colors"
+                        title="设为整场母稿"
+                        on:click={() => buildMasterFromVideo(video)}
+                      >
+                        <BookOpenCheck class="w-4 h-4 text-emerald-600" />
+                      </button>
                       <button
                         class="p-1.5 rounded-lg hover:bg-purple-500/10 transition-colors"
                         title="分析视频"
