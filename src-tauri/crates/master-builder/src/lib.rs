@@ -28,6 +28,10 @@ pub enum TextOrigin {
     AiRewriteCandidate,
 }
 
+fn default_text_origin() -> TextOrigin {
+    TextOrigin::HostSpeech
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicField {
@@ -42,6 +46,7 @@ pub struct DynamicField {
 pub struct MasterSectionDraft {
     #[serde(default)]
     pub position: u32,
+    #[serde(default)]
     pub section_key: String,
     pub kind: MasterSectionKind,
     pub product_card_id: Option<String>,
@@ -50,8 +55,11 @@ pub struct MasterSectionDraft {
     pub source_end_ms: u64,
     pub host_text: String,
     pub master_text: String,
+    #[serde(default = "default_text_origin")]
     pub text_origin: TextOrigin,
+    #[serde(default)]
     pub conditions: Vec<String>,
+    #[serde(default)]
     pub dynamic_fields: Vec<DynamicField>,
 }
 
@@ -255,6 +263,9 @@ pub fn parse_model_sections(response: &str) -> Result<Vec<MasterSectionDraft>, S
     for (index, section) in sections.iter_mut().enumerate() {
         section.position = u32::try_from(index + 1)
             .map_err(|error| format!("MiniMax 母稿章节数量异常: {error}"))?;
+        if section.section_key.trim().is_empty() {
+            section.section_key = format!("section-{:03}", index + 1);
+        }
     }
     Ok(sections)
 }
