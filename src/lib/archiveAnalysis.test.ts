@@ -7,8 +7,26 @@ import {
   selectArchiveTranscriptAction,
   friendlyArchiveTranscriptError,
   transcriptRefreshFailureState,
+  masterComparisonPresentation,
+  isCurrentMasterComparison,
   type CandidateInput,
 } from "./archiveAnalysis.js";
+
+assert.deepEqual(masterComparisonPresentation({ admission: "review_only", totalScore: 84, reasons: [] }), {
+  tone: "neutral", label: "仅保留复盘", detail: "本地复核分 84，未达到 85 分",
+});
+assert.deepEqual(masterComparisonPresentation({ admission: "candidate_queue", totalScore: 85, reasons: [] }), {
+  tone: "success", label: "已进入候选辅稿", detail: "本地复核分 85，等待人工确认",
+});
+assert.deepEqual(masterComparisonPresentation({ admission: "blocked", totalScore: 100, reasons: ["价格仍待确认"] }), {
+  tone: "warning", label: "暂不能进入候选辅稿", detail: "价格仍待确认",
+});
+assert.deepEqual(masterComparisonPresentation({ admission: null, totalScore: null, reasons: [] }), {
+  tone: "warning", label: "还没有匹配到母稿章节", detail: "请选择母稿位置后重新评分",
+});
+assert.equal(isCurrentMasterComparison("C01", 3, "C01", 3), true);
+assert.equal(isCurrentMasterComparison("C01", 3, "C02", 3), false);
+assert.equal(isCurrentMasterComparison("C01", 3, "C01", 4), false);
 
 assert.equal(
   analysisSourceKey({ kind: "archive", platform: "douyin", roomId: "100", liveId: "200" }),

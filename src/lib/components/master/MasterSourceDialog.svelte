@@ -31,7 +31,7 @@
   async function publish(): Promise<void> {
     if (!preview?.validation.publishable || busy) return;
     busy = true; error = "";
-    try { await publishMasterScript(sourceId, scriptKey, preview.draft); dispatch("published", { sourceId, scriptKey }); }
+    try { const master = await publishMasterScript(sourceId, scriptKey, preview.draft); dispatch("published", { sourceId, scriptKey, masterScriptId: master.id }); }
     catch (reason: any) { error = reason?.message || String(reason); }
     finally { busy = false; }
   }

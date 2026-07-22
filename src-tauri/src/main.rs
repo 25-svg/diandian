@@ -757,6 +757,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::master_script::preview_master_script,
         crate::handlers::master_script::publish_master_script,
         crate::handlers::master_script::get_master_script_status,
+        crate::handlers::master_script::get_master_baseline,
         crate::handlers::master_script::compare_highlight_to_master,
         crate::handlers::message::get_messages,
         crate::handlers::message::read_message,

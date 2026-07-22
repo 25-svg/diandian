@@ -77,6 +77,13 @@ pub struct MasterIngestResponse {
     pub status: IngestStatus,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterBaseline {
+    pub master: MasterScriptRow,
+    pub sections: Vec<crate::database::master_script::MasterSectionRow>,
+}
+
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn start_master_ingest(
     state: state_type!(),
@@ -256,6 +263,25 @@ pub async fn get_master_script_status(
             .await
             .map_err(String::from)?,
     })
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_master_baseline(
+    state: state_type!(),
+    script_key: String,
+) -> Result<MasterBaseline, String> {
+    let script_key = builder::safe_key(&script_key)?;
+    let master = state
+        .db
+        .get_latest_published_master(&script_key)
+        .await
+        .map_err(String::from)?;
+    let sections = state
+        .db
+        .list_master_sections(master.id)
+        .await
+        .map_err(String::from)?;
+    Ok(MasterBaseline { master, sections })
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]

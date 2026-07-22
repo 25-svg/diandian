@@ -51,6 +51,37 @@ export type BeginnerReview = {
   checks: string[];
 };
 
+export type MasterComparisonAdmission = "blocked" | "analysis_only" | "review_only" | "candidate_queue";
+
+export function masterComparisonPresentation(input: {
+  admission: MasterComparisonAdmission | null;
+  totalScore: number | null;
+  reasons: string[];
+}): { tone: "neutral" | "success" | "warning"; label: string; detail: string } {
+  if (input.admission === null || input.totalScore === null) {
+    return { tone: "warning", label: "还没有匹配到母稿章节", detail: "请选择母稿位置后重新评分" };
+  }
+  if (input.admission === "candidate_queue") {
+    return { tone: "success", label: "已进入候选辅稿", detail: `本地复核分 ${input.totalScore}，等待人工确认` };
+  }
+  if (input.admission === "blocked") {
+    return { tone: "warning", label: "暂不能进入候选辅稿", detail: input.reasons[0] || "存在未通过的关键检查" };
+  }
+  if (input.admission === "review_only") {
+    return { tone: "neutral", label: "仅保留复盘", detail: `本地复核分 ${input.totalScore}，未达到 85 分` };
+  }
+  return { tone: "neutral", label: "仅作分析参考", detail: `本地复核分 ${input.totalScore}` };
+}
+
+export function isCurrentMasterComparison(
+  requestedCandidateId: string,
+  requestedGeneration: number,
+  selectedCandidateId: string,
+  currentGeneration: number,
+): boolean {
+  return requestedCandidateId === selectedCandidateId && requestedGeneration === currentGeneration;
+}
+
 export type AnalysisSourceIdentity =
   | { kind: "archive"; platform: string; roomId: string; liveId: string }
   | { kind: "video"; videoId: number };

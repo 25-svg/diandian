@@ -979,6 +979,11 @@
     }
   }
 
+  function handleMasterPublished(event: CustomEvent<{ scriptKey: string; masterScriptId: number }>): void {
+    localStorage.setItem("bsr:active-master", JSON.stringify(event.detail));
+    masterSourceVideo = null;
+  }
+
   async function changeAgentMode(event: Event) {
     const nextMode = (event.currentTarget as HTMLSelectElement).value as AgentMode;
     if (nextMode === agentMode) return;
@@ -1313,7 +1318,7 @@
       videoId={masterSourceVideo.id}
       videoTitle={masterSourceVideo.title || masterSourceVideo.file || "整场直播母稿"}
       on:close={() => masterSourceVideo = null}
-      on:published={() => masterSourceVideo = null}
+      on:published={handleMasterPublished}
     />
   {/if}
 

@@ -15,6 +15,7 @@
     RotateCcw,
   } from "lucide-svelte";
   import TranscriptReviewPanel from "../lib/components/analysis/TranscriptReviewPanel.svelte";
+  import MasterComparisonPanel from "../lib/components/analysis/MasterComparisonPanel.svelte";
   import { get_static_url, invoke } from "../lib/invoker";
   import type { RecordItem } from "../lib/db";
   import type { VideoItem } from "../lib/interface";
@@ -27,6 +28,7 @@
     normalizeCandidates,
     selectArchiveTranscriptAction,
     transcriptRefreshFailureState,
+    isCurrentMasterComparison,
     type AnalysisSourceIdentity,
     type BeginnerReview,
     type CandidateInput,
@@ -55,6 +57,12 @@
     type TranscriptCorrection,
     type TranscriptReviewUpdateEvent,
   } from "../lib/transcriptReview";
+  import {
+    compareHighlightToMaster,
+    getMasterBaseline,
+    type MasterBaseline,
+    type MasterComparisonResult,
+  } from "../lib/masterScript";
 
   export let archive: RecordItem | null = null;
   export let video: VideoItem | null = null;
@@ -146,6 +154,12 @@
   let reviewRequestToken = 0;
   let candidateGeneration = 0;
   let criticalReviewSourceKey = "";
+  let masterBaseline: MasterBaseline | null = null;
+  let masterComparison: MasterComparisonResult | null = null;
+  let selectedMasterSectionId = 0;
+  let masterComparisonLoading = false;
+  let masterComparisonError = "";
+  let masterComparisonSequence = 0;
 
   $: selectedCandidate = candidates.find((item) => item.id === selectedCandidateId) || null;
   $: selectedReview = selectedCandidate ? reviews[selectedCandidate.id] || null : null;
@@ -429,6 +443,11 @@
     auditError = "";
     selectedCorrectionId = "";
     criticalReviewSourceKey = "";
+    masterComparison = null;
+    selectedMasterSectionId = 0;
+    masterComparisonLoading = false;
+    masterComparisonError = "";
+    masterComparisonSequence += 1;
   }
 
   function loadSaved(requestIdentity = activeAnalysisRequestIdentity()): boolean {
@@ -508,6 +527,7 @@
     const requestIdentity = activeAnalysisRequestIdentity();
     const requestId = ++initializeRequestSequence;
     const selectedVideo = video;
+    await loadActiveMaster();
     if (selectedVideo) {
       const nextVideoPlayerUrl = await get_static_url("output", selectedVideo.file);
       if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
@@ -518,6 +538,55 @@
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
     await smartRefreshTranscript(restored);
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+  }
+
+  async function loadActiveMaster(): Promise<void> {
+    masterBaseline = null;
+    try {
+      const raw = localStorage.getItem("bsr:active-master");
+      const active = raw ? JSON.parse(raw) as { scriptKey?: string } : null;
+      if (active?.scriptKey) masterBaseline = await getMasterBaseline(active.scriptKey);
+    } catch {
+      masterBaseline = null;
+    }
+  }
+
+  async function compareSelectedToMaster(sectionId: number): Promise<void> {
+    const candidate = selectedCandidate;
+    const source = currentSource;
+    const baseline = masterBaseline;
+    const section = baseline?.sections.find((item) => item.id === sectionId);
+    if (!candidate || !source || !baseline || !section) return;
+    selectedMasterSectionId = sectionId;
+    masterComparison = null;
+    masterComparisonError = "";
+    masterComparisonLoading = true;
+    const requestId = ++masterComparisonSequence;
+    const requestedCandidateId = candidate.id;
+    const requestedGeneration = candidateGeneration;
+    try {
+      const result = await compareHighlightToMaster({
+        scriptKey: baseline.master.scriptKey,
+        expectedMasterScriptId: baseline.master.id,
+        source,
+        sourceStartMs: Math.round(candidate.start * 1000),
+        sourceEndMs: Math.round(candidate.end * 1000),
+        productCardId: section.productCardId,
+        sectionKind: section.sectionKind,
+      });
+      if (requestId !== masterComparisonSequence || !isCurrentMasterComparison(
+        requestedCandidateId,
+        requestedGeneration,
+        selectedCandidateId,
+        candidateGeneration,
+      )) return;
+      masterComparison = result;
+    } catch (reason: any) {
+      if (requestId !== masterComparisonSequence) return;
+      masterComparisonError = reason?.message || String(reason);
+    } finally {
+      if (requestId === masterComparisonSequence) masterComparisonLoading = false;
+    }
   }
 
   async function smartRefreshTranscript(hasSavedAnalysis: boolean, forceTranscriptRefresh = false): Promise<void> {
@@ -868,6 +937,11 @@
     selectedCandidateId = candidate.id;
     selectedCandidate = candidate;
     selectedReview = reviews[candidate.id] || null;
+    masterComparisonSequence += 1;
+    masterComparison = null;
+    masterComparisonError = "";
+    masterComparisonLoading = false;
+    selectedMasterSectionId = 0;
     reviewTab = "analysis";
     updatePlayerAndTranscript(true, candidate);
     saveState();
@@ -1273,6 +1347,14 @@
             <p><strong>为什么选</strong>{selectedCandidate.evidence || selectedCandidate.reason || "等待复核"}</p>
             <p class="verify-line"><strong>还要确认</strong>{selectedCandidate.verify || "暂无"}</p>
           </div>
+          <MasterComparisonPanel
+            baseline={masterBaseline}
+            bind:selectedSectionId={selectedMasterSectionId}
+            result={masterComparison}
+            loading={masterComparisonLoading}
+            error={masterComparisonError}
+            on:compare={(event) => compareSelectedToMaster(event.detail.sectionId)}
+          />
         {/if}
 
         {#if reviewingId && reviewingId === selectedCandidateId}

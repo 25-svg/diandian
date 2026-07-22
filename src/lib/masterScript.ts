@@ -62,6 +62,34 @@ export type MasterIngestResponse = {
   status: { status: "complete" | "failed"; completed: number; total: number; failedChunk?: number; error?: string };
 };
 
+export type PublishedMaster = { id: number; scriptKey: string; version: string; title: string };
+export type MasterSection = {
+  id: number;
+  masterScriptId: number;
+  sectionKey: string;
+  position: number;
+  sectionKind: MasterSectionKind;
+  productCardId: string | null;
+  title: string;
+  masterText: string;
+};
+export type MasterBaseline = { master: PublishedMaster; sections: MasterSection[] };
+
+export type MasterComparisonResult = {
+  comparison: {
+    masterScriptId: number;
+    masterVersion: string;
+    masterSectionId: number | null;
+    totalScore: number | null;
+    admission: CandidateAdmission | null;
+    gates: { reasons: string[] } | null;
+    improvements: string[];
+    risks: string[];
+    suggestedInsertionPoint: string | null;
+  };
+  candidate: { id: number; status: string } | null;
+};
+
 export function masterStatusLabel(status: MasterSourceStatus): string {
   return ({
     queued: "等待生成母稿",
@@ -138,7 +166,23 @@ export function previewMasterScript(sourceId: number, scriptKey: string, title: 
 }
 
 export function publishMasterScript(sourceId: number, scriptKey: string, draft: MasterDraft) {
-  return invokeCommand("publish_master_script", { request: { sourceId, scriptKey, draft } });
+  return invokeCommand<PublishedMaster>("publish_master_script", { request: { sourceId, scriptKey, draft } });
+}
+
+export function getMasterBaseline(scriptKey: string) {
+  return invokeCommand<MasterBaseline>("get_master_baseline", { scriptKey });
+}
+
+export function compareHighlightToMaster(request: {
+  scriptKey: string;
+  expectedMasterScriptId: number;
+  source: { kind: "video"; videoId: number } | { kind: "archive"; platform: string; roomId: string; liveId: string };
+  sourceStartMs: number;
+  sourceEndMs: number;
+  productCardId: string | null;
+  sectionKind: MasterSectionKind;
+}) {
+  return invokeCommand<MasterComparisonResult>("compare_highlight_to_master", { request });
 }
 
 async function invokeCommand<T>(command: string, args: Record<string, unknown>): Promise<T> {
