@@ -70,6 +70,68 @@ rustfmt --edition 2021 --check 'crates/master-script/src/lib.rs' 'crates/master-
 
 Output: exit code `0`, no output.
 
+## Second review fix: immutable score dimensions
+
+### Fix summary
+
+- Made all six score dimensions private alongside the already-private cached total.
+- Added read-only accessors named `transaction_evidence()`, `improvement_over_master()`, `reusability()`, `completeness()`, `factual_accuracy()`, `scenario_clarity()`, and `total()`.
+- Kept `ScoreBreakdown::new` and custom serde deserialization as the only construction paths enforcing caps and recomputing total.
+- Added a serde round-trip regression covering all accessors and asserting the exact camelCase six-dimension plus `total` JSON payload.
+
+### Second review RED evidence
+
+Command, run from `src-tauri` after adding the round-trip regression and before adding the accessors or privatizing fields:
+
+```powershell
+cargo test -p master-script
+```
+
+Output:
+
+```text
+error[E0599]: no method named `transaction_evidence` found for struct `ScoreBreakdown`
+error[E0599]: no method named `improvement_over_master` found for struct `ScoreBreakdown`
+error[E0599]: no method named `reusability` found for struct `ScoreBreakdown`
+error[E0599]: no method named `completeness` found for struct `ScoreBreakdown`
+error[E0599]: no method named `factual_accuracy` found for struct `ScoreBreakdown`
+error[E0599]: no method named `scenario_clarity` found for struct `ScoreBreakdown`
+error: could not compile `master-script` (test "scoring") due to 6 previous errors
+```
+
+### Second review GREEN evidence
+
+Command:
+
+```powershell
+cargo test -p master-script
+```
+
+Output:
+
+```text
+running 9 tests
+test a_failed_gate_blocks_a_perfect_score ... ok
+test score_round_trip_exposes_read_only_dimensions_and_derived_total ... ok
+test serializes_master_section_kinds_and_support_statuses_as_snake_case ... ok
+test increments_patch_and_reports_patch_overflow ... ok
+test rejects_non_strict_patch_versions ... ok
+test gate_reasons_do_not_change_a_passing_gate_result ... ok
+test admits_only_scores_above_85_after_all_gates_pass ... ok
+test tampered_serialized_total_cannot_admit_a_low_score ... ok
+test validates_dimension_caps ... ok
+
+test result: ok. 9 passed; 0 failed
+```
+
+Focused formatting verification:
+
+```powershell
+rustfmt --edition 2021 --check 'crates/master-script/src/lib.rs' 'crates/master-script/tests/scoring.rs'
+```
+
+Output: exit code `0`, no output.
+
 ## Regression evidence
 
 The relevant non-native package tests passed:

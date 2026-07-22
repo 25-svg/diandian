@@ -97,6 +97,33 @@ fn tampered_serialized_total_cannot_admit_a_low_score() {
 }
 
 #[test]
+fn score_round_trip_exposes_read_only_dimensions_and_derived_total() {
+    let score = ScoreBreakdown::new(25, 24, 19, 14, 9, 4).unwrap();
+    let json = serde_json::to_value(&score).unwrap();
+    let round_tripped: ScoreBreakdown = serde_json::from_value(json.clone()).unwrap();
+
+    assert_eq!(round_tripped.transaction_evidence(), 25);
+    assert_eq!(round_tripped.improvement_over_master(), 24);
+    assert_eq!(round_tripped.reusability(), 19);
+    assert_eq!(round_tripped.completeness(), 14);
+    assert_eq!(round_tripped.factual_accuracy(), 9);
+    assert_eq!(round_tripped.scenario_clarity(), 4);
+    assert_eq!(round_tripped.total(), 95);
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "transactionEvidence": 25,
+            "improvementOverMaster": 24,
+            "reusability": 19,
+            "completeness": 14,
+            "factualAccuracy": 9,
+            "scenarioClarity": 4,
+            "total": 95
+        })
+    );
+}
+
+#[test]
 fn serializes_master_section_kinds_and_support_statuses_as_snake_case() {
     let sections = [
         (MasterSectionKind::Opening, "opening"),

@@ -15,12 +15,12 @@ pub enum MasterScriptError {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScoreBreakdown {
-    pub transaction_evidence: u8,
-    pub improvement_over_master: u8,
-    pub reusability: u8,
-    pub completeness: u8,
-    pub factual_accuracy: u8,
-    pub scenario_clarity: u8,
+    transaction_evidence: u8,
+    improvement_over_master: u8,
+    reusability: u8,
+    completeness: u8,
+    factual_accuracy: u8,
+    scenario_clarity: u8,
     total: u8,
 }
 
@@ -39,6 +39,30 @@ impl ScoreBreakdown {
             scenario_clarity: f,
             total: a + b + c + d + e + f,
         })
+    }
+
+    pub const fn transaction_evidence(&self) -> u8 {
+        self.transaction_evidence
+    }
+
+    pub const fn improvement_over_master(&self) -> u8 {
+        self.improvement_over_master
+    }
+
+    pub const fn reusability(&self) -> u8 {
+        self.reusability
+    }
+
+    pub const fn completeness(&self) -> u8 {
+        self.completeness
+    }
+
+    pub const fn factual_accuracy(&self) -> u8 {
+        self.factual_accuracy
+    }
+
+    pub const fn scenario_clarity(&self) -> u8 {
+        self.scenario_clarity
     }
 
     pub fn total(&self) -> u8 {
