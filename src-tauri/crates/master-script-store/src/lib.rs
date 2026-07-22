@@ -393,6 +393,25 @@ pub async fn get_master_version(pool: &SqlitePool, id: i64) -> Result<MasterScri
         .ok_or_else(|| invalid_state(format!("master script {id} does not exist")))
 }
 
+pub async fn get_latest_published_master(
+    pool: &SqlitePool,
+    script_key: &str,
+) -> Result<MasterScriptRow, StoreError> {
+    sqlx::query_as::<_, MasterScriptRow>(
+        "SELECT * FROM master_scripts \
+         WHERE script_key = $1 AND status = 'published' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(script_key)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        invalid_state(format!(
+            "published master script {script_key} does not exist"
+        ))
+    })
+}
+
 pub async fn list_master_sections(
     pool: &SqlitePool,
     master_script_id: i64,
@@ -845,6 +864,33 @@ mod master_script_store_tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn latest_published_master_is_resolved_by_script_key() {
+        let (pool, master, _) = seeded_master().await;
+        let source = get_master_source(&pool, master.source_id).await.unwrap();
+        let latest = publish_master_version(
+            &pool,
+            &NewMasterVersion {
+                script_key: master.script_key.clone(),
+                version: "1.0.1".into(),
+                source_id: source.id,
+                title: "new master".into(),
+                index_relative_path: "10-master-scripts/MS-001/V1.0.1.md".into(),
+                content_hash: "v2-hash".into(),
+                sections: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let resolved = get_latest_published_master(&pool, &master.script_key)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.id, latest.id);
+        assert_eq!(resolved.version, "1.0.1");
     }
 
     #[tokio::test]

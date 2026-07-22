@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod comparison;
 pub mod ingest;
 pub mod model;
 

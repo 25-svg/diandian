@@ -65,6 +65,16 @@ impl Database {
             .map_err(map_store_error)
     }
 
+    pub async fn get_latest_published_master(
+        &self,
+        script_key: &str,
+    ) -> Result<MasterScriptRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::get_latest_published_master(&pool, script_key)
+            .await
+            .map_err(map_store_error)
+    }
+
     pub async fn list_master_sections(
         &self,
         master_script_id: i64,

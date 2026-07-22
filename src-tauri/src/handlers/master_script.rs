@@ -246,6 +246,14 @@ pub async fn get_master_script_status(
     })
 }
 
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn compare_highlight_to_master(
+    state: state_type!(),
+    request: crate::master_script::comparison::CompareHighlightRequest,
+) -> Result<crate::master_script::comparison::CompareHighlightResult, String> {
+    crate::master_script::comparison::compare_highlight_to_master(&state, request).await
+}
+
 struct MasterTruth {
     transcript: Vec<TranscriptCue>,
     parameter_cards: Vec<ParameterFactCard>,
