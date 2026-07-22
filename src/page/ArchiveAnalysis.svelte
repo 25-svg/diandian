@@ -3,6 +3,7 @@
   import {
     ArrowLeft,
     BarChart3,
+    BookOpenCheck,
     Check,
     Clipboard,
     Copy,
@@ -1167,6 +1168,11 @@
     ].join("\n\n");
     void copyText(content, "全部");
   }
+
+  function buildVideoAsMaster(): void {
+    if (!video) return;
+    window.dispatchEvent(new CustomEvent("bsr:build-master", { detail: video }));
+  }
 </script>
 
 <div class="analysis-shell">
@@ -1182,6 +1188,12 @@
     </div>
     <div class="header-actions">
       <span class="stage" class:error-stage={Boolean(errorMessage)}>{errorMessage || stage}</span>
+      {#if video}
+        <button class="secondary-button master-button" on:click={buildVideoAsMaster}>
+          <BookOpenCheck size={15} />
+          设为整场母稿
+        </button>
+      {/if}
       <button class="secondary-button" disabled={!currentSource || isTranscribing || isDiscovering} on:click={regenerateAndAnalyze}>
         <span class:is-spinning={isTranscribing}><RotateCcw size={15} /></span>
         重新识别
@@ -1479,6 +1491,7 @@
   .icon-button:active, .secondary-button:active, .copy-actions button:active { transform: scale(.97); }
   .icon-button { width: 34px; height: 34px; display: grid; place-items: center; color: #3a3a3c; }
   .secondary-button { height: 32px; display: inline-flex; align-items: center; gap: 5px; padding: 0 11px; font-size: 11px; color: #3a3a3c; }
+  .master-button { color: #0068d1; border-color: rgba(0,113,227,.2); background: #f2f8ff; }
   button:disabled { cursor: not-allowed; opacity: .45; }
   .analysis-grid { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(280px, .9fr) minmax(320px, 1fr) minmax(360px, 1.15fr); gap: 13px; padding: 13px; overflow-x: auto; }
   .column { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: rgba(255,255,255,.86); border: 1px solid rgba(255,255,255,.94); border-radius: 18px; box-shadow: 0 12px 30px rgba(41,47,58,.075), 0 1px 3px rgba(41,47,58,.05); backdrop-filter: blur(18px); }

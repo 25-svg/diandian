@@ -11,6 +11,7 @@
   import AI from "./page/AI.svelte";
   import Archive from "./page/Archive.svelte";
   import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
+  import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
   import type { RecordItem } from "./lib/db";
   import type { VideoItem } from "./lib/interface";
   import { onMount } from "svelte";
@@ -19,6 +20,7 @@
   let analysisArchive: RecordItem | null = null;
   let analysisVideo: VideoItem | null = null;
   let analysisRefreshToken = 0;
+  let masterSourceVideo: VideoItem | null = null;
   onMount(() => {
     void set_title("典典直播切片");
   });
@@ -82,13 +84,18 @@
     const openArchiveTranscription = () => {
       active = "助手";
     };
+    const openMasterBuilder = (event: Event) => {
+      masterSourceVideo = (event as CustomEvent<VideoItem>).detail;
+    };
     window.addEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
     window.addEventListener("bsr:open-video-analysis", openVideoAnalysis);
     window.addEventListener("bsr:transcribe-archive", openArchiveTranscription);
+    window.addEventListener("bsr:build-master", openMasterBuilder);
     return () => {
       window.removeEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
       window.removeEventListener("bsr:open-video-analysis", openVideoAnalysis);
       window.removeEventListener("bsr:transcribe-archive", openArchiveTranscription);
+      window.removeEventListener("bsr:build-master", openMasterBuilder);
     };
   });
 
@@ -151,6 +158,18 @@
     </div>
   </div>
 </main>
+
+{#if masterSourceVideo}
+  <MasterSourceDialog
+    videoId={masterSourceVideo.id}
+    videoTitle={masterSourceVideo.title || masterSourceVideo.file || "整场直播母稿"}
+    on:close={() => masterSourceVideo = null}
+    on:published={(event) => {
+      localStorage.setItem("bsr:active-master", JSON.stringify(event.detail));
+      masterSourceVideo = null;
+    }}
+  />
+{/if}
 
 <style>
   .sidebar {
