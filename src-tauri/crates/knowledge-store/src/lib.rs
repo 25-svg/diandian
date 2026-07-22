@@ -41,6 +41,10 @@ CREATE INDEX idx_knowledge_documents_eligible ON knowledge_documents(eligible, a
 
 pub const KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL: &str = r#"
 ALTER TABLE knowledge_documents ADD COLUMN classification TEXT NOT NULL DEFAULT 'invalid';
+CREATE INDEX idx_knowledge_documents_classification ON knowledge_documents(classification, active);
+"#;
+
+pub const KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL: &str = r#"
 UPDATE knowledge_documents SET classification = CASE
     WHEN eligible=1 THEN 'eligible'
     WHEN issue='检测到个人或受限信息，正文未进入索引' THEN 'restricted'
@@ -48,7 +52,6 @@ UPDATE knowledge_documents SET classification = CASE
     WHEN status IN ('pending_review','pending','draft','待审核','待确认') THEN 'pending_review'
     ELSE 'invalid'
 END;
-CREATE INDEX idx_knowledge_documents_classification ON knowledge_documents(classification, active);
 "#;
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -271,6 +274,9 @@ mod knowledge_sync_tests {
         pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
             .await
             .unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL)
+            .await
+            .unwrap();
         pool
     }
 
@@ -448,6 +454,9 @@ mod knowledge_sync_tests {
         pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
             .await
             .unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL)
+            .await
+            .unwrap();
         let status = get_knowledge_status(&pool, Some(r"C:\Vault"))
             .await
             .unwrap();
@@ -483,6 +492,9 @@ mod knowledge_sync_tests {
             .unwrap();
         pool.execute(KNOWLEDGE_MIGRATION_SQL).await.unwrap();
         pool.execute(KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL)
+            .await
+            .unwrap();
+        pool.execute(KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL)
             .await
             .unwrap();
         sync_knowledge_vault(&pool, r"C:\Vault", &source)

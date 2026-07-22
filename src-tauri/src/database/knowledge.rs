@@ -2,8 +2,8 @@ use super::{Database, DatabaseError};
 use knowledge::VaultScan;
 
 pub use knowledge_store::{
-    KnowledgeStatus, KnowledgeSyncSummary, KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL,
-    KNOWLEDGE_MIGRATION_SQL,
+    KnowledgeStatus, KnowledgeSyncSummary, KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL,
+    KNOWLEDGE_CLASSIFICATION_MIGRATION_SQL, KNOWLEDGE_MIGRATION_SQL,
 };
 
 impl Database {
