@@ -752,6 +752,8 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::knowledge::sync_knowledge_vault,
         crate::handlers::knowledge::get_knowledge_status,
         crate::handlers::knowledge::open_knowledge_vault,
+        crate::handlers::master_script::start_master_ingest,
+        crate::handlers::master_script::resume_master_ingest,
         crate::handlers::message::get_messages,
         crate::handlers::message::read_message,
         crate::handlers::message::delete_message,

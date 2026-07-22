@@ -473,6 +473,61 @@ pub async fn extract_audio_segment(
     }
 }
 
+/// Extract one master-ingest chunk as a 16kHz mono 64kbps MP3.
+pub async fn extract_volcengine_audio_segment(
+    file: &Path,
+    start_ms: u64,
+    end_ms: u64,
+    output_dir: &Path,
+) -> Result<PathBuf, String> {
+    if end_ms <= start_ms || end_ms - start_ms > 600_000 {
+        return Err("Volcengine ASR segment bounds are invalid".to_string());
+    }
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .map_err(|error| format!("Failed to create ASR segment directory: {error}"))?;
+    let output_path = output_dir.join(format!("chunk_{start_ms:012}_{end_ms:012}.mp3"));
+    if tokio::fs::metadata(&output_path)
+        .await
+        .is_ok_and(|metadata| metadata.len() > 0)
+    {
+        return Ok(output_path);
+    }
+
+    let start_seconds = format!("{:.3}", start_ms as f64 / 1000.0);
+    let duration_seconds = format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0);
+    let output = ffmpeg_command()
+        .args(["-ss", &start_seconds])
+        .arg("-i")
+        .arg(file)
+        .args(["-t", &duration_seconds])
+        .args(["-vn", "-ar", "16000", "-ac", "1"])
+        .args(["-c:a", "libmp3lame", "-b:a", "64k", "-y"])
+        .arg(&output_path)
+        .output()
+        .await
+        .map_err(|error| format!("Failed to start FFmpeg ASR segment extraction: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to extract Volcengine ASR segment: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if !tokio::fs::metadata(&output_path)
+        .await
+        .is_ok_and(|metadata| metadata.len() > 0)
+    {
+        return Err("Volcengine ASR segment output is missing or empty".to_string());
+    }
+    Ok(output_path)
+}
+
+pub async fn probe_media_duration_ms(file: &Path) -> Result<u64, String> {
+    get_audio_duration(file)
+        .await
+        .map(|seconds| seconds.saturating_mul(1000))
+}
+
 /// Get the duration of an audio/video file in seconds
 async fn get_audio_duration(file: &Path) -> Result<u64, String> {
     // Use ffprobe with format option to get duration

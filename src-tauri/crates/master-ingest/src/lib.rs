@@ -348,6 +348,28 @@ pub fn chunk_input_hash(
     format!("{:x}", hasher.finalize())
 }
 
+pub fn parameter_card_context(selected_cards: &[ParameterCard]) -> Option<String> {
+    if selected_cards.is_empty() {
+        return None;
+    }
+    let mut cards = selected_cards.iter().collect::<Vec<_>>();
+    cards.sort_by(|left, right| left.card_id.cmp(&right.card_id));
+    cards.truncate(MAX_PARAMETER_CARDS);
+    Some(
+        serde_json::json!({
+            "context_type": "dialog_ctx",
+            "parameter_cards": cards.into_iter().map(|card| serde_json::json!({
+                "card_id": card.card_id,
+                "version": card.version,
+                "canonical_name": card.canonical_name,
+                "aliases": card.aliases,
+                "context": card.context,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
+}
+
 pub fn merge_chunk_cues(chunks: Vec<(u64, Vec<SrtCue>)>) -> Vec<SrtCue> {
     let mut merged = Vec::<SrtCue>::new();
     for (offset_ms, cues) in chunks {
@@ -358,8 +380,8 @@ pub fn merge_chunk_cues(chunks: Vec<(u64, Vec<SrtCue>)>) -> Vec<SrtCue> {
                 text: cue.text.trim().to_string(),
             };
             let duplicate = merged.iter().rev().any(|current| {
-                current.end_ms >= absolute.start_ms
-                    && absolute.end_ms >= current.start_ms
+                current.start_ms < absolute.end_ms
+                    && absolute.start_ms < current.end_ms
                     && normalize_phrase(&current.text) == normalize_phrase(&absolute.text)
             });
             if !duplicate {
@@ -368,11 +390,6 @@ pub fn merge_chunk_cues(chunks: Vec<(u64, Vec<SrtCue>)>) -> Vec<SrtCue> {
         }
     }
     merged.sort_by_key(|cue| (cue.start_ms, cue.end_ms));
-    for (index, cue) in merged.clone().iter().enumerate().skip(1) {
-        if merged[index - 1].end_ms > cue.start_ms {
-            merged[index].start_ms = merged[index - 1].end_ms.min(merged[index].end_ms);
-        }
-    }
     merged
 }
 
@@ -473,7 +490,7 @@ fn card_rank(
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
     let exact = normalized_names.iter().any(|name| {
-        title.contains(name) || terms.iter().any(|term| term == name || term.contains(name))
+        phrase_matches(title, name) || terms.iter().any(|term| phrase_matches(term, name))
     });
     if exact {
         return (1, 0, 0);
@@ -490,19 +507,39 @@ fn card_rank(
 fn normalize_phrase(value: &str) -> String {
     value
         .chars()
-        .filter_map(|character| {
+        .map(|character| {
             if character.is_alphanumeric() {
-                Some(character.to_ascii_lowercase())
-            } else if character.is_whitespace() {
-                Some(' ')
+                character.to_ascii_lowercase()
             } else {
-                None
+                ' '
             }
         })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn phrase_matches(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if needle.chars().any(is_cjk) {
+        return haystack.contains(needle);
+    }
+    let haystack_tokens = haystack.split_whitespace().collect::<Vec<_>>();
+    let needle_tokens = needle.split_whitespace().collect::<Vec<_>>();
+    !needle_tokens.is_empty()
+        && haystack_tokens
+            .windows(needle_tokens.len())
+            .any(|window| window == needle_tokens)
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
 }
 
 fn tokenize(value: &str) -> HashSet<String> {
@@ -552,7 +589,9 @@ fn collect_chunk_cues(
             } else {
                 &row.raw_srt
             };
-            Ok((*start_ms, parse_srt(value)?))
+            let cues = parse_srt(value)
+                .map_err(|error| format!("checkpoint recovery error for chunk {index}: {error}"))?;
+            Ok((*start_ms, cues))
         })
         .collect()
 }
@@ -564,12 +603,25 @@ fn parse_srt(value: &str) -> Result<Vec<SrtCue>, String> {
         .filter(|block| !block.trim().is_empty())
         .map(|block| {
             let mut lines = block.lines();
-            let _position = lines.next().ok_or("missing cue position")?;
+            let position = lines
+                .next()
+                .ok_or("missing cue position")?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "invalid cue position")?;
+            if position == 0 {
+                return Err("invalid cue position".to_string());
+            }
             let times = lines.next().ok_or("missing cue timestamps")?;
             let (start, end) = times.split_once(" --> ").ok_or("invalid cue timestamps")?;
+            let start_ms = parse_timestamp(start)?;
+            let end_ms = parse_timestamp(end)?;
+            if end_ms <= start_ms {
+                return Err("cue end must be after start".to_string());
+            }
             Ok(SrtCue::new(
-                parse_timestamp(start)?,
-                parse_timestamp(end)?,
+                start_ms,
+                end_ms,
                 lines.collect::<Vec<_>>().join("\n"),
             ))
         })
@@ -587,7 +639,9 @@ fn parse_timestamp(value: &str) -> Result<u64, String> {
     let seconds = parts.next().and_then(|part| part.parse::<u64>().ok());
     let milliseconds = milliseconds.parse::<u64>().ok();
     match (hours, minutes, seconds, milliseconds, parts.next()) {
-        (Some(hours), Some(minutes), Some(seconds), Some(milliseconds), None) => {
+        (Some(hours), Some(minutes), Some(seconds), Some(milliseconds), None)
+            if minutes <= 59 && seconds <= 59 && milliseconds <= 999 =>
+        {
             Ok(hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + milliseconds)
         }
         _ => Err(format!("invalid SRT timestamp: {value}")),

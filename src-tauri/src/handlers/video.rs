@@ -21,14 +21,14 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-struct CanonicalVideoTranscriptContext {
-    source: TranscriptSource,
-    artifact_dir: PathBuf,
-    media_file: PathBuf,
-    video_id: i64,
+pub(crate) struct CanonicalVideoTranscriptContext {
+    pub(crate) source: TranscriptSource,
+    pub(crate) artifact_dir: PathBuf,
+    pub(crate) media_file: PathBuf,
+    pub(crate) video_id: i64,
 }
 
-async fn resolve_video_transcript_context(
+pub(crate) async fn resolve_video_transcript_context(
     state: &State,
     requested_video_id: i64,
 ) -> Result<CanonicalVideoTranscriptContext, String> {

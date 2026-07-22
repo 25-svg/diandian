@@ -34,3 +34,23 @@ Focused implementation of recoverable master transcript ingestion in the lightwe
 - RED used the missing public orchestration contracts, not a syntax or fixture failure.
 - GREEN reused `%TEMP%\bili-shadowreplay-task4-target`; no repository target directory was created.
 - No real video or the 8.24 GiB source was opened or processed.
+
+## Review Fix RED Evidence
+
+1. `cargo test -p master-ingest --test master_ingest_tests`
+   - Failed with three intended regressions: `R5` ranked as an exact match for `R50`, legitimate
+     overlapping cues were shifted or removed, and malformed complete checkpoint SRT was accepted.
+2. `cargo test -p master-ingest --test master_ingest_tests selected_cards_render_deterministic_volcengine_context`
+   - Failed with `E0432` because the pure parameter-card context adapter did not exist.
+
+## Review Fix GREEN Evidence
+
+1. `cargo test -p master-ingest`
+   - Passed: 10 tests, 0 failed.
+2. `cargo clippy -p master-ingest --tests -- -D warnings`
+   - Passed with no warnings.
+3. `npm run test:canonical-video-subtitles`
+   - Passed: `Canonical video subtitle source check passed`.
+4. Root compilation remains intentionally deferred. The concrete FFmpeg, Volcengine, State,
+   database, artifact, and command wiring was statically reviewed but no root/Tauri/V8/Whisper
+   build, real API request, or real video processing was run.

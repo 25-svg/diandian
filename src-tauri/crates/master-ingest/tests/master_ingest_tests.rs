@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use master_ingest::{
-    chunk_input_hash, merge_chunk_cues, plan_asr_chunks, select_parameter_cards, ArtifactBundle,
-    ArtifactSink, CanonicalArtifactDirectory, Checkpoint, CheckpointStore, ChunkStatus,
-    IngestRequest, IngestStatus, MasterIngestor, ParameterCard, SrtCue, Transcriber,
+    chunk_input_hash, merge_chunk_cues, parameter_card_context, plan_asr_chunks,
+    select_parameter_cards, ArtifactBundle, ArtifactSink, CanonicalArtifactDirectory, Checkpoint,
+    CheckpointStore, ChunkStatus, IngestRequest, IngestStatus, MasterIngestor, ParameterCard,
+    SrtCue, Transcriber,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,29 @@ fn offsets_to_absolute_time_and_dedupes_overlapping_cues() {
     assert_eq!(merged.len(), 2);
     assert_eq!(merged[0], SrtCue::new(599_000, 600_500, "shared cue"));
     assert_eq!(merged[1], SrtCue::new(600_500, 602_000, "next cue"));
+}
+
+#[test]
+fn preserves_legitimate_overlaps_and_endpoint_touching_duplicates() {
+    let merged = merge_chunk_cues(vec![(
+        0,
+        vec![
+            SrtCue::new(1_000, 3_000, "first speaker"),
+            SrtCue::new(2_000, 4_000, "second speaker"),
+            SrtCue::new(4_000, 5_000, "boundary cue"),
+            SrtCue::new(5_000, 6_000, "boundary cue"),
+        ],
+    )]);
+
+    assert_eq!(
+        merged,
+        vec![
+            SrtCue::new(1_000, 3_000, "first speaker"),
+            SrtCue::new(2_000, 4_000, "second speaker"),
+            SrtCue::new(4_000, 5_000, "boundary cue"),
+            SrtCue::new(5_000, 6_000, "boundary cue"),
+        ]
+    );
 }
 
 #[test]
@@ -90,6 +114,30 @@ fn parameter_cards_follow_all_ranking_and_validation_rules() {
 }
 
 #[test]
+fn exact_model_matches_are_boundary_aware_and_punctuation_safe() {
+    let selected = select_parameter_cards(
+        "R50 EF-70/200 小白兔二代",
+        &[],
+        &[],
+        &[
+            card("A-R5", "1", "R5", &[]),
+            card("B-R50", "1", "R50", &[]),
+            card("C-EF", "1", "EF 70 200", &[]),
+            card("D-CN", "1", "小白兔二代", &[]),
+        ],
+        30,
+    );
+    let ids = selected
+        .cards
+        .iter()
+        .map(|item| item.card_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(&ids[..3], &["B-R50", "C-EF", "D-CN"]);
+    assert_eq!(ids[3], "A-R5");
+}
+
+#[test]
 fn input_hash_covers_source_bounds_and_selected_card_versions() {
     let cards = vec![card("CARD-1", "1", "one", &[])];
     let base = chunk_input_hash("video:7", "source-hash", 0, 600_000, &cards);
@@ -115,6 +163,22 @@ fn input_hash_covers_source_bounds_and_selected_card_versions() {
             &[card("CARD-1", "2", "one", &[])],
         )
     );
+}
+
+#[test]
+fn selected_cards_render_deterministic_volcengine_context() {
+    let context = parameter_card_context(&[
+        card("CARD-2", "4", "EF 70-200", &["小白兔"]),
+        card("CARD-1", "2", "R50", &[]),
+    ])
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+    assert_eq!(value["context_type"], "dialog_ctx");
+    assert_eq!(value["parameter_cards"][0]["card_id"], "CARD-1");
+    assert_eq!(value["parameter_cards"][1]["card_id"], "CARD-2");
+    assert_eq!(value["parameter_cards"][1]["aliases"][0], "小白兔");
+    assert!(parameter_card_context(&[]).is_none());
 }
 
 #[tokio::test]
@@ -293,4 +357,55 @@ async fn failed_second_chunk_resumes_only_remaining_chunks_and_preserves_first()
     assert!(writes[0].raw_srt.contains("00:10:00,000"));
     assert_eq!(writes[0].raw_srt, writes[0].corrected_srt);
     assert_eq!(writes[0].review_json, "[]");
+}
+
+#[tokio::test]
+async fn malformed_complete_checkpoint_returns_recovery_error() {
+    let invalid_srts = [
+        "cue\n00:00:00,000 --> 00:00:01,000\ntext\n\n",
+        "1\n00:60:00,000 --> 00:60:01,000\ntext\n\n",
+        "1\n00:00:00,1000 --> 00:00:01,000\ntext\n\n",
+        "1\n00:00:01,000 --> 00:00:01,000\ntext\n\n",
+    ];
+
+    for invalid_srt in invalid_srts {
+        let request = IngestRequest {
+            source_id: 9,
+            source_key: "video:9".into(),
+            source_hash: "source-hash".into(),
+            duration_ms: 600_000,
+            chunk_duration_ms: 600_000,
+            selected_cards: vec![],
+        };
+        let input_hash = chunk_input_hash("video:9", "source-hash", 0, 600_000, &[]);
+        let store = MemoryStore::default();
+        store.rows.lock().unwrap().insert(
+            0,
+            Checkpoint {
+                source_id: 9,
+                chunk_index: 0,
+                start_ms: 0,
+                end_ms: 600_000,
+                status: ChunkStatus::Complete,
+                input_hash,
+                raw_srt: invalid_srt.into(),
+                reviewed_srt: invalid_srt.into(),
+                error: None,
+            },
+        );
+        let ingestor = MasterIngestor::new(
+            store,
+            FakeTranscriber {
+                outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            MemoryArtifacts::default(),
+        );
+
+        let error = ingestor.run(request).await.unwrap_err();
+        assert!(
+            error.contains("checkpoint recovery error"),
+            "unexpected error for {invalid_srt:?}: {error}"
+        );
+    }
 }

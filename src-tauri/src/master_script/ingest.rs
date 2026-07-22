@@ -1,9 +1,12 @@
+use crate::config::Config;
 use crate::database::{Database, KnowledgeDocumentRecord, MasterChunkInput, MasterChunkRow};
+use crate::ffmpeg;
 use crate::subtitle_generator::transcript_artifacts::{TranscriptArtifactStore, TranscriptSource};
+use crate::subtitle_generator::volcengine::VolcengineAsr;
 use async_trait::async_trait;
 use master_ingest::{
-    ArtifactBundle, ArtifactSink, Checkpoint, CheckpointStore, ChunkStatus, IngestRequest,
-    IngestStatus, MasterIngestor, ParameterCard, Transcriber,
+    parameter_card_context, ArtifactBundle, ArtifactSink, Checkpoint, CheckpointStore, ChunkStatus,
+    IngestRequest, IngestStatus, MasterIngestor, ParameterCard, SrtCue, Transcriber,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -41,6 +44,70 @@ where
 {
     source.source_id = source_id;
     start_master_ingest(source, store, transcriber, artifacts).await
+}
+
+#[derive(Clone)]
+pub struct VolcengineChunkTranscriber {
+    media_file: PathBuf,
+    chunk_directory: PathBuf,
+    client: VolcengineAsr,
+}
+
+impl VolcengineChunkTranscriber {
+    pub fn configured(
+        media_file: impl AsRef<Path>,
+        chunk_directory: impl AsRef<Path>,
+        config: &Config,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            media_file: media_file.as_ref().to_path_buf(),
+            chunk_directory: chunk_directory.as_ref().to_path_buf(),
+            client: VolcengineAsr::new(
+                &config.volcengine_api_key,
+                &config.volcengine_app_id,
+                &config.volcengine_access_token,
+                &config.volcengine_resource_id,
+                &config.volcengine_boosting_table_id,
+                &config.volcengine_correct_table_id,
+            )?,
+        })
+    }
+}
+
+#[async_trait]
+impl Transcriber for VolcengineChunkTranscriber {
+    async fn transcribe(
+        &self,
+        _chunk_index: usize,
+        start_ms: u64,
+        end_ms: u64,
+        cards: &[ParameterCard],
+    ) -> Result<Vec<SrtCue>, String> {
+        let audio_path = ffmpeg::extract_volcengine_audio_segment(
+            &self.media_file,
+            start_ms,
+            end_ms,
+            &self.chunk_directory,
+        )
+        .await?;
+        let context = parameter_card_context(cards);
+        let result = self
+            .client
+            .recognize_file(&audio_path, context.as_deref())
+            .await?;
+        result
+            .subtitle_content
+            .into_iter()
+            .map(|item| {
+                let start_ms = time_to_ms(&item.start_time);
+                let end_ms = time_to_ms(&item.end_time);
+                if end_ms <= start_ms {
+                    return Err("Volcengine returned an invalid cue range".to_string());
+                }
+                Ok(SrtCue::new(start_ms, end_ms, item.text))
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -207,4 +274,8 @@ async fn write_review_json(directory: &Path, content: &str) -> Result<(), String
     tokio::fs::rename(temporary, destination)
         .await
         .map_err(|error| error.to_string())
+}
+
+fn time_to_ms(time: &srtparse::Time) -> u64 {
+    (((time.hours * 60 + time.minutes) * 60 + time.seconds) * 1000) + time.milliseconds
 }

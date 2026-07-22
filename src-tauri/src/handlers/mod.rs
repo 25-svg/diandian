@@ -3,6 +3,7 @@ pub mod ai;
 pub mod config;
 pub mod knowledge;
 pub mod macros;
+pub mod master_script;
 pub mod message;
 pub mod recorder;
 pub mod review_sample;
