@@ -134,7 +134,7 @@ ID 一经生成不可因标题修改而变化。再次提交相同来源和时�
 
 每张卡至少包含：
 
-- `id`、`title`、`type`、`status`、`version`。
+- `id`、`title`、`type`、`status`、`version`。`version` 使用字符串，兼容 `0.1.0` 等语义版本。
 - `source_kind`、`source_id`、`source_time_range`。
 - `created_at`、`updated_at`、`reviewed_at`。
 - `content_hash`、`reviewer`。
@@ -142,17 +142,19 @@ ID 一经生成不可因标题修改而变化。再次提交相同来源和时�
 
 ## 9. 审核状态
 
-统一状态流转：
+Markdown 使用稳定英文状态值，界面显示中文：
 
 ```text
-草稿 -> 待确认 -> 已审核 -> 已入库 -> 已停用
+draft -> pending_review -> approved -> imported -> retired
+草稿      待确认             已审核       已入库       已停用
 ```
 
-- 模型只能创建“草稿”。
-- 用户逐条勾选后进入“待确认”。
-- 用户在入库预览中最终确认后进入“已审核”。
-- Markdown 成功写入且重新读取校验通过后进入“已入库”。
-- 失效知识保留历史文件并标记“已停用”，不直接删除。
+- 模型只能创建 `draft`（草稿）。
+- 用户逐条勾选后进入 `pending_review`（待确认）。
+- 用户在入库预览中最终确认后进入 `approved`（已审核）。
+- Markdown 成功写入且重新读取校验通过后进入 `imported`（已入库）。
+- 失效知识保留历史文件并标记 `retired`（已停用），不直接删除。
+- 读取时兼容既有中文状态值，但新写入统一使用英文状态值。
 
 ## 10. 用户流程
 
