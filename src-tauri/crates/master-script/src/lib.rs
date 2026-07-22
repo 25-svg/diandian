@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -11,7 +12,7 @@ pub enum MasterScriptError {
     VersionOverflow(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScoreBreakdown {
     pub transaction_evidence: u8,
@@ -20,7 +21,7 @@ pub struct ScoreBreakdown {
     pub completeness: u8,
     pub factual_accuracy: u8,
     pub scenario_clarity: u8,
-    pub total: u8,
+    total: u8,
 }
 
 impl ScoreBreakdown {
@@ -38,6 +39,39 @@ impl ScoreBreakdown {
             scenario_clarity: f,
             total: a + b + c + d + e + f,
         })
+    }
+
+    pub fn total(&self) -> u8 {
+        self.total
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScoreBreakdownInput {
+    transaction_evidence: u8,
+    improvement_over_master: u8,
+    reusability: u8,
+    completeness: u8,
+    factual_accuracy: u8,
+    scenario_clarity: u8,
+}
+
+impl<'de> Deserialize<'de> for ScoreBreakdown {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = ScoreBreakdownInput::deserialize(deserializer)?;
+        Self::new(
+            input.transaction_evidence,
+            input.improvement_over_master,
+            input.reusability,
+            input.completeness,
+            input.factual_accuracy,
+            input.scenario_clarity,
+        )
+        .map_err(D::Error::custom)
     }
 }
 
@@ -124,9 +158,9 @@ impl SupportCandidateStatus {
 pub fn evaluate_admission(gates: &HardGateResult, score: &ScoreBreakdown) -> CandidateAdmission {
     if !gates.all_pass() {
         CandidateAdmission::Blocked
-    } else if score.total > 85 {
+    } else if score.total() > 85 {
         CandidateAdmission::CandidateQueue
-    } else if score.total >= 70 {
+    } else if score.total() >= 70 {
         CandidateAdmission::ReviewOnly
     } else {
         CandidateAdmission::AnalysisOnly

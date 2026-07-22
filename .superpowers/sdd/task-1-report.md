@@ -119,3 +119,67 @@ The focused `master-script` command above passed `7 passed; 0 failed`.
 - The broader package regression command also encountered an existing network-dependent Huya test failure in `recorder` (`RelativeUrlWithoutBase`) after fetching live HTML.
 - A package regression run including `danmu_stream` failed only its existing doctest, which uses `await` outside an async function and unresolved example symbols. Its library tests passed when run with `--lib`.
 - Workspace-wide `cargo fmt --all -- --check` reports pre-existing formatting differences in `crates/knowledge` and `src/subtitle_generator`; only the new files were formatted and verified.
+
+## Review fix: derived score total
+
+### Fix summary
+
+- Made `ScoreBreakdown.total` private and exposed `ScoreBreakdown::total()` for admission and later consumers.
+- Replaced derived score deserialization with a helper containing only the six bounded dimensions. An incoming `total` field is ignored by serde and recomputed through `ScoreBreakdown::new`.
+- Kept serialization derived, so UI payloads include the corrected recomputed `total`.
+- Added `tampered_serialized_total_cannot_admit_a_low_score`, which supplies low dimensions with `total: 86`, verifies the derived total is `0`, verifies admission is not `CandidateQueue`, and verifies serialized output contains `total: 0`.
+
+### Review-fix RED evidence
+
+Command, run from `src-tauri` after adding the regression test and before changing production code:
+
+```powershell
+cargo test -p master-script
+```
+
+Output:
+
+```text
+running 8 tests
+test tampered_serialized_total_cannot_admit_a_low_score ... FAILED
+
+thread 'tampered_serialized_total_cannot_admit_a_low_score' panicked ...
+assertion `left != right` failed
+left: CandidateQueue
+right: CandidateQueue
+
+test result: FAILED. 7 passed; 1 failed
+error: test failed, to rerun pass `-p master-script --test scoring`
+```
+
+### Review-fix GREEN evidence
+
+Command:
+
+```powershell
+cargo test -p master-script
+```
+
+Output:
+
+```text
+running 8 tests
+test a_failed_gate_blocks_a_perfect_score ... ok
+test admits_only_scores_above_85_after_all_gates_pass ... ok
+test gate_reasons_do_not_change_a_passing_gate_result ... ok
+test increments_patch_and_reports_patch_overflow ... ok
+test rejects_non_strict_patch_versions ... ok
+test tampered_serialized_total_cannot_admit_a_low_score ... ok
+test serializes_master_section_kinds_and_support_statuses_as_snake_case ... ok
+test validates_dimension_caps ... ok
+
+test result: ok. 8 passed; 0 failed
+```
+
+Focused formatting verification:
+
+```powershell
+rustfmt --edition 2021 --check 'crates/master-script/src/lib.rs' 'crates/master-script/tests/scoring.rs'
+```
+
+Output: exit code `0`, no output.

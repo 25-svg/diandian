@@ -72,6 +72,31 @@ fn validates_dimension_caps() {
 }
 
 #[test]
+fn tampered_serialized_total_cannot_admit_a_low_score() {
+    let tampered = r#"{
+        "transactionEvidence": 0,
+        "improvementOverMaster": 0,
+        "reusability": 0,
+        "completeness": 0,
+        "factualAccuracy": 0,
+        "scenarioClarity": 0,
+        "total": 86
+    }"#;
+    let score: ScoreBreakdown = serde_json::from_str(tampered).unwrap();
+
+    assert_eq!(score.total(), 0);
+    assert_ne!(
+        evaluate_admission(&passing_gates(), &score),
+        CandidateAdmission::CandidateQueue
+    );
+    let serialized = serde_json::to_value(&score).unwrap();
+    assert_eq!(
+        serialized.get("total").and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+}
+
+#[test]
 fn serializes_master_section_kinds_and_support_statuses_as_snake_case() {
     let sections = [
         (MasterSectionKind::Opening, "opening"),
