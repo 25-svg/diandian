@@ -9,8 +9,44 @@ import {
   transcriptRefreshFailureState,
   masterComparisonPresentation,
   isCurrentMasterComparison,
+  autoMatchMasterSection,
   type CandidateInput,
 } from "./archiveAnalysis.js";
+
+const masterSections = [
+  { id: 11, sectionKind: "product", productCardId: "CANON-R7", title: "佳能 R7 主推讲解" },
+  { id: 12, sectionKind: "product", productCardId: "INSTA360-A4PRO2", title: "影石 Insta360 A4 Pro 2" },
+  { id: 13, sectionKind: "scenario", productCardId: null, title: "售后异议处理" },
+] as const;
+
+assert.deepEqual(autoMatchMasterSection("INSTA360-A4PRO2", masterSections), {
+  sectionId: 12,
+  status: "matched",
+  strategy: "product-card",
+});
+assert.deepEqual(autoMatchMasterSection("影石 A4 PRO 2（99新）", masterSections), {
+  sectionId: 12,
+  status: "matched",
+  strategy: "title",
+});
+assert.deepEqual(autoMatchMasterSection("商品待确认", [masterSections[0]]), {
+  sectionId: 11,
+  status: "matched",
+  strategy: "single-product",
+});
+assert.deepEqual(autoMatchMasterSection("A4 Pro 2", [
+  masterSections[1],
+  { ...masterSections[1], id: 14, title: "影石 A4 Pro 2 套装" },
+]), {
+  sectionId: null,
+  status: "ambiguous",
+  strategy: null,
+});
+assert.deepEqual(autoMatchMasterSection("完全未知商品", masterSections), {
+  sectionId: null,
+  status: "unmatched",
+  strategy: null,
+});
 
 assert.deepEqual(masterComparisonPresentation({ admission: "review_only", totalScore: 84, reasons: [] }), {
   tone: "neutral", label: "仅保留复盘", detail: "本地复核分 84，未达到 85 分",

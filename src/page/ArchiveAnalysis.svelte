@@ -29,6 +29,7 @@
     selectArchiveTranscriptAction,
     transcriptRefreshFailureState,
     isCurrentMasterComparison,
+    autoMatchMasterSection,
     type AnalysisSourceIdentity,
     type BeginnerReview,
     type CandidateInput,
@@ -159,6 +160,7 @@
   let selectedMasterSectionId = 0;
   let masterComparisonLoading = false;
   let masterComparisonError = "";
+  let masterMatchStatus: "idle" | "matched" | "ambiguous" | "unmatched" = "idle";
   let masterComparisonSequence = 0;
 
   $: selectedCandidate = candidates.find((item) => item.id === selectedCandidateId) || null;
@@ -447,6 +449,7 @@
     selectedMasterSectionId = 0;
     masterComparisonLoading = false;
     masterComparisonError = "";
+    masterMatchStatus = "idle";
     masterComparisonSequence += 1;
   }
 
@@ -538,6 +541,9 @@
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
     await smartRefreshTranscript(restored);
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+    if (selectedCandidate && !masterComparison && !masterComparisonLoading) {
+      await autoCompareCandidateToMaster(selectedCandidate);
+    }
   }
 
   async function loadActiveMaster(): Promise<void> {
@@ -587,6 +593,26 @@
     } finally {
       if (requestId === masterComparisonSequence) masterComparisonLoading = false;
     }
+  }
+
+  async function autoCompareCandidateToMaster(candidate: Candidate): Promise<void> {
+    const baseline = masterBaseline;
+    if (!baseline) {
+      masterMatchStatus = "idle";
+      return;
+    }
+    const match = autoMatchMasterSection(candidate.product, baseline.sections);
+    masterMatchStatus = match.status;
+    if (match.sectionId === null) {
+      selectedMasterSectionId = 0;
+      masterComparison = null;
+      masterComparisonLoading = false;
+      masterComparisonError = match.status === "ambiguous"
+        ? "识别到多个相似商品章节，本片段已暂停评分，请先在逐字稿中确认商品名称。"
+        : "未能识别本片段对应的母稿商品，本片段不会进入候选辅稿。";
+      return;
+    }
+    await compareSelectedToMaster(match.sectionId);
   }
 
   async function smartRefreshTranscript(hasSavedAnalysis: boolean, forceTranscriptRefresh = false): Promise<void> {
@@ -941,11 +967,17 @@
     masterComparison = null;
     masterComparisonError = "";
     masterComparisonLoading = false;
+    masterMatchStatus = "idle";
     selectedMasterSectionId = 0;
     reviewTab = "analysis";
     updatePlayerAndTranscript(true, candidate);
     saveState();
-    if (!reviews[candidate.id]) await reviewSelectedCandidate(false, candidate);
+    const comparison = autoCompareCandidateToMaster(candidate);
+    if (!reviews[candidate.id]) {
+      await Promise.all([reviewSelectedCandidate(false, candidate), comparison]);
+    } else {
+      await comparison;
+    }
   }
 
   function parseReview(content: string): ReviewResult {
@@ -1353,7 +1385,7 @@
             result={masterComparison}
             loading={masterComparisonLoading}
             error={masterComparisonError}
-            on:compare={(event) => compareSelectedToMaster(event.detail.sectionId)}
+            matchStatus={masterMatchStatus}
           />
         {/if}
 

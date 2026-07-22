@@ -53,6 +53,87 @@ export type BeginnerReview = {
 
 export type MasterComparisonAdmission = "blocked" | "analysis_only" | "review_only" | "candidate_queue";
 
+type MatchableMasterSection = {
+  id: number;
+  sectionKind: string;
+  productCardId: string | null;
+  title: string;
+};
+
+export type MasterSectionMatch = {
+  sectionId: number | null;
+  status: "matched" | "ambiguous" | "unmatched";
+  strategy: "product-card" | "title" | "single-product" | null;
+};
+
+function normalizeProductText(value: string): string {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/(?:99|95|9)\s*新/g, "")
+    .replace(/[^A-Z0-9\u4e00-\u9fff]/g, "");
+}
+
+function longestCommonAsciiRun(left: string, right: string): number {
+  const a = left.replace(/[^A-Z0-9]/g, "");
+  const b = right.replace(/[^A-Z0-9]/g, "");
+  let best = 0;
+  const row = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = b.length; j >= 1; j -= 1) {
+      row[j] = a[i - 1] === b[j - 1] ? row[j - 1] + 1 : 0;
+      best = Math.max(best, row[j]);
+    }
+  }
+  return best;
+}
+
+function titleMatchesProduct(product: string, title: string): boolean {
+  const normalizedProduct = normalizeProductText(product);
+  const normalizedTitle = normalizeProductText(title);
+  if (!normalizedProduct || !normalizedTitle) return false;
+  if (
+    (normalizedProduct.length >= 4 && normalizedTitle.includes(normalizedProduct))
+    || (normalizedTitle.length >= 4 && normalizedProduct.includes(normalizedTitle))
+  ) return true;
+  return longestCommonAsciiRun(normalizedProduct, normalizedTitle) >= 4;
+}
+
+export function autoMatchMasterSection(
+  product: string,
+  sections: readonly MatchableMasterSection[],
+): MasterSectionMatch {
+  const candidates = sections.filter((item) => item.sectionKind === "product" || item.sectionKind === "scenario");
+  const normalizedProduct = normalizeProductText(product);
+  const productCardMatches = candidates.filter((item) => {
+    const card = normalizeProductText(item.productCardId || "");
+    return Boolean(card && normalizedProduct && (
+      card === normalizedProduct
+      || (card.length >= 4 && normalizedProduct.includes(card))
+      || (normalizedProduct.length >= 4 && card.includes(normalizedProduct))
+    ));
+  });
+  if (productCardMatches.length === 1) {
+    return { sectionId: productCardMatches[0].id, status: "matched", strategy: "product-card" };
+  }
+  if (productCardMatches.length > 1) {
+    return { sectionId: null, status: "ambiguous", strategy: null };
+  }
+
+  const titleMatches = candidates.filter((item) => titleMatchesProduct(product, item.title));
+  if (titleMatches.length === 1) {
+    return { sectionId: titleMatches[0].id, status: "matched", strategy: "title" };
+  }
+  if (titleMatches.length > 1) {
+    return { sectionId: null, status: "ambiguous", strategy: null };
+  }
+
+  const productSections = candidates.filter((item) => item.sectionKind === "product");
+  if (productSections.length === 1) {
+    return { sectionId: productSections[0].id, status: "matched", strategy: "single-product" };
+  }
+  return { sectionId: null, status: "unmatched", strategy: null };
+}
+
 export function masterComparisonPresentation(input: {
   admission: MasterComparisonAdmission | null;
   totalScore: number | null;
