@@ -18,6 +18,16 @@ impl Database {
             .map_err(map_store_error)
     }
 
+    pub async fn get_master_source(
+        &self,
+        source_id: i64,
+    ) -> Result<MasterSourceRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::get_master_source(&pool, source_id)
+            .await
+            .map_err(map_store_error)
+    }
+
     pub async fn upsert_master_chunk(
         &self,
         input: MasterChunkInput,

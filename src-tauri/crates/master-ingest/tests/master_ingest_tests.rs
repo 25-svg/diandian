@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use master_ingest::{
     chunk_input_hash, merge_chunk_cues, parameter_card_context, plan_asr_chunks,
-    select_parameter_cards, ArtifactBundle, ArtifactSink, CanonicalArtifactDirectory, Checkpoint,
-    CheckpointStore, ChunkStatus, IngestRequest, IngestStatus, MasterIngestor, ParameterCard,
-    SrtCue, Transcriber,
+    publish_extracted_chunk, select_parameter_cards, validate_resume_source, ArtifactBundle,
+    ArtifactSink, CanonicalArtifactDirectory, Checkpoint, CheckpointStore, ChunkStatus,
+    IngestRequest, IngestStatus, MasterIngestor, ParameterCard, SourceIdentity, SrtCue,
+    Transcriber,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,72 @@ fn plans_ten_minute_chunks_without_empty_tail() {
         vec![(0, 600_000), (600_000, 1_200_000), (1_200_000, 1_200_001)]
     );
     assert!(plan_asr_chunks(0, 600_000).is_empty());
+}
+
+#[test]
+fn mixed_cjk_model_names_respect_ascii_boundaries() {
+    let cards = vec![
+        card("R5", "1", "佳能R5", &[]),
+        card("R50", "1", "佳能R50", &[]),
+    ];
+
+    let selected = select_parameter_cards("佳能R50二手相机", &[], &[], &cards, 2);
+
+    assert_eq!(selected.cards[0].card_id, "R50");
+}
+
+#[test]
+fn resume_source_requires_the_same_immutable_media_identity() {
+    let persisted = SourceIdentity {
+        source_key: "video:7".into(),
+        media_path: r"C:\fixtures\master.ts".into(),
+        media_hash: "hash-7".into(),
+        duration_ms: 3_600_000,
+    };
+    assert!(validate_resume_source(&persisted, &persisted).is_ok());
+
+    let mut wrong_video = persisted.clone();
+    wrong_video.source_key = "video:8".into();
+    assert!(validate_resume_source(&persisted, &wrong_video).is_err());
+}
+
+#[tokio::test]
+async fn publishes_only_complete_extracted_chunks() {
+    let directory = tempfile::tempdir().unwrap();
+    let temporary = directory.path().join("chunk.tmp.mp3");
+    let destination = directory.path().join("chunk.mp3");
+    tokio::fs::write(&temporary, b"complete mp3 bytes")
+        .await
+        .unwrap();
+
+    publish_extracted_chunk(&temporary, &destination)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::fs::read(&destination).await.unwrap(),
+        b"complete mp3 bytes"
+    );
+    assert!(!temporary.exists());
+
+    let empty = directory.path().join("empty.tmp.mp3");
+    let rejected = directory.path().join("rejected.mp3");
+    tokio::fs::write(&empty, []).await.unwrap();
+    assert!(publish_extracted_chunk(&empty, &rejected).await.is_err());
+    assert!(!rejected.exists());
+
+    let failed_temporary = directory.path().join("failed.tmp.mp3");
+    let destination_directory = directory.path().join("occupied");
+    tokio::fs::write(&failed_temporary, b"complete")
+        .await
+        .unwrap();
+    tokio::fs::create_dir(&destination_directory).await.unwrap();
+    assert!(
+        publish_extracted_chunk(&failed_temporary, &destination_directory)
+            .await
+            .is_err()
+    );
+    assert!(!failed_temporary.exists());
 }
 
 #[test]

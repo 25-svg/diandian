@@ -23,6 +23,40 @@ pub struct SelectedParameterCards {
     pub cards: Vec<ParameterCard>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceIdentity {
+    pub source_key: String,
+    pub media_path: String,
+    pub media_hash: String,
+    pub duration_ms: u64,
+}
+
+pub fn validate_resume_source(
+    persisted: &SourceIdentity,
+    requested: &SourceIdentity,
+) -> Result<(), String> {
+    if persisted == requested {
+        Ok(())
+    } else {
+        Err("续跑视频与原母稿来源不一致".into())
+    }
+}
+
+pub async fn publish_extracted_chunk(temporary: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = tokio::fs::metadata(temporary)
+        .await
+        .map_err(|error| format!("读取临时音频分段失败: {error}"))?;
+    if metadata.len() == 0 {
+        let _ = tokio::fs::remove_file(temporary).await;
+        return Err("临时音频分段为空".into());
+    }
+    if let Err(error) = tokio::fs::rename(temporary, destination).await {
+        let _ = tokio::fs::remove_file(temporary).await;
+        return Err(format!("发布音频分段失败: {error}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SrtCue {
@@ -524,22 +558,18 @@ fn phrase_matches(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    if needle.chars().any(is_cjk) {
-        return haystack.contains(needle);
-    }
-    let haystack_tokens = haystack.split_whitespace().collect::<Vec<_>>();
-    let needle_tokens = needle.split_whitespace().collect::<Vec<_>>();
-    !needle_tokens.is_empty()
-        && haystack_tokens
-            .windows(needle_tokens.len())
-            .any(|window| window == needle_tokens)
-}
-
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
-    )
+    let first = needle.chars().next().unwrap();
+    let last = needle.chars().next_back().unwrap();
+    haystack.match_indices(needle).any(|(start, _)| {
+        let end = start + needle.len();
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[end..].chars().next();
+        let left_boundary = !first.is_ascii_alphanumeric()
+            || !before.is_some_and(|character| character.is_ascii_alphanumeric());
+        let right_boundary = !last.is_ascii_alphanumeric()
+            || !after.is_some_and(|character| character.is_ascii_alphanumeric());
+        left_boundary && right_boundary
+    })
 }
 
 fn tokenize(value: &str) -> HashSet<String> {

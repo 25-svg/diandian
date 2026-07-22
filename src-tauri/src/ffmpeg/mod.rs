@@ -487,38 +487,45 @@ pub async fn extract_volcengine_audio_segment(
         .await
         .map_err(|error| format!("Failed to create ASR segment directory: {error}"))?;
     let output_path = output_dir.join(format!("chunk_{start_ms:012}_{end_ms:012}.mp3"));
-    if tokio::fs::metadata(&output_path)
-        .await
-        .is_ok_and(|metadata| metadata.len() > 0)
-    {
-        return Ok(output_path);
+    match tokio::fs::remove_file(&output_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Failed to clear prior ASR segment: {error}")),
     }
+    let temporary = output_dir.join(format!(
+        ".chunk_{start_ms:012}_{end_ms:012}.{}.tmp.mp3",
+        uuid::Uuid::new_v4()
+    ));
 
     let start_seconds = format!("{:.3}", start_ms as f64 / 1000.0);
     let duration_seconds = format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0);
-    let output = ffmpeg_command()
+    let output = match ffmpeg_command()
         .args(["-ss", &start_seconds])
         .arg("-i")
         .arg(file)
         .args(["-t", &duration_seconds])
         .args(["-vn", "-ar", "16000", "-ac", "1"])
         .args(["-c:a", "libmp3lame", "-b:a", "64k", "-y"])
-        .arg(&output_path)
+        .arg(&temporary)
         .output()
         .await
-        .map_err(|error| format!("Failed to start FFmpeg ASR segment extraction: {error}"))?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(format!(
+                "Failed to start FFmpeg ASR segment extraction: {error}"
+            ));
+        }
+    };
     if !output.status.success() {
+        let _ = tokio::fs::remove_file(&temporary).await;
         return Err(format!(
             "Failed to extract Volcengine ASR segment: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    if !tokio::fs::metadata(&output_path)
-        .await
-        .is_ok_and(|metadata| metadata.len() > 0)
-    {
-        return Err("Volcengine ASR segment output is missing or empty".to_string());
-    }
+    master_ingest::publish_extracted_chunk(&temporary, &output_path).await?;
     Ok(output_path)
 }
 

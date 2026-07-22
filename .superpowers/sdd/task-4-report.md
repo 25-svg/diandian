@@ -54,3 +54,12 @@ Focused implementation of recoverable master transcript ingestion in the lightwe
 4. Root compilation remains intentionally deferred. The concrete FFmpeg, Volcengine, State,
    database, artifact, and command wiring was statically reviewed but no root/Tauri/V8/Whisper
    build, real API request, or real video processing was run.
+
+## Direct Follow-up Fixes
+
+- Resume now loads the immutable master source by ID and rejects a different video identity.
+- Mixed CJK/model names enforce ASCII boundaries, so `佳能R5` does not match `佳能R50`.
+- FFmpeg writes each MP3 chunk to a unique same-directory temporary file and publishes it only
+  after successful, non-empty extraction; failed publication removes the temporary file.
+- Focused verification: `master-ingest` 13 passed, `master-script-store` 17 passed, and clippy
+  passed for both crates with warnings denied.

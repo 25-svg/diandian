@@ -281,6 +281,17 @@ pub async fn create_master_source(
     }
 }
 
+pub async fn get_master_source(
+    pool: &SqlitePool,
+    source_id: i64,
+) -> Result<MasterSourceRow, StoreError> {
+    sqlx::query_as::<_, MasterSourceRow>("SELECT * FROM master_sources WHERE id = $1")
+        .bind(source_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| invalid_state(format!("master source {source_id} does not exist")))
+}
+
 pub async fn upsert_master_chunk(
     pool: &SqlitePool,
     input: &MasterChunkInput,
@@ -752,6 +763,16 @@ mod master_script_store_tests {
                 Err(StoreError::InvalidMasterScriptState(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn master_source_can_be_loaded_by_id_for_resume_validation() {
+        let pool = test_pool().await;
+        let created = create_master_source(&pool, &source_input()).await.unwrap();
+
+        let loaded = get_master_source(&pool, created.id).await.unwrap();
+
+        assert_eq!(loaded, created);
     }
 
     #[tokio::test]

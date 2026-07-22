@@ -7,7 +7,10 @@ use crate::master_script::{
 };
 use crate::state::State;
 use crate::state_type;
-use master_ingest::{select_parameter_cards, IngestRequest, IngestStatus, MAX_PARAMETER_CARDS};
+use master_ingest::{
+    select_parameter_cards, validate_resume_source, IngestRequest, IngestStatus, SourceIdentity,
+    MAX_PARAMETER_CARDS,
+};
 use serde::Deserialize;
 use std::time::UNIX_EPOCH;
 
@@ -59,6 +62,21 @@ pub async fn resume_master_ingest(
     request: MasterVideoIngestRequest,
 ) -> Result<IngestStatus, String> {
     let prepared = prepare_video_ingest(&state, &request).await?;
+    let persisted = state
+        .db
+        .get_master_source(source_id)
+        .await
+        .map_err(String::from)?;
+    if persisted.source_kind != "video" {
+        return Err("续跑来源不是视频母稿".into());
+    }
+    let persisted_identity = SourceIdentity {
+        source_key: persisted.source_key,
+        media_path: persisted.media_path,
+        media_hash: persisted.media_hash,
+        duration_ms: u64::try_from(persisted.duration_ms).map_err(|error| error.to_string())?,
+    };
+    validate_resume_source(&persisted_identity, &prepared.identity())?;
     let ingest_request = prepared.request(source_id);
     run_resume_master_ingest(
         source_id,
@@ -81,6 +99,15 @@ struct PreparedVideoIngest {
 }
 
 impl PreparedVideoIngest {
+    fn identity(&self) -> SourceIdentity {
+        SourceIdentity {
+            source_key: self.source_key.clone(),
+            media_path: self.media_path.clone(),
+            media_hash: self.media_hash.clone(),
+            duration_ms: self.duration_ms,
+        }
+    }
+
     fn request(&self, source_id: i64) -> IngestRequest {
         IngestRequest {
             source_id,
