@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 
 pub mod account;
 pub mod knowledge;
+pub mod master_script;
 pub mod message;
 pub mod record;
 pub mod recorder;
@@ -35,6 +36,8 @@ pub enum DatabaseError {
     InvalidTranscriptDictionaryCandidateStatus(String),
     #[error("invalid transcript dictionary candidate minimal metadata: {0}")]
     InvalidTranscriptDictionaryCandidateMetadata(String),
+    #[error("invalid master script state: {0}")]
+    InvalidMasterScriptState(String),
 }
 
 impl From<DatabaseError> for String {

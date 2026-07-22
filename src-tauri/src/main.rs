@@ -469,6 +469,12 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::knowledge::KNOWLEDGE_CLASSIFICATION_BACKFILL_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 19,
+            description: "add_master_script_tables",
+            sql: database::master_script::MASTER_SCRIPT_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
