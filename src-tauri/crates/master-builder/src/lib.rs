@@ -258,6 +258,7 @@ pub fn parse_model_sections(response: &str) -> Result<Vec<MasterSectionDraft>, S
         .map_err(|error| format!("MiniMax 母稿结果不是合法 JSON: {error}"))?;
     let mut sections = parsed.get("sections").cloned().unwrap_or(parsed);
     normalize_model_cue_ids(&mut sections);
+    normalize_model_text_origins(&mut sections);
     let mut sections: Vec<MasterSectionDraft> = serde_json::from_value(sections)
         .map_err(|error| format!("MiniMax 母稿章节格式错误: {error}"))?;
     for (index, section) in sections.iter_mut().enumerate() {
@@ -294,6 +295,33 @@ fn normalize_model_cue_ids(sections: &mut serde_json::Value) {
                 }
             }
         }
+    }
+}
+
+fn normalize_model_text_origins(sections: &mut serde_json::Value) {
+    let Some(sections) = sections.as_array_mut() else {
+        return;
+    };
+    for section in sections {
+        let Some(section) = section.as_object_mut() else {
+            continue;
+        };
+        let Some(origin) = aliased_value_mut(section, "textOrigin", "text_origin") else {
+            continue;
+        };
+        let Some(raw_origin) = origin.as_str() else {
+            continue;
+        };
+        let normalized = raw_origin
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_");
+        let canonical = match normalized.as_str() {
+            "verbatim" | "original" | "host" | "host_speech" => "host_speech",
+            "rewrite_candidate" | "ai_rewrite_candidate" => "ai_rewrite_candidate",
+            _ => continue,
+        };
+        *origin = serde_json::Value::String(canonical.to_owned());
     }
 }
 

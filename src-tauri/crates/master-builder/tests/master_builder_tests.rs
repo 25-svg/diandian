@@ -66,6 +66,15 @@ fn fills_missing_non_business_structure_fields() {
     assert!(sections[0].dynamic_fields.is_empty());
 }
 
+#[test]
+fn normalizes_model_text_origin_aliases() {
+    let json = r#"{"sections":[{"kind":"opening","sourceCueIds":[1],"sourceStartMs":0,"sourceEndMs":2000,"hostText":"欢迎来到直播间","masterText":"欢迎来到直播间","textOrigin":"verbatim"}]}"#;
+
+    let sections = parse_model_sections(json).unwrap();
+
+    assert_eq!(sections[0].text_origin, TextOrigin::HostSpeech);
+}
+
 fn cue(id: u64, start_ms: u64, end_ms: u64, text: &str) -> TranscriptCue {
     TranscriptCue {
         id,
