@@ -43,6 +43,16 @@ fn fills_missing_model_positions_from_section_order() {
     assert_eq!(sections[1].position, 2);
 }
 
+#[test]
+fn normalizes_model_cue_id_objects_and_strings() {
+    let json = r#"{"sections":[{"sectionKey":"opening","kind":"opening","productCardId":null,"sourceCueIds":[{"id":1},"2"],"sourceStartMs":0,"sourceEndMs":6000,"hostText":"欢迎来到直播间\n这台佳能R50成色很好","masterText":"欢迎来到直播间\n这台佳能R50成色很好","textOrigin":"host_speech","conditions":[],"dynamicFields":[{"name":"价格","value":"R50","sourceCueIds":[{"cueId":2}],"confirmed":true}]}]}"#;
+
+    let sections = parse_model_sections(json).unwrap();
+
+    assert_eq!(sections[0].source_cue_ids, vec![1, 2]);
+    assert_eq!(sections[0].dynamic_fields[0].source_cue_ids, vec![2]);
+}
+
 fn cue(id: u64, start_ms: u64, end_ms: u64, text: &str) -> TranscriptCue {
     TranscriptCue {
         id,

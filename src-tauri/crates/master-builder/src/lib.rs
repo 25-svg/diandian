@@ -248,7 +248,8 @@ pub fn parse_model_sections(response: &str) -> Result<Vec<MasterSectionDraft>, S
     }
     let parsed: serde_json::Value = serde_json::from_str(value)
         .map_err(|error| format!("MiniMax 母稿结果不是合法 JSON: {error}"))?;
-    let sections = parsed.get("sections").cloned().unwrap_or(parsed);
+    let mut sections = parsed.get("sections").cloned().unwrap_or(parsed);
+    normalize_model_cue_ids(&mut sections);
     let mut sections: Vec<MasterSectionDraft> = serde_json::from_value(sections)
         .map_err(|error| format!("MiniMax 母稿章节格式错误: {error}"))?;
     for (index, section) in sections.iter_mut().enumerate() {
@@ -256,6 +257,69 @@ pub fn parse_model_sections(response: &str) -> Result<Vec<MasterSectionDraft>, S
             .map_err(|error| format!("MiniMax 母稿章节数量异常: {error}"))?;
     }
     Ok(sections)
+}
+
+fn normalize_model_cue_ids(sections: &mut serde_json::Value) {
+    let Some(sections) = sections.as_array_mut() else {
+        return;
+    };
+    for section in sections {
+        let Some(section) = section.as_object_mut() else {
+            continue;
+        };
+        if let Some(cue_ids) = aliased_value_mut(section, "sourceCueIds", "source_cue_ids") {
+            normalize_cue_id_array(cue_ids);
+        }
+        let dynamic_fields = aliased_value_mut(section, "dynamicFields", "dynamic_fields");
+        if let Some(dynamic_fields) = dynamic_fields.and_then(serde_json::Value::as_array_mut) {
+            for field in dynamic_fields {
+                let Some(field) = field.as_object_mut() else {
+                    continue;
+                };
+                if let Some(cue_ids) =
+                    aliased_value_mut(field, "sourceCueIds", "source_cue_ids")
+                {
+                    normalize_cue_id_array(cue_ids);
+                }
+            }
+        }
+    }
+}
+
+fn aliased_value_mut<'a>(
+    object: &'a mut serde_json::Map<String, serde_json::Value>,
+    preferred: &str,
+    fallback: &str,
+) -> Option<&'a mut serde_json::Value> {
+    let key = if object.contains_key(preferred) {
+        preferred
+    } else {
+        fallback
+    };
+    object.get_mut(key)
+}
+
+fn normalize_cue_id_array(value: &mut serde_json::Value) {
+    let Some(values) = value.as_array_mut() else {
+        return;
+    };
+    *values = values
+        .iter()
+        .filter_map(model_cue_id)
+        .map(serde_json::Value::from)
+        .collect();
+}
+
+fn model_cue_id(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .or_else(|| {
+            let object = value.as_object()?;
+            ["id", "cueId", "cue_id"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(model_cue_id))
+        })
 }
 
 fn push_issue(
