@@ -2,6 +2,7 @@
   import { invoke, TAURI_ENV, normalizeEndpoint } from "../lib/invoker";
   import { open } from "@tauri-apps/plugin-dialog";
   import { clickOutside } from "../lib/actions/clickOutside";
+  import KnowledgeVaultSettings from "../lib/components/settings/KnowledgeVaultSettings.svelte";
 
   import type { Config } from "../lib/interface";
   import {
@@ -353,6 +354,7 @@
                 </div>
               </div>
             </div>
+            <KnowledgeVaultSettings />
           {/if}
 
           <!-- Notification Settings -->
