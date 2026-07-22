@@ -741,6 +741,7 @@ dependencies = [
  "knowledge-writer",
  "log",
  "m3u8-rs 5.0.5",
+ "master-ingest",
  "master-script",
  "master-script-store",
  "md5 0.7.0",
@@ -3943,6 +3944,19 @@ dependencies = [
  "log",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "master-ingest"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
 ]
 
 [[package]]

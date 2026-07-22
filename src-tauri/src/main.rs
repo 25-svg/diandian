@@ -11,6 +11,7 @@ mod handlers;
 #[cfg(feature = "headless")]
 mod http_server;
 mod knowledge_writer;
+mod master_script;
 mod migration;
 mod progress;
 mod recorder_manager;

@@ -1,0 +1,15 @@
+[package]
+name = "master-ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
