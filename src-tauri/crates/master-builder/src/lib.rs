@@ -40,6 +40,7 @@ pub struct DynamicField {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterSectionDraft {
+    #[serde(default)]
     pub position: u32,
     pub section_key: String,
     pub kind: MasterSectionKind,
@@ -248,7 +249,13 @@ pub fn parse_model_sections(response: &str) -> Result<Vec<MasterSectionDraft>, S
     let parsed: serde_json::Value = serde_json::from_str(value)
         .map_err(|error| format!("MiniMax 母稿结果不是合法 JSON: {error}"))?;
     let sections = parsed.get("sections").cloned().unwrap_or(parsed);
-    serde_json::from_value(sections).map_err(|error| format!("MiniMax 母稿章节格式错误: {error}"))
+    let mut sections: Vec<MasterSectionDraft> = serde_json::from_value(sections)
+        .map_err(|error| format!("MiniMax 母稿章节格式错误: {error}"))?;
+    for (index, section) in sections.iter_mut().enumerate() {
+        section.position = u32::try_from(index + 1)
+            .map_err(|error| format!("MiniMax 母稿章节数量异常: {error}"))?;
+    }
+    Ok(sections)
 }
 
 fn push_issue(

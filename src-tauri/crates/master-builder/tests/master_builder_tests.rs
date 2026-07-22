@@ -33,6 +33,16 @@ fn parses_model_sections_with_or_without_markdown_fences() {
     );
 }
 
+#[test]
+fn fills_missing_model_positions_from_section_order() {
+    let json = r#"{"sections":[{"sectionKey":"opening","kind":"opening","productCardId":null,"sourceCueIds":[1],"sourceStartMs":0,"sourceEndMs":2000,"hostText":"欢迎来到直播间","masterText":"欢迎来到直播间","textOrigin":"host_speech","conditions":[],"dynamicFields":[]},{"sectionKey":"closing","kind":"closing","productCardId":null,"sourceCueIds":[5],"sourceStartMs":12000,"sourceEndMs":14000,"hostText":"感谢大家今天的陪伴","masterText":"感谢大家今天的陪伴","textOrigin":"host_speech","conditions":[],"dynamicFields":[]}]}"#;
+
+    let sections = parse_model_sections(json).unwrap();
+
+    assert_eq!(sections[0].position, 1);
+    assert_eq!(sections[1].position, 2);
+}
+
 fn cue(id: u64, start_ms: u64, end_ms: u64, text: &str) -> TranscriptCue {
     TranscriptCue {
         id,
