@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/danmu_stream", "crates/recorder", "crates/whisper-cpp-rs"]
+members = ["crates/danmu_stream", "crates/knowledge", "crates/recorder", "crates/whisper-cpp-rs"]
 resolver = "2"
 
 [workspace.lints.clippy]
