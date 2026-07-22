@@ -17,6 +17,7 @@
   import ToolMessageComponent from "../lib/components/ToolMessage.svelte";
   import SettingsModal from "../lib/components/ai/SettingsModal.svelte";
   import ImportVideoDialog from "../lib/components/ImportVideoDialog.svelte";
+  import MasterSourceDialog from "../lib/components/master/MasterSourceDialog.svelte";
   import ReviewSampleDialog from "../lib/components/ai/ReviewSampleDialog.svelte";
   import type { ReviewSample, VideoItem } from "../lib/interface";
 
@@ -28,6 +29,7 @@
   let agent = null;
   let agentMode: AgentMode = "commerce-review";
   let showImportDialog = false;
+  let masterSourceVideo: VideoItem | null = null;
   let showSampleDialog = false;
   let importWorkflowStatus = "";
   let adminMode = false;
@@ -935,7 +937,7 @@
   }
 
   async function handleVideoImported(
-    event: CustomEvent<{ videoId?: number; videoIds?: number[] }>,
+    event: CustomEvent<{ videoId?: number; videoIds?: number[]; asMaster?: boolean }>,
   ) {
     showImportDialog = false;
     try {
@@ -959,6 +961,10 @@
 
       if (!importedVideo) {
         throw new Error("没有找到刚导入的视频，请重新导入后再试。");
+      }
+      if (event.detail?.asMaster) {
+        masterSourceVideo = importedVideo;
+        return;
       }
       window.dispatchEvent(new CustomEvent("bsr:open-video-analysis", { detail: importedVideo }));
     } catch (error) {
@@ -1301,6 +1307,15 @@
     roomId={null}
     on:imported={handleVideoImported}
   />
+
+  {#if masterSourceVideo}
+    <MasterSourceDialog
+      videoId={masterSourceVideo.id}
+      videoTitle={masterSourceVideo.title || masterSourceVideo.file || "整场直播母稿"}
+      on:close={() => masterSourceVideo = null}
+      on:published={() => masterSourceVideo = null}
+    />
+  {/if}
 
   <ReviewSampleDialog
     bind:showDialog={showSampleDialog}

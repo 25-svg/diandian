@@ -9,7 +9,7 @@
   export let roomId: string | null = null;
 
   const dispatch = createEventDispatcher<{
-    imported: { videoId?: number; videoIds?: number[] };
+    imported: { videoId?: number; videoIds?: number[]; asMaster?: boolean };
   }>();
   const IMPORTED_VIDEO_ROOM = "bsr:import";
 
@@ -24,6 +24,7 @@
   let fileInput: HTMLInputElement;
   let importProgress = "";
   let currentImportEventId: string | null = null;
+  let importAsMaster = false;
 
   // 批量导入状态
   let selectedFiles: string[] = [];
@@ -482,7 +483,9 @@
       dispatch("imported", {
         videoId: importedVideo.id,
         videoIds: [importedVideo.id],
+        asMaster: importAsMaster,
       });
+      importAsMaster = false;
     } catch (error) {
       console.error("导入失败:", error);
       alert("导入失败: " + error);
@@ -502,6 +505,7 @@
     selectedFileName = "";
     selectedFileSize = 0;
     videoTitle = "";
+    importAsMaster = false;
     uploading = false;
     uploadProgress = 0;
     importing = false;
@@ -696,6 +700,13 @@
                   placeholder="输入视频标题"
                 />
               </div>
+              <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-600 dark:bg-gray-700">
+                <input type="checkbox" bind:checked={importAsMaster} class="mt-0.5 h-4 w-4 accent-blue-600" />
+                <span>
+                  <strong class="block text-sm font-medium text-gray-800 dark:text-gray-100">导入后作为整场直播母稿</strong>
+                  <small class="mt-1 block text-xs leading-5 text-gray-500 dark:text-gray-400">适合包含多个商品的完整直播；系统会先生成逐字稿，再按商品整理并等待你发布。</small>
+                </span>
+              </label>
             </div>
           {/if}
         </div>

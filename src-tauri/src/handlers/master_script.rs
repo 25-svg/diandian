@@ -70,11 +70,18 @@ pub struct MasterScriptStatus {
     pub chunks: Vec<MasterChunkRow>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterIngestResponse {
+    pub source_id: i64,
+    pub status: IngestStatus,
+}
+
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn start_master_ingest(
     state: state_type!(),
     request: MasterVideoIngestRequest,
-) -> Result<IngestStatus, String> {
+) -> Result<MasterIngestResponse, String> {
     let prepared = prepare_video_ingest(&state, &request).await?;
     let source = state
         .db
@@ -88,13 +95,17 @@ pub async fn start_master_ingest(
         .await
         .map_err(String::from)?;
     let ingest_request = prepared.request(source.id);
-    run_start_master_ingest(
+    let status = run_start_master_ingest(
         ingest_request,
         DatabaseCheckpointStore::new(state.db.clone()),
         prepared.transcriber,
         prepared.artifacts,
     )
-    .await
+    .await?;
+    Ok(MasterIngestResponse {
+        source_id: source.id,
+        status,
+    })
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -102,7 +113,7 @@ pub async fn resume_master_ingest(
     state: state_type!(),
     source_id: i64,
     request: MasterVideoIngestRequest,
-) -> Result<IngestStatus, String> {
+) -> Result<MasterIngestResponse, String> {
     let prepared = prepare_video_ingest(&state, &request).await?;
     let persisted = state
         .db
@@ -120,14 +131,15 @@ pub async fn resume_master_ingest(
     };
     validate_resume_source(&persisted_identity, &prepared.identity())?;
     let ingest_request = prepared.request(source_id);
-    run_resume_master_ingest(
+    let status = run_resume_master_ingest(
         source_id,
         ingest_request,
         DatabaseCheckpointStore::new(state.db.clone()),
         prepared.transcriber,
         prepared.artifacts,
     )
-    .await
+    .await?;
+    Ok(MasterIngestResponse { source_id, status })
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]

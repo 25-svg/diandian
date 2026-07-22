@@ -5,6 +5,7 @@ export type KnowledgeStatus = {
   lastSyncedAt: string | null;
   activeCount: number;
   eligibleCount: number;
+  asrEligibleCount: number;
   pendingReviewCount: number;
   ignoredCount: number;
   restrictedCount: number;
@@ -18,6 +19,7 @@ export type KnowledgeSyncSummary = {
   unchanged: number;
   deactivated: number;
   eligibleCount: number;
+  asrEligibleCount: number;
   pendingReviewCount: number;
   ignoredCount: number;
   restrictedCount: number;
@@ -50,7 +52,8 @@ export function knowledgeStatusPresentation(status: KnowledgeStatus): KnowledgeS
   const knowledgeCardCount = Math.max(0, status.activeCount - status.ignoredCount);
   const categories = [
     `可用 ${status.eligibleCount}`,
-    status.pendingReviewCount > 0 ? `待审核 ${status.pendingReviewCount}` : "",
+    status.asrEligibleCount > 0 ? `ASR 纠错 ${status.asrEligibleCount}` : "",
+    status.pendingReviewCount > 0 ? `待复盘检索审核 ${status.pendingReviewCount}` : "",
     status.restrictedCount > 0 ? `受限 ${status.restrictedCount}` : "",
     status.errorCount > 0 ? `异常 ${status.errorCount}` : "",
   ].filter(Boolean).join("，");
@@ -69,7 +72,9 @@ export function knowledgeStatusPresentation(status: KnowledgeStatus): KnowledgeS
   if (status.pendingReviewCount > 0) {
     return {
       tone: "warning",
-      label: `有 ${status.pendingReviewCount} 张卡片等待审核`,
+      label: status.asrEligibleCount > 0
+        ? "知识库已同步，可用于 ASR 纠错"
+        : `有 ${status.pendingReviewCount} 张卡片等待审核`,
       detail,
     };
   }

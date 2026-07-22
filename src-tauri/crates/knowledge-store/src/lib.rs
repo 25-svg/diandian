@@ -80,6 +80,7 @@ pub struct KnowledgeSyncSummary {
     pub unchanged: usize,
     pub deactivated: usize,
     pub eligible_count: usize,
+    pub asr_eligible_count: usize,
     pub pending_review_count: usize,
     pub ignored_count: usize,
     pub restricted_count: usize,
@@ -96,6 +97,7 @@ pub struct KnowledgeStatus {
     pub last_synced_at: Option<String>,
     pub active_count: i64,
     pub eligible_count: i64,
+    pub asr_eligible_count: i64,
     pub pending_review_count: i64,
     pub ignored_count: i64,
     pub restricted_count: i64,
@@ -111,6 +113,11 @@ pub async fn sync_knowledge_vault(
     let sync_token = uuid::Uuid::new_v4().to_string();
     let synced_at = chrono::Utc::now().to_rfc3339();
     let eligible_count = scan.documents.iter().filter(|item| item.eligible).count();
+    let asr_eligible_count = scan
+        .documents
+        .iter()
+        .filter(|item| item.asr_eligible)
+        .count();
     let pending_review_count = classification_count(scan, "pending_review");
     let ignored_count = classification_count(scan, "ignored");
     let restricted_count = classification_count(scan, "restricted");
@@ -220,6 +227,7 @@ pub async fn sync_knowledge_vault(
         unchanged,
         deactivated,
         eligible_count,
+        asr_eligible_count,
         pending_review_count,
         ignored_count,
         restricted_count,
@@ -267,16 +275,30 @@ pub async fn get_knowledge_status(
     pool: &SqlitePool,
     vault_path: Option<&str>,
 ) -> Result<KnowledgeStatus, sqlx::Error> {
-    let select = r#"SELECT 1 AS connected, source.vault_path, source.status,
+    let has_asr_eligibility = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('knowledge_documents') WHERE name='asr_eligible'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+    let asr_count = if has_asr_eligibility {
+        "COALESCE(SUM(CASE WHEN document.active=1 AND document.asr_eligible=1 THEN 1 ELSE 0 END),0)"
+    } else {
+        "0"
+    };
+    let select = format!(
+        r#"SELECT 1 AS connected, source.vault_path, source.status,
             source.last_synced_at,
             COALESCE(SUM(CASE WHEN document.active=1 THEN 1 ELSE 0 END),0) AS active_count,
             COALESCE(SUM(CASE WHEN document.active=1 AND document.eligible=1 THEN 1 ELSE 0 END),0) AS eligible_count,
+            {asr_count} AS asr_eligible_count,
             COALESCE(SUM(CASE WHEN document.active=1 AND document.classification='pending_review' THEN 1 ELSE 0 END),0) AS pending_review_count,
             COALESCE(SUM(CASE WHEN document.active=1 AND document.classification='ignored' THEN 1 ELSE 0 END),0) AS ignored_count,
             COALESCE(SUM(CASE WHEN document.active=1 AND document.classification='restricted' THEN 1 ELSE 0 END),0) AS restricted_count,
             COALESCE(SUM(CASE WHEN document.active=1 AND document.classification IN ('invalid','duplicate') THEN 1 ELSE 0 END),0) AS error_count
         FROM knowledge_sources source
-        LEFT JOIN knowledge_documents document ON document.source_id=source.id"#;
+        LEFT JOIN knowledge_documents document ON document.source_id=source.id"#
+    );
     let result = if let Some(path) = vault_path {
         sqlx::query_as::<_, KnowledgeStatus>(&format!(
             "{select} WHERE source.vault_path=?1 GROUP BY source.id"
@@ -298,6 +320,7 @@ pub async fn get_knowledge_status(
         last_synced_at: None,
         active_count: 0,
         eligible_count: 0,
+        asr_eligible_count: 0,
         pending_review_count: 0,
         ignored_count: 0,
         restricted_count: 0,
@@ -457,7 +480,7 @@ mod knowledge_sync_tests {
         restricted.classification = "restricted".into();
         restricted.issue = Some("restricted".into());
 
-        sync_knowledge_vault(
+        let summary = sync_knowledge_vault(
             &pool,
             r"C:\Vault",
             &scan(vec![
@@ -469,6 +492,12 @@ mod knowledge_sync_tests {
         )
         .await
         .unwrap();
+
+        assert_eq!(summary.asr_eligible_count, 2);
+        let status = get_knowledge_status(&pool, Some(r"C:\Vault"))
+            .await
+            .unwrap();
+        assert_eq!(status.asr_eligible_count, 2);
 
         assert!(list_eligible_documents(&pool, &[])
             .await

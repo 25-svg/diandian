@@ -31,6 +31,7 @@
     lastSyncedAt: null,
     activeCount: 0,
     eligibleCount: 0,
+    asrEligibleCount: 0,
     pendingReviewCount: 0,
     ignoredCount: 0,
     restrictedCount: 0,
@@ -149,6 +150,13 @@
       {#if status.connected}
         <div class="mt-4 grid gap-2 border-t border-gray-100 pt-4 sm:grid-cols-2 dark:border-gray-700">
           <div class="flex items-start gap-2 text-sm">
+            <CheckCircle2 class="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
+            <div>
+              <p class="font-medium text-gray-800 dark:text-gray-100">可用于 ASR 纠错：{status.asrEligibleCount} 张</p>
+              <p class="text-xs text-gray-500 dark:text-gray-400">公司确认过的产品名、型号和替换词会自动参与转写纠错</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-2 text-sm">
             <CheckCircle2 class="mt-0.5 h-4 w-4 shrink-0 text-green-600" />
             <div>
               <p class="font-medium text-gray-800 dark:text-gray-100">可正式检索：{status.eligibleCount} 张</p>
@@ -158,8 +166,8 @@
           <div class="flex items-start gap-2 text-sm">
             <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
             <div>
-              <p class="font-medium text-gray-800 dark:text-gray-100">等待人工审核：{status.pendingReviewCount} 张</p>
-              <p class="text-xs text-gray-500 dark:text-gray-400">审核通过后才会提供给分析模型</p>
+              <p class="font-medium text-gray-800 dark:text-gray-100">待复盘检索审核：{status.pendingReviewCount} 张</p>
+              <p class="text-xs text-gray-500 dark:text-gray-400">仅影响复盘模型检索，不影响已确认参数卡用于 ASR 纠错</p>
             </div>
           </div>
           {#if status.ignoredCount > 0}
