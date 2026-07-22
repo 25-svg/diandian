@@ -451,6 +451,12 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::transcript_dictionary_candidate::TRANSCRIPT_DICTIONARY_CANDIDATES_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 16,
+            description: "add_knowledge_snapshot_tables",
+            sql: database::knowledge::KNOWLEDGE_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
