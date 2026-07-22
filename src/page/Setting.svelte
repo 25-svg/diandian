@@ -36,6 +36,7 @@
     volcengine_correct_table_id: "",
     admin_mode: false,
     powerlive_key: "",
+    knowledge_vault_path: "",
     whisper_model: "",
     whisper_prompt: "",
     clip_name_format: "",

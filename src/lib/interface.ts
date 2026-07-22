@@ -199,6 +199,7 @@ export interface Config {
   webhook_url: string;
   danmu_ass_options: Danmu2AssOptions;
   powerlive_key: string;
+  knowledge_vault_path: string;
 }
 
 export interface Danmu2AssOptions {

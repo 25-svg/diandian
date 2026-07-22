@@ -10,6 +10,7 @@
     "test:recorder-removal-preserves-archives": "node scripts/check-recorder-removal-preserves-archives.mjs",
     "test:canonical-video-subtitles": "node scripts/check-canonical-video-subtitles.mjs",
     "test:transcript-review": "node --loader ts-node/esm src/lib/transcriptReview.test.ts",
+    "test:knowledge": "node --loader ts-node/esm src/lib/knowledge.test.ts",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
