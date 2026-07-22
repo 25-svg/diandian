@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::database::{Database, KnowledgeDocumentRecord, MasterChunkInput, MasterChunkRow};
+use crate::database::knowledge::KnowledgeDocumentRecord;
+use crate::database::master_script::{MasterChunkInput, MasterChunkRow};
+use crate::database::Database;
 use crate::ffmpeg;
 use crate::subtitle_generator::transcript_artifacts::{TranscriptArtifactStore, TranscriptSource};
 use crate::subtitle_generator::volcengine::VolcengineAsr;
