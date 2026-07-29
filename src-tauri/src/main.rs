@@ -536,6 +536,12 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::record::RECORD_ANCHOR_DETECTION_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 29,
+            description: "add_live_dashboard_tables",
+            sql: database::live_dashboard::LIVE_DASHBOARD_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

@@ -5,6 +5,8 @@ use tokio::sync::RwLock;
 
 pub mod account;
 pub mod knowledge;
+pub mod live_dashboard;
+pub mod master_sample_batch;
 pub mod master_script;
 pub mod message;
 pub mod record;
@@ -13,6 +15,7 @@ pub mod review_sample;
 pub mod task;
 pub mod transcript_dictionary_candidate;
 pub mod video;
+pub mod video_archive;
 
 pub struct Database {
     db: RwLock<Option<Pool<Sqlite>>>,
