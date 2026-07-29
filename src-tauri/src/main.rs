@@ -1,23 +1,28 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anchor_detection;
 mod audio_utils;
 mod config;
 mod constants;
 mod danmu2ass;
 mod database;
 mod ffmpeg;
+mod fs_util;
 mod handlers;
 #[cfg(feature = "headless")]
 mod http_server;
 mod knowledge_writer;
+mod live_data_import;
 mod master_script;
 mod migration;
+mod nas_archive;
 mod progress;
 mod recorder_manager;
 mod security;
 mod state;
 mod static_server;
+mod storage_migration;
 mod subtitle_generator;
 mod task;
 #[cfg(feature = "gui")]
@@ -483,6 +488,54 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::knowledge::KNOWLEDGE_ASR_ELIGIBILITY_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 21,
+            description: "add_master_sample_batches",
+            sql: database::master_sample_batch::MASTER_SAMPLE_BATCH_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 22,
+            description: "add_master_sample_batch_syntheses",
+            sql: database::master_sample_batch::MASTER_SAMPLE_BATCH_SYNTHESIS_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 23,
+            description: "add_video_transcript_chunks",
+            sql: database::video::VIDEO_TRANSCRIPT_CHUNKS_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 24,
+            description: "add_master_sample_batch_purpose",
+            sql: database::master_sample_batch::MASTER_SAMPLE_BATCH_PURPOSE_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 25,
+            description: "add_video_archive_jobs",
+            sql: database::video_archive::VIDEO_ARCHIVE_JOBS_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 26,
+            description: "add_master_upgrade_reviews",
+            sql: database::master_script::MASTER_UPGRADE_REVIEW_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 27,
+            description: "add_video_anchor_detection",
+            sql: database::video::VIDEO_ANCHOR_DETECTION_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 28,
+            description: "add_record_anchor_detection",
+            sql: database::record::RECORD_ANCHOR_DETECTION_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -515,7 +568,10 @@ impl MigrationSource<'static> for MigrationList {
 async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Error>> {
     use std::path::PathBuf;
 
-    use crate::{constants::API_PORT, static_server::StaticServer, task::TaskManager};
+    use crate::{
+        constants::API_PORT, static_server::StaticServer,
+        storage_migration::StorageMigrationStatus, task::TaskManager,
+    };
     use progress::progress_manager::ProgressManager;
     use progress::progress_reporter::EventEmitter;
 
@@ -565,13 +621,19 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
     let mut task_manager = TaskManager::new();
     task_manager.start();
     let task_manager = Arc::new(task_manager);
+    let nas_archive = Arc::new(nas_archive::NasArchiveService::new(
+        db.clone(),
+        config.clone(),
+    ));
     let recorder_manager = Arc::new(RecorderManager::new(
         emitter,
         db.clone(),
         config.clone(),
         task_manager.clone(),
         webhook_poster.clone(),
+        nas_archive.clone(),
     ));
+    nas_archive.clone().start();
 
     // In headless/Docker, cache and output are served from the API server (API_PORT), so no
     // separate static server is needed and only one port need be exposed. Use a dedicated
@@ -584,13 +646,17 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
     let _ = try_add_parent_id_to_records(&db).await;
     let _ = try_convert_entry_to_m3u8(&db, config.read().await.cache.clone().into()).await;
 
+    let storage_migration = StorageMigrationStatus::new();
+
     Ok(State {
         db,
         config,
         webhook_poster,
         recorder_manager,
+        nas_archive,
         task_manager,
         static_server,
+        storage_migration,
         progress_manager,
         readonly: args.readonly,
     })
@@ -601,7 +667,10 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
     use platform_dirs::AppDirs;
     use progress::progress_reporter::EventEmitter;
 
-    use crate::{static_server::start_static_server, task::TaskManager};
+    use crate::{
+        static_server::start_static_server, storage_migration::StorageMigrationStatus,
+        task::TaskManager,
+    };
 
     let log_dir = app.path().app_log_dir()?;
     setup_logging(&log_dir).await?;
@@ -639,6 +708,10 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
     task_manager.start();
 
     let task_manager = Arc::new(task_manager);
+    let nas_archive = Arc::new(nas_archive::NasArchiveService::new(
+        db.clone(),
+        config.clone(),
+    ));
 
     let recorder_manager = Arc::new(RecorderManager::new(
         app.app_handle().clone(),
@@ -647,7 +720,9 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         config.clone(),
         task_manager.clone(),
         webhook_poster.clone(),
+        nas_archive.clone(),
     ));
+    nas_archive.clone().start();
 
     let static_server = Arc::new(start_static_server(config.clone()).await?);
 
@@ -662,12 +737,16 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
     let _ = try_add_parent_id_to_records(&db_clone).await;
     let _ = try_convert_entry_to_m3u8(&db_clone, cache_path.clone().into()).await;
 
+    let storage_migration = StorageMigrationStatus::new();
+
     Ok(State {
         db,
         config,
         recorder_manager,
+        nas_archive,
         task_manager,
         static_server,
+        storage_migration,
         app_handle: app.handle().clone(),
         webhook_poster,
     })
@@ -730,6 +809,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::ai::minimax_chat,
         crate::handlers::config::get_config,
         crate::handlers::config::get_static_port,
+        crate::handlers::config::get_storage_migration_status,
         crate::handlers::config::set_cache_path,
         crate::handlers::config::set_output_path,
         crate::handlers::config::update_notify,
@@ -747,12 +827,23 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::config::update_webhook_url,
         crate::handlers::config::update_danmu_ass_options,
         crate::handlers::config::update_powerlive_key,
+        crate::handlers::config::test_nas_video_storage,
+        crate::handlers::config::update_nas_video_storage,
         crate::handlers::knowledge::inspect_knowledge_vault,
         crate::handlers::knowledge::connect_knowledge_vault,
         crate::handlers::knowledge::sync_knowledge_vault,
         crate::handlers::knowledge::get_knowledge_status,
+        crate::handlers::knowledge::get_enterprise_product_dictionary,
         crate::handlers::knowledge::open_knowledge_vault,
         crate::handlers::master_script::start_master_ingest,
+        crate::handlers::master_script::create_master_sample_batch,
+        crate::handlers::master_script::list_master_sample_batches,
+        crate::handlers::master_script::get_master_sample_batch,
+        crate::handlers::master_script::start_master_sample_batch_processing,
+        crate::handlers::master_script::generate_master_sample_batch_draft,
+        crate::handlers::master_script::publish_master_sample_batch_draft,
+        crate::handlers::master_script::publish_corrected_master_sample_batch_version,
+        crate::handlers::master_script::list_unbatched_master_source_video_ids,
         crate::handlers::master_script::resume_master_ingest,
         crate::handlers::master_script::preview_master_script,
         crate::handlers::master_script::publish_master_script,
@@ -763,6 +854,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::master_script::preview_master_upgrade,
         crate::handlers::master_script::publish_master_upgrade,
         crate::handlers::master_script::compare_highlight_to_master,
+        crate::handlers::master_script::retry_master_upgrade_review,
         crate::handlers::message::get_messages,
         crate::handlers::message::read_message,
         crate::handlers::message::delete_message,
@@ -808,10 +900,15 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::video::get_all_videos,
         crate::handlers::video::get_video_cover,
         crate::handlers::video::delete_video,
+        crate::handlers::video::list_video_archives,
+        crate::handlers::video::retry_video_archive,
+        crate::handlers::video::open_video_archive_location,
         crate::handlers::video::get_video_typelist,
         crate::handlers::video::update_video_cover,
         crate::handlers::video::generate_video_subtitle,
         crate::handlers::video::get_video_subtitle,
+        crate::handlers::video::get_video_playback_source,
+        crate::handlers::video::prepare_video_playback,
         crate::handlers::video::update_video_subtitle,
         crate::handlers::video::update_video_note,
         crate::handlers::video::encode_video_subtitle,
@@ -822,6 +919,10 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::video::get_file_size,
         crate::handlers::video::get_import_progress,
         crate::handlers::video::generate_audio_sample,
+        crate::handlers::anchor_detection::detect_video_anchor,
+        crate::handlers::anchor_detection::save_video_anchor_manual,
+        crate::handlers::anchor_detection::detect_archive_anchor,
+        crate::handlers::anchor_detection::save_archive_anchor_manual,
         crate::handlers::task::get_tasks,
         crate::handlers::task::delete_task,
         crate::handlers::utils::show_in_folder,
@@ -887,7 +988,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(v) => log::info!("Checked ffmpeg version: {v}"),
                 }
 
+                let resume_state = state.clone();
                 app.manage(state);
+                tauri::async_runtime::spawn(async move {
+                    crate::handlers::master_script::resume_processing_master_sample_batches(
+                        resume_state,
+                    )
+                    .await;
+                });
                 Ok(())
             })
         })

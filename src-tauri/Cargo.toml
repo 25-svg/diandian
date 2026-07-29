@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/danmu_stream", "crates/knowledge", "crates/knowledge-store", "crates/knowledge-writer", "crates/master-builder", "crates/master-comparison", "crates/master-ingest", "crates/master-script", "crates/master-script-store", "crates/recorder", "crates/whisper-cpp-rs"]
+members = ["crates/anchor-detection-domain", "crates/danmu_stream", "crates/knowledge", "crates/knowledge-store", "crates/knowledge-writer", "crates/master-builder", "crates/master-comparison", "crates/master-ingest", "crates/master-script", "crates/master-script-store", "crates/recorder", "crates/whisper-cpp-rs"]
 resolver = "2"
 
 [workspace.lints.clippy]
@@ -24,6 +24,7 @@ workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anchor-detection-domain = { path = "crates/anchor-detection-domain" }
 danmu_stream = { path = "crates/danmu_stream" }
 knowledge = { path = "crates/knowledge" }
 knowledge-store = { path = "crates/knowledge-store" }
@@ -78,6 +79,7 @@ sanitize-filename = "0.6.0"
 socketioxide = "0.17.2"
 scraper = "0.24.0"
 sentry = { version = "0.46.0", features = ["log", "logs"] }
+calamine = "0.26"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem
