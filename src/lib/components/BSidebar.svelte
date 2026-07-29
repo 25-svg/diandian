@@ -11,6 +11,8 @@
     History,
     Scissors,
     Sparkles,
+    ChartNoAxesCombined,
+    MonitorUp,
   } from "lucide-svelte";
   import { hasNewVersion } from "../stores/version";
   import SidebarItem from "./SidebarItem.svelte";
@@ -64,6 +66,16 @@
     <SidebarItem label="任务" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
         <List class="w-5 h-5" />
+      </div>
+    </SidebarItem>
+    <SidebarItem label="培养看板" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon">
+        <ChartNoAxesCombined class="w-5 h-5" />
+      </div>
+    </SidebarItem>
+    <SidebarItem label="直播数据大屏" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon">
+        <MonitorUp class="w-5 h-5" />
       </div>
     </SidebarItem>
     <SidebarItem label="助手" {activeUrl} on:activeChange={navigate}>

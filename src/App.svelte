@@ -11,9 +11,12 @@
   import AI from "./page/AI.svelte";
   import Archive from "./page/Archive.svelte";
   import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
+  import TrainingDashboard from "./page/TrainingDashboard.svelte";
+  import LiveDataDashboard from "./page/LiveDataDashboard.svelte";
   import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
   import type { RecordItem } from "./lib/db";
   import type { VideoItem } from "./lib/interface";
+  import { getMasterBaseline, listMasterSampleBatches } from "./lib/masterScript";
   import { onMount } from "svelte";
 
   let active = "总览";
@@ -21,8 +24,37 @@
   let analysisVideo: VideoItem | null = null;
   let analysisRefreshToken = 0;
   let masterSourceVideo: VideoItem | null = null;
+
+  async function ensureActiveEnterpriseMaster(): Promise<void> {
+    try {
+      const current = JSON.parse(localStorage.getItem("bsr:active-master") || "{}") as { scriptKey?: string };
+      if (current.scriptKey) return;
+
+      const batches = (await listMasterSampleBatches())
+        .filter(({ batch }) => batch.purpose === "enterprise" && batch.status === "published")
+        .sort((left, right) => right.batch.id - left.batch.id);
+
+      for (const { batch } of batches) {
+        const scriptKey = `MS-BATCH-${batch.id}`;
+        try {
+          const baseline = await getMasterBaseline(scriptKey);
+          localStorage.setItem("bsr:active-master", JSON.stringify({
+            scriptKey: baseline.master.scriptKey,
+            masterScriptId: baseline.master.id,
+          }));
+          return;
+        } catch {
+          // Try the next published enterprise batch if this one has no usable baseline.
+        }
+      }
+    } catch {
+      // First launch remains usable even when no enterprise master has been published.
+    }
+  }
+
   onMount(() => {
     void set_title("典典直播切片");
+    void ensureActiveEnterpriseMaster();
   });
   onMount(async () => {
     await onOpenUrl((urls: string[]) => {
@@ -142,6 +174,12 @@
       </div>
       <div class="page" class:visible={active == "任务"}>
         <Task />
+      </div>
+      <div class="page" class:visible={active == "培养看板"}>
+        <TrainingDashboard />
+      </div>
+      <div class="page" class:visible={active == "直播数据大屏"}>
+        <LiveDataDashboard />
       </div>
       <div class="page" class:visible={active == "助手"}>
         <AI />
