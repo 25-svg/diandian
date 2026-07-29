@@ -1,7 +1,9 @@
 pub mod account;
 pub mod ai;
+pub mod anchor_detection;
 pub mod config;
 pub mod knowledge;
+pub mod live_dashboard;
 pub mod macros;
 pub mod master_script;
 pub mod message;

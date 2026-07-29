@@ -91,6 +91,29 @@ pub struct LiveDashboardProductRow {
     pub click_count: Option<i64>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDashboardChannelRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub name: String,
+    pub viewer_count: Option<i64>,
+    pub payment_amount_fen: Option<i64>,
+    pub order_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDashboardShortVideoRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub title: String,
+    pub published_at: String,
+    pub exposure_count: Option<i64>,
+    pub referral_count: Option<i64>,
+    pub click_rate: Option<f64>,
+}
+
 impl Database {
     pub async fn upsert_live_dashboard(
         &self,
@@ -147,6 +170,18 @@ impl Database {
     pub async fn list_live_dashboard_products(&self, session_id: i64) -> Result<Vec<LiveDashboardProductRow>, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
         Ok(sqlx::query_as("SELECT * FROM live_dashboard_products WHERE session_id=$1 ORDER BY payment_amount_fen DESC, id ASC")
+            .bind(session_id).fetch_all(&pool).await?)
+    }
+
+    pub async fn list_live_dashboard_channels(&self, session_id: i64) -> Result<Vec<LiveDashboardChannelRow>, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        Ok(sqlx::query_as("SELECT * FROM live_dashboard_channels WHERE session_id=$1 ORDER BY payment_amount_fen DESC, id ASC")
+            .bind(session_id).fetch_all(&pool).await?)
+    }
+
+    pub async fn list_live_dashboard_short_videos(&self, session_id: i64) -> Result<Vec<LiveDashboardShortVideoRow>, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        Ok(sqlx::query_as("SELECT * FROM live_dashboard_short_videos WHERE session_id=$1 ORDER BY referral_count DESC, id ASC")
             .bind(session_id).fetch_all(&pool).await?)
     }
 }

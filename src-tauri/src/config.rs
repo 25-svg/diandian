@@ -6,6 +6,27 @@ use std::sync::Arc;
 
 use crate::{danmu2ass::Danmu2AssOptions, recorder_manager::ClipRangeParams};
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct NasVideoStorageConfig {
+    pub enabled: bool,
+    pub root_path: String,
+    pub archive_recordings: bool,
+    pub archive_imports: bool,
+    pub delete_local_after_archive: bool,
+}
+
+impl Default for NasVideoStorageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root_path: String::new(),
+            archive_recordings: true,
+            archive_imports: true,
+            delete_local_after_archive: true,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
     pub cache: String,
@@ -60,6 +81,12 @@ pub struct Config {
     pub volcengine_correct_table_id: String,
     #[serde(default)]
     pub knowledge_vault_path: String,
+    #[serde(default)]
+    pub nas_video_storage: NasVideoStorageConfig,
+    #[serde(default = "default_live_dashboard_download_dir")]
+    pub live_dashboard_download_dir: String,
+    #[serde(default)]
+    pub auto_download_enabled: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -131,6 +158,12 @@ fn default_volcengine_resource_id() -> String {
     "volc.seedasr.auc".to_string()
 }
 
+fn default_live_dashboard_download_dir() -> String {
+    std::env::var("USERPROFILE")
+        .map(|profile| PathBuf::from(profile).join("Downloads").to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 impl Config {
     pub fn load(
         config_path: &PathBuf,
@@ -188,6 +221,9 @@ impl Config {
             volcengine_boosting_table_id: String::new(),
             volcengine_correct_table_id: String::new(),
             knowledge_vault_path: String::new(),
+            nas_video_storage: NasVideoStorageConfig::default(),
+            live_dashboard_download_dir: default_live_dashboard_download_dir(),
+            auto_download_enabled: false,
         };
 
         config.save();
@@ -277,5 +313,56 @@ impl Config {
         self.update_interval
             .store(interval, atomic::Ordering::Relaxed);
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("bili-shadowreplay-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn nas_storage_defaults_are_safe() {
+        let root = unique_test_root("nas-defaults");
+        let config_path = root.join("Conf.toml");
+        let cache = root.join("cache");
+        let output = root.join("output");
+
+        let config = Config::load(&config_path, &cache, &output).unwrap();
+
+        assert!(!config.nas_video_storage.enabled);
+        assert!(config.nas_video_storage.root_path.is_empty());
+        assert!(config.nas_video_storage.archive_recordings);
+        assert!(config.nas_video_storage.archive_imports);
+        assert!(config.nas_video_storage.delete_local_after_archive);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_config_without_nas_section_loads_safe_defaults() {
+        let root = unique_test_root("nas-legacy");
+        let config_path = root.join("Conf.toml");
+        let cache = root.join("cache");
+        let output = root.join("output");
+        let original = Config::load(&config_path, &cache, &output).unwrap();
+        let serialized = std::fs::read_to_string(&config_path).unwrap();
+        let legacy = serialized
+            .lines()
+            .take_while(|line| !line.trim().starts_with("[nas_video_storage]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&config_path, legacy).unwrap();
+
+        let loaded = Config::load(&config_path, &cache, &output).unwrap();
+
+        assert_eq!(loaded.cache, original.cache);
+        assert_eq!(loaded.output, original.output);
+        assert_eq!(loaded.nas_video_storage, NasVideoStorageConfig::default());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

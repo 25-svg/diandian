@@ -841,6 +841,11 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::knowledge::get_knowledge_status,
         crate::handlers::knowledge::get_enterprise_product_dictionary,
         crate::handlers::knowledge::open_knowledge_vault,
+        crate::handlers::live_dashboard::import_live_dashboard_xlsx,
+        crate::handlers::live_dashboard::list_live_dashboard_sessions,
+        crate::handlers::live_dashboard::get_live_dashboard_detail,
+        crate::handlers::live_dashboard::get_live_dashboard_settings,
+        crate::handlers::live_dashboard::set_live_dashboard_download_dir,
         crate::handlers::master_script::start_master_ingest,
         crate::handlers::master_script::create_master_sample_batch,
         crate::handlers::master_script::list_master_sample_batches,
@@ -995,10 +1000,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let resume_state = state.clone();
+                let live_dashboard_state = state.clone();
                 app.manage(state);
                 tauri::async_runtime::spawn(async move {
                     crate::handlers::master_script::resume_processing_master_sample_batches(
                         resume_state,
+                    )
+                    .await;
+                });
+                tauri::async_runtime::spawn(async move {
+                    crate::handlers::live_dashboard::start_live_dashboard_download_poller(
+                        live_dashboard_state,
                     )
                     .await;
                 });
