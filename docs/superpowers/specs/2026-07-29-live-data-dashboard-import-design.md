@@ -87,3 +87,12 @@
 - 集成测试：有效工作簿导入、重复导入幂等、缺失工作表拒绝、临时文件忽略。
 - 前端测试：核心指标字段映射和无数据展示。
 - 手动验收：将官方导出的 XLSX 下载到指定目录后，大屏无需选择文件即可更新；再次下载同一场次不产生重复记录。
+
+## Verification
+
+2026-07-29 verified:
+
+- `cargo test --bin bili-shadowreplay live_data_import::tests` — 4 tests passed, including the real official XLSX fixture.
+- `cargo test --bin bili-shadowreplay database::live_dashboard::tests` — idempotent import test passed.
+- `node --loader ts-node/esm src/lib/liveDashboard.test.ts` and `npm run build` — passed.
+- Started the desktop app, copied an official XLSX into Downloads, and confirmed an imported session appeared in SQLite. Re-copying the same live session kept the session count at `1 -> 1`.
