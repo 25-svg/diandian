@@ -12,13 +12,28 @@ use crate::state_type;
 #[cfg(feature = "gui")]
 use tauri::{Emitter, State as TauriState};
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveDashboardDetail {
     pub session: LiveDashboardSessionRow,
     pub channels: Vec<LiveDashboardChannelRow>,
     pub short_videos: Vec<LiveDashboardShortVideoRow>,
     pub products: Vec<LiveDashboardProductRow>,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveDashboardImportFailure {
+    path: String,
+    message: String,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveDashboardWatchError {
+    message: String,
 }
 
 pub async fn import_live_dashboard_xlsx_path(
@@ -45,7 +60,11 @@ pub async fn import_live_dashboard_xlsx(
 pub async fn list_live_dashboard_sessions(
     state: state_type!(),
 ) -> Result<Vec<LiveDashboardSessionRow>, String> {
-    state.db.list_live_dashboard_sessions().await.map_err(|error| error.to_string())
+    state
+        .db
+        .list_live_dashboard_sessions()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -62,24 +81,47 @@ pub async fn get_live_dashboard_detail(
         .find(|session| session.id == session_id)
         .ok_or_else(|| "直播数据场次不存在".to_string())?;
     Ok(LiveDashboardDetail {
-        channels: state.db.list_live_dashboard_channels(session_id).await.map_err(|error| error.to_string())?,
-        short_videos: state.db.list_live_dashboard_short_videos(session_id).await.map_err(|error| error.to_string())?,
-        products: state.db.list_live_dashboard_products(session_id).await.map_err(|error| error.to_string())?,
+        channels: state
+            .db
+            .list_live_dashboard_channels(session_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        short_videos: state
+            .db
+            .list_live_dashboard_short_videos(session_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        products: state
+            .db
+            .list_live_dashboard_products(session_id)
+            .await
+            .map_err(|error| error.to_string())?,
         session,
     })
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
-pub async fn get_live_dashboard_settings(state: state_type!()) -> Result<HashMap<String, serde_json::Value>, String> {
+pub async fn get_live_dashboard_settings(
+    state: state_type!(),
+) -> Result<HashMap<String, serde_json::Value>, String> {
     let config = state.config.read().await;
     Ok(HashMap::from([
-        ("downloadDir".to_string(), serde_json::Value::String(config.live_dashboard_download_dir.clone())),
-        ("autoDownloadEnabled".to_string(), serde_json::Value::Bool(config.auto_download_enabled)),
+        (
+            "downloadDir".to_string(),
+            serde_json::Value::String(config.live_dashboard_download_dir.clone()),
+        ),
+        (
+            "autoDownloadEnabled".to_string(),
+            serde_json::Value::Bool(config.auto_download_enabled),
+        ),
     ]))
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
-pub async fn set_live_dashboard_download_dir(state: state_type!(), path: String) -> Result<(), String> {
+pub async fn set_live_dashboard_download_dir(
+    state: state_type!(),
+    path: String,
+) -> Result<(), String> {
     if path.trim().is_empty() || !Path::new(&path).is_dir() {
         return Err("下载目录不可访问，请重新选择".to_string());
     }
@@ -91,39 +133,87 @@ pub async fn set_live_dashboard_download_dir(state: state_type!(), path: String)
 
 pub async fn start_live_dashboard_download_poller(state: State) {
     let mut observed_sizes = HashMap::<std::path::PathBuf, u64>::new();
-    let mut imported_fingerprints = HashMap::<std::path::PathBuf, (u64, std::time::SystemTime)>::new();
+    let mut imported_fingerprints =
+        HashMap::<std::path::PathBuf, (u64, std::time::SystemTime)>::new();
+    let mut last_directory_error = None::<String>;
     loop {
-        let directory = state.config.read().await.live_dashboard_download_dir.clone();
+        let directory = state
+            .config
+            .read()
+            .await
+            .live_dashboard_download_dir
+            .clone();
         if !directory.trim().is_empty() {
             match std::fs::read_dir(&directory) {
                 Ok(entries) => {
+                    last_directory_error = None;
                     for entry in entries.flatten() {
                         let path = entry.path();
                         let extension = path.extension().and_then(|value| value.to_str());
-                        let temporary = path.file_name().and_then(|value| value.to_str()).is_some_and(|name| name.starts_with("~$"));
+                        let temporary = path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|name| name.starts_with("~$"));
                         if extension != Some("xlsx") || temporary {
                             continue;
                         }
-                        let Ok(metadata) = entry.metadata() else { continue; };
+                        let Ok(metadata) = entry.metadata() else {
+                            continue;
+                        };
                         let size = metadata.len();
                         let unchanged = observed_sizes.insert(path.clone(), size) == Some(size);
-                        let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        if !unchanged || imported_fingerprints.get(&path) == Some(&(size, modified)) {
+                        let modified = metadata
+                            .modified()
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        if !unchanged || imported_fingerprints.get(&path) == Some(&(size, modified))
+                        {
                             continue;
                         }
                         match import_live_dashboard_xlsx_path(&state, &path).await {
                             Ok(session) => {
                                 imported_fingerprints.insert(path.clone(), (size, modified));
                                 #[cfg(feature = "gui")]
-                                if let Err(error) = state.app_handle.emit("live-dashboard-imported", &session) {
-                                    log::warn!("Failed to emit live dashboard import event: {error}");
+                                if let Err(error) =
+                                    state.app_handle.emit("live-dashboard-imported", &session)
+                                {
+                                    log::warn!(
+                                        "Failed to emit live dashboard import event: {error}"
+                                    );
                                 }
                             }
-                            Err(error) => log::warn!("Live dashboard import skipped for {}: {error}", path.display()),
+                            Err(error) => {
+                                log::warn!(
+                                    "Live dashboard import skipped for {}: {error}",
+                                    path.display()
+                                );
+                                #[cfg(feature = "gui")]
+                                if let Err(emit_error) = state.app_handle.emit(
+                                    "live-dashboard-import-failed",
+                                    LiveDashboardImportFailure {
+                                        path: path.to_string_lossy().into_owned(),
+                                        message: error,
+                                    },
+                                ) {
+                                    log::warn!("Failed to emit live dashboard import failure: {emit_error}");
+                                }
+                            }
                         }
                     }
                 }
-                Err(error) => log::warn!("Live dashboard download directory unavailable {directory}: {error}"),
+                Err(error) => {
+                    let message = format!("下载目录不可访问，已暂停自动导入：{directory}（{error}）。手动导入仍可使用。");
+                    log::warn!("{message}");
+                    if last_directory_error.as_deref() != Some(message.as_str()) {
+                        last_directory_error = Some(message.clone());
+                        #[cfg(feature = "gui")]
+                        if let Err(emit_error) = state.app_handle.emit(
+                            "live-dashboard-watch-error",
+                            LiveDashboardWatchError { message },
+                        ) {
+                            log::warn!("Failed to emit live dashboard watch error: {emit_error}");
+                        }
+                    }
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;

@@ -12,14 +12,14 @@
     averageOnline?: number | null; averageWatchSeconds?: number | null;
     viewerConversionRate?: number | null; sourceFile: string; importedAt: string;
   };
-  type Detail = { session: Session; channels: Array<{ name: string; viewerCount?: number; paymentAmountFen?: number; orderCount?: number }>; products: Array<{ productId: string; name: string; paymentAmountFen?: number; soldCount?: number; buyerCount?: number }> };
+  type Detail = { session: Session; channels: Array<{ name: string; viewerCount?: number; paymentAmountFen?: number; orderCount?: number }>; shortVideos: Array<{ title: string; viewerCount?: number; paymentAmountFen?: number; orderCount?: number }>; products: Array<{ productId: string; name: string; paymentAmountFen?: number; soldCount?: number; buyerCount?: number }> };
 
   let sessions: Session[] = [];
   let detail: Detail | null = null;
   let loading = true;
   let message = "";
   let downloadDir = "";
-  let unlisten: (() => void) | undefined;
+  let unlistens: Array<() => void> = [];
 
   const money = (fen?: number | null) => fen == null ? "— / 官方导出未提供" : `¥${(fen / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
 
@@ -54,9 +54,13 @@
 
   onMount(async () => {
     await refresh();
-    unlisten = await listen("live-dashboard-imported", () => { message = "检测到新下载，已自动导入。"; void refresh(); });
+    unlistens = await Promise.all([
+      listen("live-dashboard-imported", () => { message = "检测到新下载，已自动导入。"; void refresh(); }),
+      listen<{ path: string; message: string }>("live-dashboard-import-failed", (event) => { message = `自动导入失败：${event.payload.message}。请确认文件为官方整场数据下载 XLSX。`; }),
+      listen<{ message: string }>("live-dashboard-watch-error", (event) => { message = event.payload.message; }),
+    ]);
   });
-  onDestroy(() => unlisten?.());
+  onDestroy(() => unlistens.forEach((unlisten) => unlisten()));
 </script>
 
 <section class="dashboard">
@@ -73,7 +77,7 @@
   {#if detail}
     <div class="cards">{#each dashboardMetricCards(detail.session) as card}<article><span>{card.label}</span><strong>{card.value}</strong></article>{/each}<article><span>直播间观看人数</span><strong>{detail.session.viewerCount ?? "— / 官方导出未提供"}</strong></article><article><span>平均在线人数</span><strong>{detail.session.averageOnline ?? "— / 官方导出未提供"}</strong></article><article><span>千次观看用户支付金额</span><strong>{money(detail.session.perThousandPaymentAmountFen)}</strong></article></div>
     <div class="meta">来源：{detail.session.sourceFile}　导入：{new Date(detail.session.importedAt).toLocaleString("zh-CN")}</div>
-    <div class="tables"><article><h2>渠道分析</h2><table><thead><tr><th>渠道</th><th>观看人数</th><th>用户支付金额</th><th>订单</th></tr></thead><tbody>{#each detail.channels as channel}<tr><td>{channel.name}</td><td>{channel.viewerCount ?? "—"}</td><td>{money(channel.paymentAmountFen)}</td><td>{channel.orderCount ?? "—"}</td></tr>{/each}</tbody></table></article><article><h2>商品成交榜</h2><table><thead><tr><th>商品</th><th>支付金额</th><th>件数</th><th>人数</th></tr></thead><tbody>{#each detail.products as product}<tr><td title={product.productId}>{product.name}</td><td>{money(product.paymentAmountFen)}</td><td>{product.soldCount ?? "—"}</td><td>{product.buyerCount ?? "—"}</td></tr>{/each}</tbody></table></article></div>
+    <div class="tables"><article><h2>渠道分析</h2><table><thead><tr><th>渠道</th><th>观看人数</th><th>用户支付金额</th><th>订单</th></tr></thead><tbody>{#each detail.channels as channel}<tr><td>{channel.name}</td><td>{channel.viewerCount ?? "—"}</td><td>{money(channel.paymentAmountFen)}</td><td>{channel.orderCount ?? "—"}</td></tr>{/each}</tbody></table></article><article><h2>短视频引流</h2><table><thead><tr><th>短视频</th><th>观看人数</th><th>用户支付金额</th><th>订单</th></tr></thead><tbody>{#each detail.shortVideos as video}<tr><td>{video.title}</td><td>{video.viewerCount ?? "—"}</td><td>{money(video.paymentAmountFen)}</td><td>{video.orderCount ?? "—"}</td></tr>{/each}</tbody></table></article><article><h2>商品成交榜</h2><table><thead><tr><th>商品</th><th>支付金额</th><th>件数</th><th>人数</th></tr></thead><tbody>{#each detail.products as product}<tr><td title={product.productId}>{product.name}</td><td>{money(product.paymentAmountFen)}</td><td>{product.soldCount ?? "—"}</td><td>{product.buyerCount ?? "—"}</td></tr>{/each}</tbody></table></article></div>
   {:else if !loading}
     <div class="empty">暂无直播数据。请在罗盘下载官方 XLSX，软件会自动导入；也可点击“导入 XLSX”。</div>
   {/if}
