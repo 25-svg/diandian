@@ -10,6 +10,9 @@ use uuid::Uuid;
 use super::response::DouyinRoomInfoResponse;
 use std::path::Path;
 
+const DOUYIN_WEB_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
 #[derive(Debug, Clone)]
 pub struct DouyinBasicRoomInfo {
     pub room_id_str: String,
@@ -70,6 +73,16 @@ pub fn generate_user_agent_header() -> reqwest::header::HeaderMap {
     headers
 }
 
+fn build_web_room_request(room_id: &str, ms_token: &str) -> (String, reqwest::header::HeaderMap) {
+    let query = format!(
+        "aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome&browser_version=126.0.0.0&web_rid={room_id}&ms_token={ms_token}"
+    );
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("User-Agent", DOUYIN_WEB_USER_AGENT.parse().unwrap());
+    headers.insert("Referer", "https://live.douyin.com/".parse().unwrap());
+    (query, headers)
+}
+
 fn parse_web_room_info_response(
     data: DouyinRoomInfoResponse,
     sec_user_id: &str,
@@ -122,19 +135,16 @@ pub async fn get_room_info(
     room_id: &str,
     sec_user_id: &str,
 ) -> Result<DouyinBasicRoomInfo, RecorderError> {
-    let mut headers = generate_user_agent_header();
-    headers.insert("Referer", "https://live.douyin.com/".parse().unwrap());
-    headers.insert("Cookie", account.cookies.clone().parse().unwrap());
     let ms_token = generate_ms_token().await;
+    let (params, mut headers) = build_web_room_request(room_id, &ms_token);
     let user_agent = headers.get("user-agent").unwrap().to_str().unwrap();
-    let params = format!(
-            "aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=122.0.0.0&web_rid={room_id}&ms_token={ms_token}");
     let a_bogus = generate_a_bogus(&params, user_agent).await?;
+    headers.insert("Cookie", account.cookies.clone().parse().unwrap());
     // log::debug!("params: {params}");
     // log::debug!("user_agent: {user_agent}");
     // log::debug!("a_bogus: {a_bogus}");
     let url = format!(
-            "https://live.douyin.com/webcast/room/web/enter/?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=122.0.0.0&web_rid={room_id}&ms_token={ms_token}&a_bogus={a_bogus}"
+            "https://live.douyin.com/webcast/room/web/enter/?{params}&a_bogus={a_bogus}"
         );
 
     let resp = client.get(&url).headers(headers).send().await?;
@@ -448,6 +458,18 @@ mod tests {
         assert_eq!(info.room_title, "直播标题");
         assert_eq!(info.cover, None);
         assert_eq!(info.user_avatar, "");
+    }
+
+    #[test]
+    fn web_room_request_uses_one_browser_fingerprint() {
+        let (query, headers) = build_web_room_request("123", "token");
+
+        assert!(query.contains("browser_platform=Win32"));
+        assert!(query.contains("browser_version=126.0.0.0"));
+        assert!(headers["user-agent"]
+            .to_str()
+            .unwrap()
+            .contains("Windows NT"));
     }
 
     #[tokio::test]
