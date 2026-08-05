@@ -15,54 +15,74 @@ pub enum MasterScriptError {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScoreBreakdown {
-    transaction_evidence: u8,
-    improvement_over_master: u8,
+    scene_goal: u8,
+    persuasiveness: u8,
+    master_increment: u8,
     reusability: u8,
-    completeness: u8,
     factual_accuracy: u8,
-    scenario_clarity: u8,
+    natural_expression: u8,
     total: u8,
 }
 
 impl ScoreBreakdown {
-    pub fn new(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8) -> Result<Self, MasterScriptError> {
-        if a > 25 || b > 25 || c > 20 || d > 15 || e > 10 || f > 5 {
+    /// Scores a reviewed sales segment against the applicable master-script scene.
+    /// The weights measure execution quality, not wording similarity.
+    pub fn new(
+        scene_goal: u8,
+        persuasiveness: u8,
+        master_increment: u8,
+        reusability: u8,
+        factual_accuracy: u8,
+        natural_expression: u8,
+    ) -> Result<Self, MasterScriptError> {
+        if scene_goal > 30
+            || persuasiveness > 20
+            || master_increment > 20
+            || reusability > 15
+            || factual_accuracy > 10
+            || natural_expression > 5
+        {
             return Err(MasterScriptError::InvalidScore);
         }
 
         Ok(Self {
-            transaction_evidence: a,
-            improvement_over_master: b,
-            reusability: c,
-            completeness: d,
-            factual_accuracy: e,
-            scenario_clarity: f,
-            total: a + b + c + d + e + f,
+            scene_goal,
+            persuasiveness,
+            master_increment,
+            reusability,
+            factual_accuracy,
+            natural_expression,
+            total: scene_goal
+                + persuasiveness
+                + master_increment
+                + reusability
+                + factual_accuracy
+                + natural_expression,
         })
     }
 
-    pub const fn transaction_evidence(&self) -> u8 {
-        self.transaction_evidence
+    pub const fn scene_goal(&self) -> u8 {
+        self.scene_goal
     }
 
-    pub const fn improvement_over_master(&self) -> u8 {
-        self.improvement_over_master
+    pub const fn persuasiveness(&self) -> u8 {
+        self.persuasiveness
+    }
+
+    pub const fn master_increment(&self) -> u8 {
+        self.master_increment
     }
 
     pub const fn reusability(&self) -> u8 {
         self.reusability
     }
 
-    pub const fn completeness(&self) -> u8 {
-        self.completeness
-    }
-
     pub const fn factual_accuracy(&self) -> u8 {
         self.factual_accuracy
     }
 
-    pub const fn scenario_clarity(&self) -> u8 {
-        self.scenario_clarity
+    pub const fn natural_expression(&self) -> u8 {
+        self.natural_expression
     }
 
     pub fn total(&self) -> u8 {
@@ -73,12 +93,12 @@ impl ScoreBreakdown {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScoreBreakdownInput {
-    transaction_evidence: u8,
-    improvement_over_master: u8,
+    scene_goal: u8,
+    persuasiveness: u8,
+    master_increment: u8,
     reusability: u8,
-    completeness: u8,
     factual_accuracy: u8,
-    scenario_clarity: u8,
+    natural_expression: u8,
 }
 
 impl<'de> Deserialize<'de> for ScoreBreakdown {
@@ -88,12 +108,12 @@ impl<'de> Deserialize<'de> for ScoreBreakdown {
     {
         let input = ScoreBreakdownInput::deserialize(deserializer)?;
         Self::new(
-            input.transaction_evidence,
-            input.improvement_over_master,
+            input.scene_goal,
+            input.persuasiveness,
+            input.master_increment,
             input.reusability,
-            input.completeness,
             input.factual_accuracy,
-            input.scenario_clarity,
+            input.natural_expression,
         )
         .map_err(D::Error::custom)
     }
@@ -113,6 +133,8 @@ pub struct HardGateResult {
 }
 
 impl HardGateResult {
+    /// First-pass analysis may still be shown while review is pending, but the
+    /// support-script queue accepts only fully reviewed transcript evidence.
     pub fn all_pass(&self) -> bool {
         self.transcript_reviewed
             && self.master_section_matched

@@ -7,9 +7,14 @@
 
   export let showDialog = false;
   export let roomId: string | null = null;
+  export let dialogTitle = "导入外部视频";
+  export let defaultAnalysisPurpose: "enterprise_review" | "competitor_benchmark" = "enterprise_review";
+  export let showMasterImportOption = true;
+  export let titlePlaceholder = "输入视频标题";
 
   const dispatch = createEventDispatcher<{
     imported: { videoId?: number; videoIds?: number[]; asMaster?: boolean };
+    backgrounded: { fileName: string };
   }>();
   const IMPORTED_VIDEO_ROOM = "bsr:import";
 
@@ -25,6 +30,23 @@
   let importProgress = "";
   let currentImportEventId: string | null = null;
   let importAsMaster = false;
+  let analysisPurpose: "enterprise_review" | "competitor_benchmark" = defaultAnalysisPurpose;
+  let competitorName = "";
+  let masterScriptKey = "MS-BATCH-4";
+  let dialogWasOpen = false;
+
+  $: if (showDialog && !dialogWasOpen) {
+    analysisPurpose = defaultAnalysisPurpose;
+    competitorName = "";
+    importAsMaster = false;
+  }
+  $: dialogWasOpen = showDialog;
+
+  function toggleCompetitorAnalysis(event: Event) {
+    analysisPurpose = (event.currentTarget as HTMLInputElement).checked
+      ? "competitor_benchmark"
+      : "enterprise_review";
+  }
 
   // 批量导入状态
   let selectedFiles: string[] = [];
@@ -477,12 +499,19 @@
         },
       );
 
-      const importedVideo = await invoke<{ id: number }>("import_external_video", {
+      const importRequest = invoke<{ id: number }>("import_external_video", {
         eventId: eventId,
         filePath: selectedFilePath,
         title: videoTitle,
         roomId: roomId || IMPORTED_VIDEO_ROOM,
+        analysisPurpose,
+        competitorName: analysisPurpose === "competitor_benchmark" ? competitorName.trim() : "",
+        masterScriptKey: masterScriptKey.trim(),
       });
+      dispatch("backgrounded", { fileName: selectedFileName || videoTitle });
+      showDialog = false;
+
+      const importedVideo = await importRequest;
       dispatch("imported", {
         videoId: importedVideo.id,
         videoIds: [importedVideo.id],
@@ -503,12 +532,18 @@
    */
   function closeDialog() {
     showDialog = false;
+    // A started import owns its request/listeners until it finishes. Hiding the
+    // modal must not cancel or reset that work; it continues in background.
+    if (importing || batchImporting) return;
     // 重置单文件导入状态
     selectedFilePath = null;
     selectedFileName = "";
     selectedFileSize = 0;
     videoTitle = "";
     importAsMaster = false;
+    analysisPurpose = defaultAnalysisPurpose;
+    competitorName = "";
+    masterScriptKey = "MS-BATCH-4";
     uploading = false;
     uploadProgress = 0;
     importing = false;
@@ -553,7 +588,7 @@
         <div class="p-6 space-y-4">
           <div class="flex justify-between items-center">
             <h3 class="text-lg font-medium text-gray-900 dark:text-white">
-              导入外部视频
+              {dialogTitle}
             </h3>
             <button
               on:click={closeDialog}
@@ -700,9 +735,10 @@
                   type="text"
                   bind:value={videoTitle}
                   class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
-                  placeholder="输入视频标题"
+                  placeholder={titlePlaceholder}
                 />
               </div>
+              {#if showMasterImportOption}
               <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-600 dark:bg-gray-700">
                 <input type="checkbox" bind:checked={importAsMaster} class="mt-0.5 h-4 w-4 accent-blue-600" />
                 <span>
@@ -710,6 +746,17 @@
                   <small class="mt-1 block text-xs leading-5 text-gray-500 dark:text-gray-400">适合包含多个商品的完整直播；系统会先生成逐字稿，再按商品整理并等待你发布。</small>
                 </span>
               </label>
+              {/if}
+              <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-600 dark:bg-gray-700">
+                <input type="checkbox" checked={analysisPurpose === "competitor_benchmark"} on:change={toggleCompetitorAnalysis} class="mt-0.5 h-4 w-4 accent-blue-600" />
+                <span>
+                  <strong class="block text-sm font-medium text-gray-800 dark:text-gray-100">竞品录播（无订单/罗盘数据）</strong>
+                  <small class="mt-1 block text-xs leading-5 text-gray-500 dark:text-gray-400">仅对照企业母稿并进入竞品案例库，不能升级企业母稿。</small>
+                </span>
+              </label>
+              {#if analysisPurpose === "competitor_benchmark"}
+                <input bind:value={competitorName} class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" placeholder="竞品名称（例如：XX 相机店）" />
+              {/if}
             </div>
           {/if}
         </div>

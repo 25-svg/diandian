@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { get, invoke } from "../lib/invoker";
+  import { get, invoke, invokeSensitive } from "../lib/invoker";
   import { scale, fade } from "svelte/transition";
   import { Textarea } from "flowbite-svelte";
   import QRCode from "qrcode";
   import type { AccountItem, AccountInfo } from "../lib/db";
   import { Ellipsis, Plus } from "lucide-svelte";
+  import PageShell from "../lib/components/PageShell.svelte";
 
   let account_info: AccountInfo = {
     accounts: [],
@@ -206,40 +207,27 @@
   on:mousedown={handleModalClickOutside}
 />
 
-<div
-  class="flex-1 p-6 overflow-auto custom-scrollbar-light bg-gray-50 dark:bg-black"
->
-  <div class="space-y-6">
-    <!-- Header -->
-    <div class="flex justify-between items-center">
-      <div class="flex items-center space-x-4">
-        <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">
-          账号
-        </h1>
-        <div
-          class="flex items-center space-x-2 text-sm text-gray-500 dark:text-gray-400"
-        >
-          <span> 共 {account_info.accounts.length} 个</span>
-        </div>
-      </div>
-      <button
-        on:click={() => {
-          addModal = true;
-          activeTab = "qr";
-        }}
-        class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center space-x-2"
-      >
-        <Plus class="w-5 h-5 icon-white" />
-        <span>添加账号</span>
-      </button>
-    </div>
+<PageShell title="账号" subtitle={`共 ${account_info.accounts.length} 个账号`}>
+  <div slot="actions">
+    <button
+      type="button"
+      class="mac-btn mac-btn-primary"
+      on:click={() => {
+        addModal = true;
+        activeTab = "qr";
+      }}
+    >
+      <Plus class="w-4 h-4" />
+      <span>添加账号</span>
+    </button>
+  </div>
 
     <!-- Account List -->
-    <div class="space-y-4">
+    <div class="space-y-3">
       <!-- Online Account -->
       {#each account_info.accounts as account (account.uid)}
         <div
-          class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+          class="mac-card p-4 hover:border-[color:var(--mac-blue)] transition-colors"
         >
           <div class="flex items-center justify-between">
             <div class="flex items-center space-x-4">
@@ -295,12 +283,25 @@
                     <button
                       class="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-[#e5e5e5] dark:hover:bg-[#3a3a3c] rounded-t-lg rounded-b-lg"
                       on:click={async () => {
-                        await invoke("remove_account", {
-                          platform: account.platform,
-                          uid: account.uid,
-                        });
-                        await update_accounts();
-                        activeDropdown = null;
+                        if (
+                          !window.confirm(
+                            `确定注销账号「${account.name || account.uid}」吗？`
+                          )
+                        ) {
+                          activeDropdown = null;
+                          return;
+                        }
+                        try {
+                          await invokeSensitive("remove_account", {
+                            platform: account.platform,
+                            uid: account.uid,
+                          });
+                          await update_accounts();
+                          activeDropdown = null;
+                        } catch (error) {
+                          alert(`注销账号失败：${error}`);
+                          activeDropdown = null;
+                        }
                       }}
                     >
                       注销账号
@@ -315,31 +316,25 @@
 
       <!-- Add Account Card -->
       <button
-        class="w-full p-4 rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+        type="button"
+        class="w-full p-4 rounded-[14px] border-2 border-dashed border-[color:var(--mac-separator-strong)] hover:border-[color:var(--mac-blue)] transition-colors"
         on:click={() => {
           addModal = true;
           activeTab = "qr";
         }}
       >
         <div class="flex flex-col items-center justify-center space-y-2">
-          <div
-            class="w-12 h-12 rounded-full bg-blue-500/10 flex items-center justify-center"
-          >
+          <div class="w-12 h-12 rounded-full bg-[color:var(--mac-blue-soft)] flex items-center justify-center">
             <Plus class="w-6 h-6 icon-primary" />
           </div>
           <div class="text-center">
-            <p class="text-sm font-medium text-blue-600 dark:text-blue-400">
-              添加新账号
-            </p>
-            <p class="text-xs text-gray-500 dark:text-gray-400">
-              添加一个新账号，用于获取直播流和投稿
-            </p>
+            <p class="text-sm font-medium text-[color:var(--mac-blue)]">添加新账号</p>
+            <p class="text-xs text-[color:var(--mac-tertiary)]">添加一个新账号，用于获取直播流和投稿</p>
           </div>
         </div>
       </button>
     </div>
-  </div>
-</div>
+</PageShell>
 
 {#if addModal}
   <div

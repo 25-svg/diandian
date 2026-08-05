@@ -32,27 +32,32 @@
     gap: 10px;
     padding: 0 11px;
     border: 0;
-    border-radius: 11px;
-    color: #4a4a4f;
+    border-radius: var(--mac-radius-md);
+    color: var(--mac-secondary);
     background: transparent;
     cursor: pointer;
     font-size: 13px;
     font-weight: 520;
     text-align: left;
-    transition: background .18s ease, color .18s ease, transform .18s ease, box-shadow .18s ease;
+    transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
   }
-  .sidebar-item:hover { color: #1d1d1f; background: rgba(0,0,0,.045); }
-  .sidebar-item:active { transform: scale(.985); }
+  .sidebar-item:hover { color: var(--mac-label); background: var(--mac-fill); }
+  .sidebar-item:active { transform: scale(0.985); }
   .sidebar-item.active {
-    color: #005fc7;
-    background: rgba(255,255,255,.9);
-    box-shadow: 0 5px 14px rgba(33,48,70,.08), inset 0 0 0 1px rgba(255,255,255,.75);
+    color: var(--mac-blue);
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 5px 14px rgba(33, 48, 70, 0.08), inset 0 0 0 1px rgba(255, 255, 255, 0.75);
   }
-  .item-icon { width: 20px; height: 20px; display: grid; place-items: center; color: #6e6e73; }
-  .sidebar-item.active .item-icon { color: #0071e3; }
-  .update-dot { position: absolute; right: 11px; width: 6px; height: 6px; border-radius: 50%; background: #ff453a; }
-  :global(.dark) .sidebar-item { color: #d1d1d6; }
-  :global(.dark) .sidebar-item:hover { color: white; background: rgba(255,255,255,.07); }
-  :global(.dark) .sidebar-item.active { color: white; background: rgba(255,255,255,.12); box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
-  :global(.dark) .item-icon, :global(.dark) .sidebar-item.active .item-icon { color: #64b5ff; }
+  .item-icon { width: 20px; height: 20px; display: grid; place-items: center; color: var(--mac-tertiary); }
+  .sidebar-item.active .item-icon { color: var(--mac-blue); }
+  .update-dot { position: absolute; right: 11px; width: 6px; height: 6px; border-radius: 50%; background: var(--mac-red); }
+  :global(.dark) .sidebar-item { color: var(--mac-secondary); }
+  :global(.dark) .sidebar-item:hover { color: var(--mac-label); background: var(--mac-fill); }
+  :global(.dark) .sidebar-item.active {
+    color: var(--mac-label);
+    background: rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  }
+  :global(.dark) .item-icon,
+  :global(.dark) .sidebar-item.active .item-icon { color: var(--mac-blue); }
 </style>

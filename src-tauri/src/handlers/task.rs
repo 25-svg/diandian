@@ -22,7 +22,7 @@ pub async fn delete_task(
     trace_id: Option<String>,
 ) -> Result<(), String> {
     let audit = require_sensitive_write(
-        "delete_background_task",
+        "delete_task",
         &idempotency_key,
         &confirmation_token,
         trace_id.as_deref(),

@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 pub mod account;
 pub mod knowledge;
 pub mod live_dashboard;
+pub mod live_dashboard_binding;
 pub mod master_sample_batch;
 pub mod master_script;
 pub mod message;
@@ -59,5 +60,27 @@ impl Database {
     /// db *must* be set in tauri setup
     pub async fn set(&self, p: Pool<Sqlite>) {
         *self.db.write().await = Some(p);
+    }
+
+    /// Configure the shared SQLite pool for desktop use. WAL keeps readers from
+    /// blocking a short write, while a bounded busy timeout turns contention
+    /// into a wait instead of an immediate `database is locked` failure.
+    pub async fn configure_sqlite_runtime(&self) -> Result<(), DatabaseError> {
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 10000")
+            .execute(&pool)
+            .await?;
+        Ok(())
     }
 }

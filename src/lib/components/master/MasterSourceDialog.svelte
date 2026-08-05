@@ -3,7 +3,7 @@
   import { Check, Loader2, X } from "lucide-svelte";
   import MasterBuildProgress from "./MasterBuildProgress.svelte";
   import MasterPreviewPanel from "./MasterPreview.svelte";
-  import { previewMasterScript, publishMasterScript, startMasterIngest, type MasterPreview } from "../../masterScript";
+  import { friendlyMasterError, previewMasterScript, publishMasterScript, startMasterIngest, type MasterPreview } from "../../masterScript";
   export let videoId: number;
   export let videoTitle: string;
   const dispatch = createEventDispatcher();
@@ -16,6 +16,10 @@
   let busy = true;
   let structuring = false;
   let scriptKey = `MS-${new Date().toISOString().slice(0,10).replaceAll("-", "")}`;
+  const explainError = (reason: unknown) => {
+    const friendly = friendlyMasterError(reason);
+    return `${friendly.title}：${friendly.detail} ${friendly.nextAction}`;
+  };
 
   async function build(): Promise<void> {
     busy = true; structuring = false; failed = false; error = "";
@@ -23,10 +27,10 @@
       const result = await startMasterIngest({ videoId, title: videoTitle });
       sourceId = result.sourceId; completed = result.status.completed; total = result.status.total;
       failed = result.status.status === "failed";
-      if (failed) { error = result.status.error || "转写中断"; return; }
+      if (failed) { error = explainError(result.status.error || "转写中断"); return; }
       structuring = true;
       preview = await previewMasterScript(sourceId, scriptKey, videoTitle);
-    } catch (reason: any) { failed = true; error = reason?.message || String(reason); }
+    } catch (reason: any) { failed = true; error = explainError(reason); }
     finally { busy = false; structuring = false; }
   }
 
@@ -34,7 +38,7 @@
     if (!preview?.validation.publishable || busy) return;
     busy = true; error = "";
     try { const master = await publishMasterScript(sourceId, scriptKey, preview.draft); dispatch("published", { sourceId, scriptKey, masterScriptId: master.id }); }
-    catch (reason: any) { error = reason?.message || String(reason); }
+    catch (reason: any) { error = explainError(reason); }
     finally { busy = false; }
   }
   onMount(build);

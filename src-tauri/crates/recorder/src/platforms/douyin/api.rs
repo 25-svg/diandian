@@ -13,6 +13,39 @@ use std::path::Path;
 const DOUYIN_WEB_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H5Failure {
+    InvalidRequest,
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct H5RecoveryAttempts {
+    request_count: usize,
+    sec_uid_refresh_count: usize,
+}
+
+fn h5_recovery_attempts(failures: &[H5Failure]) -> H5RecoveryAttempts {
+    let mut attempts = H5RecoveryAttempts {
+        request_count: 1,
+        sec_uid_refresh_count: 0,
+    };
+
+    for failure in failures {
+        if *failure != H5Failure::InvalidRequest || attempts.sec_uid_refresh_count == 1 {
+            break;
+        }
+        attempts.sec_uid_refresh_count = 1;
+        attempts.request_count = 2;
+    }
+
+    attempts
+}
+
+fn is_identity_error(error: &RecorderError) -> bool {
+    matches!(error, RecorderError::ApiError { error } if error.contains("Request params error"))
+}
+
 #[derive(Debug, Clone)]
 pub struct DouyinBasicRoomInfo {
     pub room_id_str: String,
@@ -154,7 +187,7 @@ pub async fn get_room_info(
 
     if text.is_empty() {
         log::debug!("Empty room info response, trying H5 API");
-        return get_room_info_h5(client, account, room_id, sec_user_id).await;
+        return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await;
     }
 
     if status.is_success() {
@@ -163,16 +196,40 @@ pub async fn get_room_info(
                 Ok(info) => return Ok(info),
                 Err(e) => {
                     log::warn!("Invalid douyin room info response: {e}; trying H5 API");
-                    return get_room_info_h5(client, account, room_id, sec_user_id).await;
+                    return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await;
                 }
             }
         }
         log::error!("Failed to parse room info response: {text}");
-        return get_room_info_h5(client, account, room_id, sec_user_id).await;
+        return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await;
     }
 
     log::error!("Failed to get room info: {status}");
-    return get_room_info_h5(client, account, room_id, sec_user_id).await;
+    get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await
+}
+
+async fn get_room_info_h5_with_identity_recovery(
+    client: &Client,
+    account: &Account,
+    room_id: &str,
+    sec_user_id: &str,
+) -> Result<DouyinBasicRoomInfo, RecorderError> {
+    match get_room_info_h5(client, account, room_id, sec_user_id).await {
+        Ok(info) => Ok(info),
+        Err(error) => {
+            let failure = if is_identity_error(&error) {
+                H5Failure::InvalidRequest
+            } else {
+                H5Failure::Other
+            };
+            if h5_recovery_attempts(&[failure]).sec_uid_refresh_count == 1 {
+                let refreshed_sec_user_id = get_room_owner_sec_uid(client, room_id).await?;
+                get_room_info_h5(client, account, room_id, &refreshed_sec_user_id).await
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 pub async fn get_room_info_h5(
@@ -401,8 +458,15 @@ pub async fn get_room_owner_sec_uid(
 
 /// Download file from url to path
 pub async fn download_file(client: &Client, url: &str, path: &Path) -> Result<(), RecorderError> {
-    if !path.parent().unwrap().exists() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if url.trim().is_empty() {
+        return Err(RecorderError::ApiError {
+            error: "Empty download url".to_string(),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
     }
     let response = client.get(url).send().await?;
     let bytes = response.bytes().await?;
@@ -470,6 +534,17 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("Windows NT"));
+    }
+
+    #[test]
+    fn h5_identity_recovery_refreshes_once() {
+        let attempts = h5_recovery_attempts(&[
+            H5Failure::InvalidRequest,
+            H5Failure::InvalidRequest,
+        ]);
+
+        assert_eq!(attempts.request_count, 2);
+        assert_eq!(attempts.sec_uid_refresh_count, 1);
     }
 
     #[tokio::test]

@@ -80,6 +80,53 @@ CREATE TABLE support_script_candidates (
 );
 "#;
 
+pub const MASTER_UPGRADE_REVIEW_MIGRATION_SQL: &str = r#"
+CREATE TABLE master_upgrade_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  review_key TEXT NOT NULL UNIQUE,
+  master_script_id INTEGER NOT NULL REFERENCES master_scripts(id),
+  master_section_id INTEGER NOT NULL REFERENCES master_sections(id),
+  source_key TEXT NOT NULL,
+  source_start_ms INTEGER NOT NULL,
+  source_end_ms INTEGER NOT NULL,
+  transcript_hash TEXT NOT NULL,
+  candidate_json TEXT NOT NULL,
+  prompt_two_json TEXT NOT NULL,
+  master_section_json TEXT NOT NULL,
+  comparison_decision TEXT CHECK(comparison_decision IS NULL OR comparison_decision IN (
+    'add_as_support','add_as_golden_sentence','replace_existing',
+    'merge_with_existing','duplicate','reject'
+  )),
+  review_json TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK(status IN ('pending','complete','failed')),
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"#;
+
+pub const COMPETITOR_REFERENCE_CANDIDATES_MIGRATION_SQL: &str = r#"
+CREATE TABLE competitor_reference_candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_key TEXT NOT NULL UNIQUE,
+  master_script_id INTEGER NOT NULL REFERENCES master_scripts(id),
+  master_section_id INTEGER NOT NULL REFERENCES master_sections(id),
+  source_key TEXT NOT NULL,
+  competitor_name TEXT NOT NULL DEFAULT '',
+  source_start_ms INTEGER NOT NULL,
+  source_end_ms INTEGER NOT NULL,
+  transcript_hash TEXT NOT NULL,
+  host_text TEXT NOT NULL,
+  comparison_json TEXT NOT NULL,
+  migration_decision TEXT NOT NULL CHECK(migration_decision IN ('migratable_structure','better_phrasing','reference_only','not_applicable')),
+  total_score INTEGER NOT NULL CHECK(total_score BETWEEN 0 AND 100),
+  status TEXT NOT NULL CHECK(status IN ('pending','approved_reference','rejected','merged_to_case_study')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at TEXT,
+  UNIQUE(master_script_id, master_section_id, source_key, source_start_ms, source_end_ms, transcript_hash)
+);
+"#;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("invalid master script state: {0}")]
@@ -156,6 +203,38 @@ pub struct NewSupportCandidate {
     pub admission: CandidateAdmission,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewCompetitorReferenceCandidate {
+    pub candidate_key: String,
+    pub master_script_id: i64,
+    pub master_section_id: i64,
+    pub source_key: String,
+    pub competitor_name: String,
+    pub source_start_ms: i64,
+    pub source_end_ms: i64,
+    pub transcript_hash: String,
+    pub host_text: String,
+    pub comparison_json: String,
+    pub migration_decision: String,
+    pub total_score: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewMasterUpgradeReview {
+    pub review_key: String,
+    pub master_script_id: i64,
+    pub master_section_id: i64,
+    pub source_key: String,
+    pub source_start_ms: i64,
+    pub source_end_ms: i64,
+    pub transcript_hash: String,
+    pub candidate_json: String,
+    pub prompt_two_json: String,
+    pub master_section_json: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterSourceRow {
@@ -201,7 +280,7 @@ pub struct MasterScriptRow {
     pub published_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterSectionRow {
     pub id: i64,
@@ -238,6 +317,168 @@ pub struct SupportCandidateRow {
     pub status: String,
     pub created_at: String,
     pub decided_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct CompetitorReferenceCandidateRow {
+    pub id: i64,
+    pub candidate_key: String,
+    pub master_script_id: i64,
+    pub master_section_id: i64,
+    pub source_key: String,
+    pub competitor_name: String,
+    pub source_start_ms: i64,
+    pub source_end_ms: i64,
+    pub transcript_hash: String,
+    pub host_text: String,
+    pub comparison_json: String,
+    pub migration_decision: String,
+    pub total_score: i64,
+    pub status: String,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterUpgradeReviewRow {
+    pub id: i64,
+    pub review_key: String,
+    pub master_script_id: i64,
+    pub master_section_id: i64,
+    pub source_key: String,
+    pub source_start_ms: i64,
+    pub source_end_ms: i64,
+    pub transcript_hash: String,
+    pub candidate_json: String,
+    pub prompt_two_json: String,
+    pub master_section_json: String,
+    pub comparison_decision: Option<String>,
+    pub review_json: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub async fn create_or_get_master_upgrade_review(
+    pool: &SqlitePool,
+    input: &NewMasterUpgradeReview,
+) -> Result<MasterUpgradeReviewRow, StoreError> {
+    let inserted = sqlx::query_as::<_, MasterUpgradeReviewRow>(
+        "INSERT INTO master_upgrade_reviews (
+           review_key, master_script_id, master_section_id, source_key,
+           source_start_ms, source_end_ms, transcript_hash, candidate_json,
+           prompt_two_json, master_section_json, status
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
+         ON CONFLICT(review_key) DO NOTHING RETURNING *",
+    )
+    .bind(&input.review_key)
+    .bind(input.master_script_id)
+    .bind(input.master_section_id)
+    .bind(&input.source_key)
+    .bind(input.source_start_ms)
+    .bind(input.source_end_ms)
+    .bind(&input.transcript_hash)
+    .bind(&input.candidate_json)
+    .bind(&input.prompt_two_json)
+    .bind(&input.master_section_json)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(row) = inserted {
+        return Ok(row);
+    }
+    let existing = sqlx::query_as::<_, MasterUpgradeReviewRow>(
+        "SELECT * FROM master_upgrade_reviews WHERE review_key = $1",
+    )
+    .bind(&input.review_key)
+    .fetch_one(pool)
+    .await?;
+    if same_upgrade_review_input(&existing, input) {
+        Ok(existing)
+    } else {
+        Err(invalid_state("母稿升级比较编号已绑定到不同的不可变输入"))
+    }
+}
+
+pub async fn get_master_upgrade_review(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<MasterUpgradeReviewRow, StoreError> {
+    sqlx::query_as::<_, MasterUpgradeReviewRow>(
+        "SELECT * FROM master_upgrade_reviews WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
+pub async fn complete_master_upgrade_review(
+    pool: &SqlitePool,
+    id: i64,
+    comparison_decision: &str,
+    review_json: &str,
+) -> Result<MasterUpgradeReviewRow, StoreError> {
+    let current = get_master_upgrade_review(pool, id).await?;
+    if current.status == "complete" {
+        return if current.comparison_decision.as_deref() == Some(comparison_decision)
+            && current.review_json == review_json
+        {
+            Ok(current)
+        } else {
+            Err(invalid_state("已完成的母稿升级比较不可修改"))
+        };
+    }
+    sqlx::query_as::<_, MasterUpgradeReviewRow>(
+        "UPDATE master_upgrade_reviews
+         SET comparison_decision=$1, review_json=$2, status='complete',
+             error=NULL, updated_at=datetime('now')
+         WHERE id=$3 AND status IN ('pending','failed') RETURNING *",
+    )
+    .bind(comparison_decision)
+    .bind(review_json)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
+pub async fn fail_master_upgrade_review(
+    pool: &SqlitePool,
+    id: i64,
+    error: &str,
+) -> Result<MasterUpgradeReviewRow, StoreError> {
+    let current = get_master_upgrade_review(pool, id).await?;
+    if current.status == "complete" {
+        return Err(invalid_state("已完成的母稿升级比较不可标记失败"));
+    }
+    sqlx::query_as::<_, MasterUpgradeReviewRow>(
+        "UPDATE master_upgrade_reviews
+         SET status='failed', error=$1, updated_at=datetime('now')
+         WHERE id=$2 AND status IN ('pending','failed') RETURNING *",
+    )
+    .bind(error)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
+fn same_upgrade_review_input(
+    existing: &MasterUpgradeReviewRow,
+    input: &NewMasterUpgradeReview,
+) -> bool {
+    existing.master_script_id == input.master_script_id
+        && existing.master_section_id == input.master_section_id
+        && existing.source_key == input.source_key
+        && existing.source_start_ms == input.source_start_ms
+        && existing.source_end_ms == input.source_end_ms
+        && existing.transcript_hash == input.transcript_hash
+        && existing.candidate_json == input.candidate_json
+        && existing.prompt_two_json == input.prompt_two_json
+        && existing.master_section_json == input.master_section_json
 }
 
 pub async fn create_master_source(
@@ -577,6 +818,73 @@ pub async fn decide_support_candidate(
     .ok_or_else(|| invalid_state(format!("candidate {id} is not {required_status}")))
 }
 
+pub async fn insert_competitor_reference_candidate(
+    pool: &SqlitePool,
+    input: &NewCompetitorReferenceCandidate,
+) -> Result<CompetitorReferenceCandidateRow, StoreError> {
+    if !matches!(
+        input.migration_decision.as_str(),
+        "migratable_structure" | "better_phrasing" | "reference_only" | "not_applicable"
+    ) {
+        return Err(invalid_state("invalid competitor migration decision"));
+    }
+    let row = sqlx::query_as::<_, CompetitorReferenceCandidateRow>(
+        "INSERT INTO competitor_reference_candidates (candidate_key, master_script_id, master_section_id, source_key, competitor_name, source_start_ms, source_end_ms, transcript_hash, host_text, comparison_json, migration_decision, total_score, status) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending') \
+         ON CONFLICT DO NOTHING RETURNING *",
+    )
+    .bind(&input.candidate_key).bind(input.master_script_id).bind(input.master_section_id)
+    .bind(&input.source_key).bind(&input.competitor_name).bind(input.source_start_ms)
+    .bind(input.source_end_ms).bind(&input.transcript_hash).bind(&input.host_text)
+    .bind(&input.comparison_json).bind(&input.migration_decision).bind(input.total_score)
+    .fetch_optional(pool).await?;
+    if let Some(row) = row {
+        return Ok(row);
+    }
+    sqlx::query_as::<_, CompetitorReferenceCandidateRow>(
+        "SELECT * FROM competitor_reference_candidates WHERE candidate_key = $1",
+    )
+    .bind(&input.candidate_key)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
+pub async fn list_competitor_reference_candidates(
+    pool: &SqlitePool,
+    status: Option<&str>,
+) -> Result<Vec<CompetitorReferenceCandidateRow>, StoreError> {
+    match status {
+        Some(status) => Ok(sqlx::query_as::<_, CompetitorReferenceCandidateRow>(
+            "SELECT * FROM competitor_reference_candidates WHERE status = $1 ORDER BY id DESC",
+        )
+        .bind(status)
+        .fetch_all(pool)
+        .await?),
+        None => Ok(sqlx::query_as::<_, CompetitorReferenceCandidateRow>(
+            "SELECT * FROM competitor_reference_candidates ORDER BY id DESC",
+        )
+        .fetch_all(pool)
+        .await?),
+    }
+}
+
+pub async fn decide_competitor_reference_candidate(
+    pool: &SqlitePool,
+    id: i64,
+    next_status: &str,
+) -> Result<CompetitorReferenceCandidateRow, StoreError> {
+    let expected = match next_status {
+        "approved_reference" | "rejected" => "pending",
+        "merged_to_case_study" => "approved_reference",
+        _ => return Err(invalid_state("invalid competitor reference transition")),
+    };
+    sqlx::query_as::<_, CompetitorReferenceCandidateRow>(
+        "UPDATE competitor_reference_candidates SET status = $1, decided_at = datetime('now') WHERE id = $2 AND status = $3 RETURNING *",
+    ).bind(next_status).bind(id).bind(expected).fetch_optional(pool).await?
+        .ok_or_else(|| invalid_state(format!("competitor reference {id} is not {expected}")))
+}
+
 fn same_candidate_payload(
     existing: &SupportCandidateRow,
     input: &NewSupportCandidate,
@@ -634,6 +942,9 @@ mod master_script_store_tests {
             .await
             .unwrap();
         pool.execute(MASTER_SCRIPT_MIGRATION_SQL).await.unwrap();
+        pool.execute(MASTER_UPGRADE_REVIEW_MIGRATION_SQL)
+            .await
+            .unwrap();
         pool
     }
 
@@ -650,6 +961,9 @@ mod master_script_store_tests {
             .await
             .unwrap();
         pool.execute(MASTER_SCRIPT_MIGRATION_SQL).await.unwrap();
+        pool.execute(MASTER_UPGRADE_REVIEW_MIGRATION_SQL)
+            .await
+            .unwrap();
         pool
     }
 
@@ -735,6 +1049,104 @@ mod master_script_store_tests {
             score_json: serde_json::to_string(&score).unwrap(),
             admission: CandidateAdmission::CandidateQueue,
         }
+    }
+
+    fn upgrade_review_input(
+        master_script_id: i64,
+        master_section_id: i64,
+    ) -> NewMasterUpgradeReview {
+        NewMasterUpgradeReview {
+            review_key: "upgrade-review-1".into(),
+            master_script_id,
+            master_section_id,
+            source_key: "video:7".into(),
+            source_start_ms: 500,
+            source_end_ms: 4_000,
+            transcript_hash: "transcript-hash".into(),
+            candidate_json: r#"{"segmentId":"SEG-001"}"#.into(),
+            prompt_two_json: r#"{"decision":"support_candidate"}"#.into(),
+            master_section_json: r#"{"sectionId":1}"#.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn master_upgrade_review_is_idempotent_and_complete_is_immutable() {
+        let (pool, master, section) = seeded_master().await;
+        let input = upgrade_review_input(master.id, section.id);
+        let first = create_or_get_master_upgrade_review(&pool, &input)
+            .await
+            .unwrap();
+        let retry = create_or_get_master_upgrade_review(&pool, &input)
+            .await
+            .unwrap();
+        assert_eq!(first.id, retry.id);
+        assert_eq!(first.status, "pending");
+
+        let complete = complete_master_upgrade_review(
+            &pool,
+            first.id,
+            "add_as_support",
+            r#"{"comparisonDecision":"add_as_support"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete.status, "complete");
+        assert_eq!(
+            complete.comparison_decision.as_deref(),
+            Some("add_as_support")
+        );
+
+        assert!(complete_master_upgrade_review(
+            &pool,
+            first.id,
+            "reject",
+            r#"{"comparisonDecision":"reject"}"#,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_master_upgrade_review_can_be_retried_without_recreating_it() {
+        let (pool, master, section) = seeded_master().await;
+        let input = upgrade_review_input(master.id, section.id);
+        let pending = create_or_get_master_upgrade_review(&pool, &input)
+            .await
+            .unwrap();
+        let failed = fail_master_upgrade_review(&pool, pending.id, "network unavailable")
+            .await
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+
+        let same = create_or_get_master_upgrade_review(&pool, &input)
+            .await
+            .unwrap();
+        assert_eq!(same.id, pending.id);
+        let complete = complete_master_upgrade_review(
+            &pool,
+            same.id,
+            "merge_with_existing",
+            r#"{"comparisonDecision":"merge_with_existing"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete.status, "complete");
+        assert!(complete.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn master_upgrade_review_rejects_conflicting_immutable_payload() {
+        let (pool, master, section) = seeded_master().await;
+        let input = upgrade_review_input(master.id, section.id);
+        create_or_get_master_upgrade_review(&pool, &input)
+            .await
+            .unwrap();
+        let mut conflict = input;
+        conflict.candidate_json = r#"{"segmentId":"SEG-OTHER"}"#.into();
+        assert!(matches!(
+            create_or_get_master_upgrade_review(&pool, &conflict).await,
+            Err(StoreError::InvalidMasterScriptState(_))
+        ));
     }
 
     #[tokio::test]

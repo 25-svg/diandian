@@ -220,6 +220,7 @@ async fn ensure_service(client: &Client) -> Result<(), String> {
         .try_clone()
         .map_err(|e| format!("Failed to clone FunASR startup log handle: {e}"))?;
     let mut command = Command::new(program);
+    configure_bundled_environment(&mut command, &working_dir);
     command
         .args(args)
         .current_dir(working_dir)
@@ -238,8 +239,38 @@ async fn ensure_service(client: &Client) -> Result<(), String> {
     wait_until_ready(client, child_guard.as_mut()).await
 }
 
+fn configure_bundled_environment(command: &mut Command, runtime_dir: &Path) {
+    let model_root = runtime_dir.join("models");
+    let asr_model = model_root
+        .join("iic--speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch");
+    let vad_model =
+        model_root.join("iic--speech_fsmn_vad_zh-cn-16k-common-pytorch");
+    if asr_model.is_dir() {
+        command.env("BSR_FUNASR_ASR_MODEL", asr_model);
+    }
+    if vad_model.is_dir() {
+        command.env("BSR_FUNASR_VAD_MODEL", vad_model);
+    }
+
+    // The offline package keeps ffmpeg.exe beside the desktop executable and
+    // FunASR under app/funasr-runtime. Make the bundled media tools visible to
+    // Python without requiring a system PATH change on the target computer.
+    if let Some(app_dir) = runtime_dir.parent() {
+        let mut paths = vec![app_dir.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(value) = std::env::join_paths(paths) {
+            command.env("PATH", value);
+        }
+    }
+}
+
 async fn wait_until_ready(client: &Client, mut child: Option<&mut Child>) -> Result<(), String> {
-    for _ in 0..150 {
+    // A cold Windows start may spend several minutes importing PyTorch while
+    // antivirus scans the environment. Keep the UI task alive and report the
+    // actual startup failure instead of falling back during a healthy load.
+    for _ in 0..300 {
         if service_healthy(client).await {
             return Ok(());
         }
@@ -254,7 +285,7 @@ async fn wait_until_ready(client: &Client, mut child: Option<&mut Child>) -> Res
         sleep(Duration::from_secs(1)).await;
     }
     Err(format!(
-        "FunASR service did not become ready within 150 seconds. {}",
+        "FunASR service did not become ready within 300 seconds. {}",
         read_service_log_tail()
     ))
 }

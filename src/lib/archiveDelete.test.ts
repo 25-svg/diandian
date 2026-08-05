@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { groupArchivesForDeletion } from "./archiveDelete.js";
+import {
+  chunkArchiveDeleteGroups,
+  groupArchivesForDeletion,
+} from "./archiveDelete.js";
 
 const groups = groupArchivesForDeletion(
   [
@@ -14,5 +17,14 @@ assert.deepEqual(groups, [
   { platform: "bilibili", roomId: "100", liveIds: ["a", "b"] },
   { platform: "douyin", roomId: "200", liveIds: ["c"] },
 ]);
+
+const chunked = chunkArchiveDeleteGroups(
+  [{ platform: "douyin", roomId: "1", liveIds: Array.from({ length: 45 }, (_, i) => `id-${i}`) }],
+  20
+);
+assert.equal(chunked.length, 3);
+assert.equal(chunked[0]?.liveIds.length, 20);
+assert.equal(chunked[1]?.liveIds.length, 20);
+assert.equal(chunked[2]?.liveIds.length, 5);
 
 console.log("archive delete grouping tests passed");

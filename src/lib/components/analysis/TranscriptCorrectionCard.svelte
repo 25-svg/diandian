@@ -68,13 +68,23 @@
   </section>
 
   <section>
-    <label for={`correction-${correction.id}`}>建议改成</label>
-    <textarea
-      id={`correction-${correction.id}`}
-      bind:value={editedText}
-      disabled={submitting || disabled || correction.decision !== "pending"}
-      rows="3"
-    />
+    <label for={`correction-${correction.id}`}>
+      {correction.decision === "pending"
+        ? "建议改成"
+        : correction.decision === "approved"
+          ? "已采用的最终文本"
+          : "已保留的原文"}
+    </label>
+    {#if correction.decision === "pending"}
+      <textarea
+        id={`correction-${correction.id}`}
+        bind:value={editedText}
+        disabled={submitting || disabled}
+        rows="3"
+      />
+    {:else}
+      <p class="resolved-text">{correction.decidedText || correction.original}</p>
+    {/if}
   </section>
 
   <p class="business-reason">{correctionBusinessReason(correction.category)}</p>
@@ -100,8 +110,10 @@
     </div>
   {:else}
     <div class="resolved-line">
-      <Check size={15} />这条已经处理，可以查看上一条或下一条。
+      <Check size={15} />
+      <span>这条已经处理并锁定，不会重复提交修改。</span>
     </div>
+    <p class="resolved-guidance">如需改动，请重新打开校对并重新分析关联片段，避免逐字稿与片段结论不一致。</p>
   {/if}
 
   {#if errorMessage}<p class="inline-error" role="alert">{errorMessage}</p>{/if}
@@ -127,6 +139,7 @@
   .original-text { margin: 0; padding: 10px 11px; border-left: 3px solid #98a2b3; background: #f7f8fa; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
   textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 76px; padding: 9px 10px; border: 1px solid #cfd6e1; border-radius: 7px; color: #1d2939; background: white; font: inherit; font-size: 13px; line-height: 1.55; outline: none; }
   textarea:focus { border-color: #1687f8; box-shadow: 0 0 0 3px rgba(22,135,248,.12); }
+  .resolved-text { min-height: 42px; margin: 0; padding: 10px 11px; border: 1px solid #b7dfc5; border-radius: 7px; color: #17663a; background: #f0faf3; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
   .business-reason { margin: 0; padding: 9px 10px; border-left: 3px solid #f79009; color: #5d4328; background: #fff8eb; font-size: 11px; line-height: 1.55; }
   .placeholder-guidance { margin: 0; padding: 9px 10px; border-left: 3px solid #d92d20; color: #912018; background: #fef3f2; font-size: 11px; line-height: 1.55; }
   .busy-reason { margin: 0; padding: 9px 10px; color: #175cd3; background: #eff8ff; font-size: 11px; line-height: 1.5; }
@@ -138,6 +151,7 @@
   .secondary { border: 1px solid #d5dae3; color: #344054; background: white; }
   .primary { border: 1px solid #0071e3; color: white; background: #0071e3; }
   .resolved-line { display: flex; align-items: center; gap: 7px; padding: 9px 10px; color: #087c42; background: #edf9f2; font-size: 11px; }
+  .resolved-guidance { margin: 0; color: #667085; font-size: 10px; line-height: 1.5; }
   .inline-error { margin: 0; padding: 8px 10px; color: #b42318; background: #fef3f2; font-size: 11px; line-height: 1.5; }
   details { padding-top: 10px; border-top: 1px solid #eaecf0; color: #667085; font-size: 10px; }
   summary { cursor: pointer; font-weight: 650; }
@@ -146,4 +160,5 @@
   :global(.dark) .correction-sheet { color: #f2f4f7; }
   :global(.dark) .original-text, :global(.dark) .correction-meta span { background: #303238; }
   :global(.dark) textarea, :global(.dark) .secondary { color: #f2f4f7; border-color: #4b5058; background: #292b30; }
+  :global(.dark) .resolved-text { border-color: #316b47; color: #c7f9d4; background: #173a25; }
 </style>

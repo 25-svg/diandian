@@ -2,9 +2,11 @@ use super::{Database, DatabaseError};
 use master_script_store::StoreError;
 
 pub use master_script_store::{
-    MasterChunkInput, MasterChunkRow, MasterScriptRow, MasterSectionRow, MasterSourceRow,
-    NewMasterSection, NewMasterSource, NewMasterVersion, NewSupportCandidate, SupportCandidateRow,
-    MASTER_SCRIPT_MIGRATION_SQL,
+    CompetitorReferenceCandidateRow, MasterChunkInput, MasterChunkRow, MasterScriptRow,
+    MasterSectionRow, MasterSourceRow, MasterUpgradeReviewRow, NewCompetitorReferenceCandidate,
+    NewMasterSection, NewMasterSource, NewMasterUpgradeReview, NewMasterVersion,
+    NewSupportCandidate, SupportCandidateRow, COMPETITOR_REFERENCE_CANDIDATES_MIGRATION_SQL,
+    MASTER_SCRIPT_MIGRATION_SQL, MASTER_UPGRADE_REVIEW_MIGRATION_SQL,
 };
 
 impl Database {
@@ -112,6 +114,85 @@ impl Database {
     ) -> Result<SupportCandidateRow, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
         master_script_store::decide_support_candidate(&pool, id, next_status)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn insert_competitor_reference_candidate(
+        &self,
+        input: NewCompetitorReferenceCandidate,
+    ) -> Result<CompetitorReferenceCandidateRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::insert_competitor_reference_candidate(&pool, &input)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn list_competitor_reference_candidates(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<CompetitorReferenceCandidateRow>, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::list_competitor_reference_candidates(&pool, status)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn decide_competitor_reference_candidate(
+        &self,
+        id: i64,
+        next_status: &str,
+    ) -> Result<CompetitorReferenceCandidateRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::decide_competitor_reference_candidate(&pool, id, next_status)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn create_or_get_master_upgrade_review(
+        &self,
+        input: NewMasterUpgradeReview,
+    ) -> Result<MasterUpgradeReviewRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::create_or_get_master_upgrade_review(&pool, &input)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn get_master_upgrade_review(
+        &self,
+        id: i64,
+    ) -> Result<MasterUpgradeReviewRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::get_master_upgrade_review(&pool, id)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn complete_master_upgrade_review(
+        &self,
+        id: i64,
+        comparison_decision: &str,
+        review_json: &str,
+    ) -> Result<MasterUpgradeReviewRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::complete_master_upgrade_review(
+            &pool,
+            id,
+            comparison_decision,
+            review_json,
+        )
+        .await
+        .map_err(map_store_error)
+    }
+
+    pub async fn fail_master_upgrade_review(
+        &self,
+        id: i64,
+        error: &str,
+    ) -> Result<MasterUpgradeReviewRow, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        master_script_store::fail_master_upgrade_review(&pool, id, error)
             .await
             .map_err(map_store_error)
     }

@@ -458,8 +458,17 @@ where
     let current = TranscriptArtifactStore::load_from_dir(source.clone(), dir)
         .await
         .map_err(|error| error.to_string())?;
-    let was_pending =
-        correction_from_bundle(&current, correction_id)?.decision == ReviewDecision::Pending;
+    let Some(current_correction) = current
+        .corrections
+        .iter()
+        .find(|correction| correction.id == correction_id)
+    else {
+        // Recognition or review regeneration can replace correction IDs while
+        // an older WebView is still open. Treat that submission as stale and
+        // return the authoritative bundle so the UI can move to the latest item.
+        return Ok(current);
+    };
+    let was_pending = current_correction.decision == ReviewDecision::Pending;
 
     let (bundle, resolved_now) = if was_pending {
         match TranscriptArtifactStore::resolve(
@@ -500,9 +509,11 @@ where
         || correction.decision != ReviewDecision::Approved
         || normalized_decided_text(decided_text.as_deref()) != correction.decided_text.as_deref()
     {
-        return Err(
-            "correction has already been decided with a different action or text".to_string(),
-        );
+        // The persisted decision is authoritative. A stale WebView can submit
+        // an older choice after another click already saved the correction;
+        // return the latest bundle so the UI refreshes instead of surfacing a
+        // technical conflict to the reviewer.
+        return Ok(bundle);
     }
 
     let candidate = build_replacement_candidate(&source, correction)?;
@@ -674,9 +685,11 @@ pub(crate) async fn resolve_canonical_video_source(
         .get_video_source(requested_video_id)
         .await
         .map_err(|error| error.to_string())?;
-    let requested_media = database_owned_video_path(output, &requested_file)?;
+    let requested_media =
+        database_video_media_path(db, output, requested_video_id, &requested_file).await?;
     let requested_identity = resolved_path_identity(&requested_media)?;
-    let requested_dir = TranscriptArtifactStore::video_artifact_dir(&requested_media);
+    let requested_dir =
+        database_video_artifact_dir(db, output, requested_video_id, &requested_file).await?;
 
     let sources = db
         .list_video_sources()
@@ -695,7 +708,7 @@ pub(crate) async fn resolve_canonical_video_source(
             .ok_or_else(|| {
                 format!("transcript artifact owner video id {video_id} does not exist")
             })?;
-        let owner_media = database_owned_video_path(output, owner_file)?;
+        let owner_media = database_video_media_path(db, output, video_id, owner_file).await?;
         if !same_path_identity(&requested_identity, &resolved_path_identity(&owner_media)?) {
             return Err(format!(
                 "transcript artifacts are bound to video id {video_id}, which resolves to a different file"
@@ -703,13 +716,13 @@ pub(crate) async fn resolve_canonical_video_source(
         }
         return Ok((
             TranscriptSource::Video { video_id },
-            TranscriptArtifactStore::video_artifact_dir(owner_media),
+            database_video_artifact_dir(db, output, video_id, owner_file).await?,
         ));
     }
 
     let mut aliases = Vec::new();
     for (video_id, file) in sources {
-        let Ok(media_file) = database_owned_video_path(output, &file) else {
+        let Ok(media_file) = database_video_media_path(db, output, video_id, &file).await else {
             continue;
         };
         let Ok(identity) = resolved_path_identity(&media_file) else {
@@ -736,6 +749,61 @@ pub(crate) async fn resolve_canonical_video_source(
         },
         requested_dir,
     ))
+}
+
+async fn database_video_artifact_dir(
+    db: &Database,
+    output: &Path,
+    video_id: i64,
+    file: &str,
+) -> Result<PathBuf, String> {
+    if let Some(archive) = db
+        .get_video_archive_by_video(video_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if archive.status == "archived"
+            && !archive.local_path.trim().is_empty()
+            && archive.nas_path == file
+        {
+            let original_local_path = database_owned_video_path(output, &archive.local_path)?;
+            return Ok(TranscriptArtifactStore::video_artifact_dir(
+                original_local_path,
+            ));
+        }
+    }
+    Ok(TranscriptArtifactStore::video_artifact_dir(
+        database_owned_video_path(output, file)?,
+    ))
+}
+
+pub(crate) async fn database_video_media_path(
+    db: &Database,
+    output: &Path,
+    video_id: i64,
+    file: &str,
+) -> Result<PathBuf, String> {
+    if let Some(archive) = db
+        .get_video_archive_by_video(video_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if archive.status == "archived"
+            && !archive.nas_path.trim().is_empty()
+            && archive.nas_path == file
+        {
+            let path = PathBuf::from(file);
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err("archived NAS video path is invalid".to_string());
+            }
+            return Ok(path);
+        }
+    }
+    database_owned_video_path(output, file)
 }
 
 fn resolved_path_identity(path: &Path) -> Result<PathBuf, String> {
@@ -1301,7 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_retry_rejects_different_text_and_action_before_persistence() {
+    async fn approved_retry_with_a_stale_choice_returns_the_persisted_decision() {
         let dir = tempfile::tempdir().unwrap();
         initialize_review(dir.path()).await;
         resolve_transcript_correction_in_dir(
@@ -1322,7 +1390,7 @@ mod tests {
         ] {
             let calls = Arc::new(Mutex::new(0));
             let calls_for_attempt = calls.clone();
-            let error = resolve_transcript_correction_in_dir(
+            let bundle = resolve_transcript_correction_in_dir(
                 source(),
                 dir.path(),
                 "correction-7",
@@ -1335,10 +1403,41 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
-            assert!(error.contains("different action or text"));
+            .unwrap();
+            assert_eq!(bundle.corrections[0].decision, ReviewDecision::Approved);
+            assert_eq!(
+                bundle.corrections[0].decided_text.as_deref(),
+                Some("A4PRO2 99元")
+            );
             assert_eq!(*calls.lock().unwrap(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn missing_correction_from_a_stale_webview_returns_the_latest_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_review(dir.path()).await;
+        let persist_calls = Arc::new(Mutex::new(0));
+        let persist_calls_for_attempt = persist_calls.clone();
+
+        let bundle = resolve_transcript_correction_in_dir(
+            source(),
+            dir.path(),
+            "correction-from-older-review",
+            ReviewAction::KeepOriginal,
+            None,
+            false,
+            move |_| {
+                *persist_calls_for_attempt.lock().unwrap() += 1;
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bundle.corrections[0].id, "correction-7");
+        assert_eq!(bundle.corrections[0].decision, ReviewDecision::Pending);
+        assert_eq!(*persist_calls.lock().unwrap(), 0);
     }
 
     #[test]

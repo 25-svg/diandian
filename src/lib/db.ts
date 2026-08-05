@@ -33,6 +33,16 @@ export interface RecordItem {
   size: number;
   created_at: string;
   cover: string;
+  anchor_name: string;
+  anchor_source: string;
+  anchor_confidence: string;
+  anchor_detection_status: string;
+  anchor_detection_error: string;
+  anchor_detected_at: string;
+  archive_kind: "company" | "competitor";
+  classification_source: "auto_rule" | "manual";
+  /** Present when this row represents an externally imported video in 录播档案. */
+  imported_video_id?: number;
 }
 
 export interface AccountInfo {

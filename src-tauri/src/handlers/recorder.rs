@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use super::transcript_review::{
     load_legacy_archive_transcript_audit, resolve_legacy_archive_review_item,
@@ -241,6 +242,58 @@ pub async fn get_archive(
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
+pub async fn set_archive_kind(
+    state: state_type!(),
+    live_id: String,
+    archive_kind: String,
+) -> Result<RecordRow, String> {
+    state
+        .db
+        .set_record_archive_kind(&live_id, &archive_kind)
+        .await
+        .map_err(String::from)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveAutoClassificationInput {
+    pub live_id: String,
+    pub account_name: String,
+}
+
+#[cfg(test)]
+mod archive_auto_classification_tests {
+    use super::ArchiveAutoClassificationInput;
+
+    #[test]
+    fn accepts_camel_case_tauri_payload() {
+        let value =
+            serde_json::json!({ "liveId": "record-1", "accountName": "金典拍拍相机专卖店" });
+        let input: ArchiveAutoClassificationInput = serde_json::from_value(value).unwrap();
+        assert_eq!(input.live_id, "record-1");
+        assert_eq!(input.account_name, "金典拍拍相机专卖店");
+    }
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn auto_classify_archive_kinds(
+    state: state_type!(),
+    archives: Vec<ArchiveAutoClassificationInput>,
+) -> Result<Vec<RecordRow>, String> {
+    let mut updated = Vec::with_capacity(archives.len());
+    for archive in archives {
+        updated.push(
+            state
+                .db
+                .auto_classify_record_archive_kind(&archive.live_id, &archive.account_name)
+                .await
+                .map_err(String::from)?,
+        );
+    }
+    Ok(updated)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_archives_by_parent_id(
     state: state_type!(),
     room_id: String,
@@ -280,18 +333,140 @@ pub async fn generate_archive_subtitle(
         .await?)
 }
 
+async fn wait_until_archive_subtitle_idle(
+    state: &State,
+    platform: PlatformType,
+    room_id: &str,
+    live_id: &str,
+) -> Result<(), String> {
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let active = state
+            .db
+            .get_active_archive_subtitle_task(platform.as_str(), room_id, live_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if active.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_archive_subtitle_task(
+    state: &State,
+    platform: PlatformType,
+    room_id: &str,
+    live_id: &str,
+) -> Result<ArchiveSubtitleRefreshResult, String> {
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let active = state
+            .db
+            .get_active_archive_subtitle_task(platform.as_str(), room_id, live_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if active.is_some() {
+            continue;
+        }
+
+        let subtitle = state
+            .recorder_manager
+            .get_archive_subtitle(platform, room_id, live_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if subtitle.trim().is_empty() {
+            return Err(
+                "逐字稿任务已结束，但没有生成可用文稿。请稍后点击重新识别再试。".to_string(),
+            );
+        }
+        let new_length = subtitle.len();
+        return Ok(ArchiveSubtitleRefreshResult {
+            subtitle,
+            decision: "resumed".to_string(),
+            similarity: 0.0,
+            old_length: 0,
+            new_length,
+        });
+    }
+}
+
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn refresh_archive_subtitle(
     state: state_type!(),
     platform: String,
     room_id: String,
     live_id: String,
+    force: Option<bool>,
 ) -> Result<ArchiveSubtitleRefreshResult, String> {
     let platform = PlatformType::from_str(&platform)?;
-    Ok(state
+    let force = force.unwrap_or(false);
+    let task = TaskRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_type: "generate_archive_subtitle".to_string(),
+        status: "pending".to_string(),
+        message: "等待生成整场逐字稿".to_string(),
+        metadata: serde_json::json!({
+            "platform": platform.as_str(),
+            "room_id": room_id,
+            "live_id": live_id,
+        })
+        .to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if !state
+        .db
+        .add_archive_subtitle_task_if_idle(&task, platform.as_str(), &room_id, &live_id)
+        .await?
+    {
+        if !force {
+            return wait_for_archive_subtitle_task(&state, platform, &room_id, &live_id).await;
+        }
+        wait_until_archive_subtitle_idle(&state, platform, &room_id, &live_id).await?;
+        if !state
+            .db
+            .add_archive_subtitle_task_if_idle(&task, platform.as_str(), &room_id, &live_id)
+            .await?
+        {
+            return wait_for_archive_subtitle_task(&state, platform, &room_id, &live_id).await;
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    let emitter = EventEmitter::new(state.app_handle.clone());
+    #[cfg(feature = "headless")]
+    let emitter = EventEmitter::new(state.progress_manager.get_event_sender());
+    let reporter = ProgressReporter::new(state.db.clone(), &emitter, &task.id).await?;
+    reporter.update("正在生成整场逐字稿").await;
+
+    let result = state
         .recorder_manager
-        .refresh_archive_subtitle(platform, &room_id, &live_id)
-        .await?)
+        .refresh_archive_subtitle(platform, &room_id, &live_id, Some(&reporter))
+        .await;
+    match result {
+        Ok(result) => {
+            reporter.finish(true, "整场逐字稿生成完成").await;
+            state
+                .db
+                .update_task(&task.id, "success", "整场逐字稿生成完成", None)
+                .await?;
+            Ok(result)
+        }
+        Err(error) => {
+            reporter
+                .finish(false, &format!("整场逐字稿生成失败: {error}"))
+                .await;
+            state
+                .db
+                .update_task(
+                    &task.id,
+                    "failed",
+                    &format!("整场逐字稿生成失败: {error}"),
+                    None,
+                )
+                .await?;
+            Err(error.to_string())
+        }
+    }
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]

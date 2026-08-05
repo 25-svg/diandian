@@ -18,25 +18,25 @@ fn passing_gates() -> HardGateResult {
 
 #[test]
 fn admits_scores_at_85_after_all_gates_pass() {
-    let score_69 = ScoreBreakdown::new(20, 20, 15, 10, 4, 0).unwrap();
+    let score_69 = ScoreBreakdown::new(20, 14, 14, 10, 7, 4).unwrap();
     assert_eq!(
         evaluate_admission(&passing_gates(), &score_69),
         CandidateAdmission::AnalysisOnly
     );
 
-    let score_70 = ScoreBreakdown::new(20, 20, 15, 10, 5, 0).unwrap();
+    let score_70 = ScoreBreakdown::new(20, 14, 14, 10, 8, 4).unwrap();
     assert_eq!(
         evaluate_admission(&passing_gates(), &score_70),
         CandidateAdmission::ReviewOnly
     );
 
-    let score_84 = ScoreBreakdown::new(20, 20, 17, 13, 9, 5).unwrap();
+    let score_84 = ScoreBreakdown::new(25, 17, 17, 12, 8, 5).unwrap();
     assert_eq!(
         evaluate_admission(&passing_gates(), &score_84),
         CandidateAdmission::ReviewOnly
     );
 
-    let score_85 = ScoreBreakdown::new(20, 20, 18, 13, 9, 5).unwrap();
+    let score_85 = ScoreBreakdown::new(26, 17, 17, 12, 8, 5).unwrap();
     assert_eq!(
         evaluate_admission(&passing_gates(), &score_85),
         CandidateAdmission::CandidateQueue
@@ -48,7 +48,20 @@ fn a_failed_gate_blocks_a_perfect_score() {
     let mut gates = passing_gates();
     gates.facts_resolved = false;
     gates.reasons.push("价格仍待确认".into());
-    let score = ScoreBreakdown::new(25, 25, 20, 15, 10, 5).unwrap();
+    let score = ScoreBreakdown::new(30, 20, 20, 15, 10, 5).unwrap();
+    assert_eq!(
+        evaluate_admission(&gates, &score),
+        CandidateAdmission::Blocked
+    );
+}
+
+#[test]
+fn pending_transcript_review_blocks_queue_admission_until_confirmed() {
+    let mut gates = passing_gates();
+    gates.transcript_reviewed = false;
+    gates.reasons.push("有少量逐字稿待确认".into());
+    let score = ScoreBreakdown::new(26, 17, 17, 12, 8, 5).unwrap();
+
     assert_eq!(
         evaluate_admission(&gates, &score),
         CandidateAdmission::Blocked
@@ -59,7 +72,7 @@ fn a_failed_gate_blocks_a_perfect_score() {
 fn gate_reasons_do_not_change_a_passing_gate_result() {
     let mut gates = passing_gates();
     gates.reasons.push("历史提示".into());
-    let score = ScoreBreakdown::new(25, 25, 20, 15, 10, 5).unwrap();
+    let score = ScoreBreakdown::new(30, 20, 20, 15, 10, 5).unwrap();
     assert_eq!(
         evaluate_admission(&gates, &score),
         CandidateAdmission::CandidateQueue
@@ -68,18 +81,23 @@ fn gate_reasons_do_not_change_a_passing_gate_result() {
 
 #[test]
 fn validates_dimension_caps() {
-    assert!(ScoreBreakdown::new(26, 25, 20, 15, 10, 5).is_err());
+    assert!(ScoreBreakdown::new(31, 20, 20, 15, 10, 5).is_err());
+    assert!(ScoreBreakdown::new(30, 21, 20, 15, 10, 5).is_err());
+    assert!(ScoreBreakdown::new(30, 20, 21, 15, 10, 5).is_err());
+    assert!(ScoreBreakdown::new(30, 20, 20, 16, 10, 5).is_err());
+    assert!(ScoreBreakdown::new(30, 20, 20, 15, 11, 5).is_err());
+    assert!(ScoreBreakdown::new(30, 20, 20, 15, 10, 6).is_err());
 }
 
 #[test]
 fn tampered_serialized_total_cannot_admit_a_low_score() {
     let tampered = r#"{
-        "transactionEvidence": 0,
-        "improvementOverMaster": 0,
+        "sceneGoal": 0,
+        "persuasiveness": 0,
+        "masterIncrement": 0,
         "reusability": 0,
-        "completeness": 0,
         "factualAccuracy": 0,
-        "scenarioClarity": 0,
+        "naturalExpression": 0,
         "total": 86
     }"#;
     let score: ScoreBreakdown = serde_json::from_str(tampered).unwrap();
@@ -98,26 +116,26 @@ fn tampered_serialized_total_cannot_admit_a_low_score() {
 
 #[test]
 fn score_round_trip_exposes_read_only_dimensions_and_derived_total() {
-    let score = ScoreBreakdown::new(25, 24, 19, 14, 9, 4).unwrap();
+    let score = ScoreBreakdown::new(30, 19, 19, 14, 9, 4).unwrap();
     let json = serde_json::to_value(&score).unwrap();
     let round_tripped: ScoreBreakdown = serde_json::from_value(json.clone()).unwrap();
 
-    assert_eq!(round_tripped.transaction_evidence(), 25);
-    assert_eq!(round_tripped.improvement_over_master(), 24);
-    assert_eq!(round_tripped.reusability(), 19);
-    assert_eq!(round_tripped.completeness(), 14);
+    assert_eq!(round_tripped.scene_goal(), 30);
+    assert_eq!(round_tripped.persuasiveness(), 19);
+    assert_eq!(round_tripped.master_increment(), 19);
+    assert_eq!(round_tripped.reusability(), 14);
     assert_eq!(round_tripped.factual_accuracy(), 9);
-    assert_eq!(round_tripped.scenario_clarity(), 4);
+    assert_eq!(round_tripped.natural_expression(), 4);
     assert_eq!(round_tripped.total(), 95);
     assert_eq!(
         json,
         serde_json::json!({
-            "transactionEvidence": 25,
-            "improvementOverMaster": 24,
-            "reusability": 19,
-            "completeness": 14,
+            "sceneGoal": 30,
+            "persuasiveness": 19,
+            "masterIncrement": 19,
+            "reusability": 14,
             "factualAccuracy": 9,
-            "scenarioClarity": 4,
+            "naturalExpression": 4,
             "total": 95
         })
     );

@@ -3,13 +3,14 @@
     "beforeDevCommand": "yarn dev",
     "beforeBuildCommand": "yarn build",
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:8054"
+    "devUrl": "http://localhost:8054/index.html"
   },
   "bundle": {
     "active": true,
     "resources": [
       "ffmpeg.exe",
-      "ffprobe.exe"
+      "ffprobe.exe",
+      "ffplay.exe"
     ],
     "icon": [
       "icons/32x32.png",

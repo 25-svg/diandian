@@ -1,9 +1,89 @@
-use crate::config::Config;
+use crate::config::{Config, NasVideoStorageConfig};
 #[cfg(feature = "headless")]
 use crate::constants::API_PORT;
 use crate::danmu2ass::Danmu2AssOptions;
 use crate::state::State;
 use crate::state_type;
+use serde::Serialize;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+fn validate_storage_path(path: &str, label: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err(format!("{label}不能为空"));
+    }
+    if path.contains("#recycle") {
+        return Err(format!(
+            "{label}不能设为 NAS 回收站 (#recycle)，请在 File Station 新建文件夹后再选择"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_storage_dir(path: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| format!("无法创建目录 {path}：{error}"))
+}
+
+fn cache_migration_should_be_skipped(old_cache_path: &str) -> bool {
+    old_cache_path.contains("#recycle")
+}
+
+fn migrate_storage_entries(old_root: &str, new_root: &str, label: &str) -> Result<(), String> {
+    ensure_storage_dir(new_root)?;
+
+    let mut old_entries = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(old_root) {
+        for entry in entries.flatten() {
+            if entry.path() == Path::new(new_root) {
+                continue;
+            }
+            old_entries.push(entry.path());
+        }
+    }
+
+    let total = old_entries.len();
+    log::info!("{label} migration started: {total} entries {old_root} -> {new_root}");
+
+    for (index, entry) in old_entries.iter().enumerate() {
+        let file_name = entry
+            .file_name()
+            .ok_or_else(|| format!("{label}迁移失败：{old_root} 中存在无效目录项"))?;
+        let new_entry = Path::new(new_root).join(file_name);
+        log::info!(
+            "{label} migration copying {}/{}: {}",
+            index + 1,
+            total,
+            entry.display()
+        );
+        if entry.is_dir() {
+            crate::handlers::utils::copy_dir_all(entry, &new_entry)
+                .map_err(|error| format!("迁移{label}失败（{}）：{error}", entry.display()))?;
+        } else {
+            std::fs::copy(entry, &new_entry)
+                .map_err(|error| format!("迁移{label}失败（{}）：{error}", entry.display()))?;
+        }
+    }
+
+    for entry in old_entries {
+        if entry.is_dir() {
+            if let Err(error) = std::fs::remove_dir_all(&entry) {
+                log::error!("Remove old {label} entry error: {error}");
+            }
+        } else if let Err(error) = std::fs::remove_file(&entry) {
+            log::error!("Remove old {label} entry error: {error}");
+        }
+    }
+
+    log::info!("{label} migration finished: {new_root}");
+    Ok(())
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_storage_migration_status(
+    state: state_type!(),
+) -> Result<crate::storage_migration::StorageMigrationSnapshot, ()> {
+    Ok(state.storage_migration.snapshot())
+}
 
 #[cfg(feature = "gui")]
 use tauri::State as TauriState;
@@ -41,132 +121,99 @@ pub async fn set_cache_path(state: state_type!(), cache_path: String) -> Result<
         return Ok(());
     }
 
+    validate_storage_path(&cache_path, "缓存目录")?;
+    ensure_storage_dir(&cache_path)?;
+
     let old_cache_path_obj = std::path::Path::new(&old_cache_path);
     let new_cache_path_obj = std::path::Path::new(&cache_path);
-    // check if new cache path is under old cache path
     if new_cache_path_obj.starts_with(old_cache_path_obj) {
         log::error!("New cache path is under old cache path: {old_cache_path} -> {cache_path}");
-        return Err("New cache path cannot be under old cache path".to_string());
+        return Err("新缓存目录不能位于旧缓存目录内部".to_string());
     }
 
+    state.storage_migration.set_cache(true);
     state.recorder_manager.set_migrating(true);
-    // stop and clear all recorders
     state.recorder_manager.stop_all().await;
-    // first switch to new cache
-    state.config.write().await.set_cache_path(&cache_path);
-    log::info!("Cache path changed: {cache_path}");
-    // Copy old cache to new cache
-    log::info!("Start copy old cache to new cache");
-    state
-        .db
-        .new_message(
-            "缓存目录切换",
-            "缓存正在迁移中，根据数据量情况可能花费较长时间，在此期间流预览功能不可用",
-        )
-        .await?;
 
-    let mut old_cache_entries = vec![];
-    if let Ok(entries) = std::fs::read_dir(&old_cache_path) {
-        for entry in entries.flatten() {
-            // check if entry is the same as new cache path
-            if entry.path() == std::path::Path::new(&cache_path) {
-                continue;
-            }
-            old_cache_entries.push(entry.path());
+    let migration_result: Result<(), String> = async {
+        if cache_migration_should_be_skipped(&old_cache_path) {
+            log::warn!("Skip cache migration from recycle bin path: {old_cache_path}");
+            state.config.write().await.set_cache_path(&cache_path);
+            state
+                .db
+                .new_message(
+                    "缓存目录切换",
+                    "已从回收站路径切换到新目录。回收站中的旧文件未自动迁移，可在 File Station 手动处理。",
+                )
+                .await?;
+            return Ok(());
         }
-    }
 
-    // copy all entries to new cache
-    for entry in &old_cache_entries {
-        let new_entry = std::path::Path::new(&cache_path).join(entry.file_name().unwrap());
-        // if entry is a folder
-        if entry.is_dir() {
-            if let Err(e) = crate::handlers::utils::copy_dir_all(entry, &new_entry) {
-                log::error!("Copy old cache to new cache error: {e}");
-                return Err(e.to_string());
-            }
-        } else if let Err(e) = std::fs::copy(entry, &new_entry) {
-            log::error!("Copy old cache to new cache error: {e}");
-            return Err(e.to_string());
-        }
-    }
+        state
+            .db
+            .new_message(
+                "缓存目录切换",
+                "缓存正在迁移中，根据数据量情况可能花费较长时间，在此期间流预览功能不可用",
+            )
+            .await?;
 
-    log::info!("Copy old cache to new cache done");
-    state.db.new_message("缓存目录切换", "缓存切换完成").await?;
+        let old_cache_path_for_task = old_cache_path.clone();
+        let cache_path_for_task = cache_path.clone();
+        tokio::task::spawn_blocking(move || {
+            migrate_storage_entries(&old_cache_path_for_task, &cache_path_for_task, "缓存")
+        })
+        .await
+        .map_err(|error| format!("缓存迁移任务异常：{error}"))??;
+
+        state.config.write().await.set_cache_path(&cache_path);
+        state
+            .db
+            .new_message("缓存目录切换", "缓存切换完成")
+            .await?;
+        Ok(())
+    }
+    .await;
 
     state.recorder_manager.set_migrating(false);
-
-    // remove all old cache entries
-    for entry in old_cache_entries {
-        if entry.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(&entry) {
-                log::error!("Remove old cache error: {e}");
-            }
-        } else if let Err(e) = std::fs::remove_file(&entry) {
-            log::error!("Remove old cache error: {e}");
-        }
-    }
-
-    Ok(())
+    state.storage_migration.set_cache(false);
+    migration_result
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
 #[allow(dead_code)]
 pub async fn set_output_path(state: state_type!(), output_path: String) -> Result<(), String> {
-    let mut config = state.config.write().await;
-    let old_output_path = config.output.clone();
+    let old_output_path = {
+        let config = state.config.read().await;
+        config.output.clone()
+    };
     log::info!("Try to set output path: {old_output_path} -> {output_path}");
     if old_output_path == output_path {
         return Ok(());
     }
 
+    validate_storage_path(&output_path, "切片保存路径")?;
+    ensure_storage_dir(&output_path)?;
+
     let old_output_path_obj = std::path::Path::new(&old_output_path);
     let new_output_path_obj = std::path::Path::new(&output_path);
-    // check if new output path is under old output path
     if new_output_path_obj.starts_with(old_output_path_obj) {
         log::error!("New output path is under old output path: {old_output_path} -> {output_path}");
-        return Err("New output path cannot be under old output path".to_string());
+        return Err("新切片目录不能位于旧切片目录内部".to_string());
     }
 
-    // list all file and folder in old output
-    let mut old_output_entries = vec![];
-    if let Ok(entries) = std::fs::read_dir(&old_output_path) {
-        for entry in entries.flatten() {
-            // check if entry is the same as new output path
-            if entry.path() == std::path::Path::new(&output_path) {
-                continue;
-            }
-            old_output_entries.push(entry.path());
-        }
-    }
+    state.storage_migration.set_output(true);
+    let old_output_path_for_task = old_output_path.clone();
+    let output_path_for_task = output_path.clone();
+    let migration_result = tokio::task::spawn_blocking(move || {
+        migrate_storage_entries(&old_output_path_for_task, &output_path_for_task, "切片")
+    })
+    .await
+    .map_err(|error| format!("切片迁移任务异常：{error}"))?;
 
-    // rename all entries to new output
-    for entry in &old_output_entries {
-        let new_entry = std::path::Path::new(&output_path).join(entry.file_name().unwrap());
-        // if entry is a folder
-        if entry.is_dir() {
-            if let Err(e) = crate::handlers::utils::copy_dir_all(entry, &new_entry) {
-                log::error!("Copy old output to new output error: {e}");
-                return Err(e.to_string());
-            }
-        } else if let Err(e) = std::fs::copy(entry, &new_entry) {
-            log::error!("Copy old output to new output error: {e}");
-            return Err(e.to_string());
-        }
-    }
+    state.storage_migration.set_output(false);
 
-    // remove all old output entries
-    for entry in old_output_entries {
-        if entry.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(&entry) {
-                log::error!("Remove old output error: {e}");
-            }
-        } else if let Err(e) = std::fs::remove_file(&entry) {
-            log::error!("Remove old output error: {e}");
-        }
-    }
-
-    config.set_output_path(&output_path);
+    migration_result?;
+    state.config.write().await.set_output_path(&output_path);
     Ok(())
 }
 
@@ -359,4 +406,114 @@ pub async fn update_powerlive_key(state: state_type!(), powerlive_key: String) -
     state.config.write().await.save();
     log::info!("Updated powerlive key");
     Ok(())
+}
+
+fn validate_nas_root_path(root_path: &str) -> Result<PathBuf, String> {
+    let trimmed = root_path.trim();
+    if trimmed.is_empty() {
+        return Err("请先填写 NAS 共享目录".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    if !trimmed.starts_with(r"\\") {
+        return Err(r"NAS 共享目录必须使用 UNC 路径，例如 \\192.168.1.100\直播录像".to_string());
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn probe_nas_root(root: &Path) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err("NAS 共享目录不存在或当前无法访问".to_string());
+    }
+    let probe_path = root.join(format!(
+        ".bili-shadowreplay-write-probe-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .map_err(|error| format!("NAS 共享目录不可写：{error}"))?;
+        file.write_all(b"nas-write-probe")
+            .map_err(|error| format!("NAS 写入测试失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("NAS 写入同步失败：{error}"))?;
+        Ok(())
+    })();
+    let cleanup_result = std::fs::remove_file(&probe_path);
+    result?;
+    cleanup_result.map_err(|error| format!("NAS 测试文件无法清理：{error}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NasConnectionResult {
+    pub reachable: bool,
+    pub root_path: String,
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn test_nas_video_storage(root_path: String) -> Result<NasConnectionResult, String> {
+    let root = validate_nas_root_path(&root_path)?;
+    probe_nas_root(&root)?;
+    Ok(NasConnectionResult {
+        reachable: true,
+        root_path: root.to_string_lossy().to_string(),
+    })
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn update_nas_video_storage(
+    state: state_type!(),
+    mut settings: NasVideoStorageConfig,
+) -> Result<(), String> {
+    settings.root_path = settings.root_path.trim().to_string();
+    if settings.enabled {
+        let root = validate_nas_root_path(&settings.root_path)?;
+        probe_nas_root(&root)?;
+    }
+    let mut config = state.config.write().await;
+    config.nas_video_storage = settings;
+    config.save();
+    drop(config);
+    state.nas_archive.wake();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nas_connection_rejects_empty_path() {
+        assert_eq!(
+            validate_nas_root_path(" ").unwrap_err(),
+            "请先填写 NAS 共享目录"
+        );
+    }
+
+    #[test]
+    fn storage_path_rejects_recycle_bin() {
+        assert!(validate_storage_path(r"Z:\#recycle", "缓存目录").is_err());
+    }
+
+    #[test]
+    fn cache_migration_is_skipped_for_recycle_bin_path() {
+        assert!(cache_migration_should_be_skipped(r"Z:\#recycle"));
+        assert!(!cache_migration_should_be_skipped(r"Z:\bsr-cache"));
+    }
+
+    #[test]
+    fn nas_connection_probe_confirms_write_and_cleans_up() {
+        let root = std::env::temp_dir().join(format!(
+            "bili-shadowreplay-nas-probe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        probe_nas_root(&root).unwrap();
+
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -15,6 +15,7 @@
     Users,
     Video,
   } from "lucide-svelte";
+  import PageShell from "../lib/components/PageShell.svelte";
 
   let summary: RecorderList = {
     count: 0,
@@ -49,7 +50,12 @@
     disk_usage = await get_archive_disk_usage();
 
     // get disk info
-    disk_info = await invoke("get_disk_info");
+    try {
+      disk_info = await invoke("get_disk_info");
+    } catch (error) {
+      console.warn("get_disk_info failed:", error);
+      disk_info = { disk: "", total: 0, free: 0 };
+    }
     account_count = await get_account_count();
 
     // get total length
@@ -234,24 +240,13 @@
 
 <svelte:window on:click={handleClickOutside} />
 
-<div
-  class="flex-1 p-6 overflow-y-auto custom-scrollbar-light bg-gray-50"
-  on:scroll={handleScroll}
->
-  <div class="space-y-6">
-    <!-- Header -->
-    <div class="flex justify-between items-center">
-      <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">总览</h1>
-    </div>
-
+<PageShell title="总览" subtitle="查看缓存占用、直播间状态与最近录播。" on:scroll={handleScroll}>
     <!-- Stats Grid -->
     <div class="grid grid-cols-3 gap-6">
       <!-- Cache Size -->
-      <div
-        class="p-6 rounded-xl bg-white dark:bg-[#3c3c3e] shadow-sm border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
-      >
+      <div class="mac-card p-6 hover:border-[color:var(--mac-blue)] transition-colors">
         <div class="flex items-center space-x-3">
-          <div class="p-3 rounded-lg bg-blue-500">
+          <div class="p-3 rounded-[10px] bg-[color:var(--mac-blue)]">
             <HardDrive class="w-6 h-6 icon-white" />
           </div>
           <div>
@@ -264,7 +259,7 @@
       </div>
 
       <div
-        class="p-6 rounded-xl bg-white dark:bg-[#3c3c3e] shadow-sm border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+        class="mac-card p-6 hover:border-[color:var(--mac-blue)] transition-colors"
       >
         <div class="flex items-center space-x-3">
           <div class="p-3 rounded-lg bg-orange-500">
@@ -285,9 +280,9 @@
             >
               <div
                 class="h-full bg-orange-500 rounded-full"
-                style="width: {((disk_info.total - disk_info.free) /
-                  disk_info.total) *
-                  100}%"
+                style="width: {disk_info.total > 0
+                  ? ((disk_info.total - disk_info.free) / disk_info.total) * 100
+                  : 0}%"
               ></div>
             </div>
           </div>
@@ -296,7 +291,7 @@
 
       <!-- Active Rooms -->
       <div
-        class="p-6 rounded-xl bg-white dark:bg-[#3c3c3e] shadow-sm border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+        class="mac-card p-6 hover:border-[color:var(--mac-blue)] transition-colors"
       >
         <div class="flex items-center space-x-3">
           <div class="p-3 rounded-lg bg-green-500">
@@ -313,7 +308,7 @@
 
       <!-- Connected Accounts -->
       <div
-        class="p-6 rounded-xl bg-white dark:bg-[#3c3c3e] shadow-sm border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+        class="mac-card p-6 hover:border-[color:var(--mac-blue)] transition-colors"
       >
         <div class="flex items-center space-x-3">
           <div class="p-3 rounded-lg bg-purple-500">
@@ -330,7 +325,7 @@
 
       <!-- Total Recording Time -->
       <div
-        class="p-6 rounded-xl bg-white dark:bg-[#3c3c3e] shadow-sm border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+        class="mac-card p-6 hover:border-[color:var(--mac-blue)] transition-colors"
       >
         <div class="flex items-center space-x-3">
           <div class="p-3 rounded-lg bg-indigo-500">
@@ -347,7 +342,7 @@
 
       <!-- Today's Recordings -->
       <div
-        class="p-6 rounded-xl bg-white dark:bg-[#3c3c3e] shadow-sm border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+        class="mac-card p-6 hover:border-[color:var(--mac-blue)] transition-colors"
       >
         <div class="flex items-center space-x-3">
           <div class="p-3 rounded-lg bg-pink-500">
@@ -381,7 +376,7 @@
         </div>
         {#if hasNewRecords}
           <button
-            class="px-3 py-1 text-sm text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 rounded-full hover:bg-blue-100 dark:hover:bg-blue-500/20 transition-colors"
+            class="px-3 py-1 text-sm text-[color:var(--mac-blue)] bg-[color:var(--mac-blue-soft)] rounded-full hover:brightness-95 transition-colors"
             on:click={loadMoreRecords}
           >
             记录有更新 • 点击刷新
@@ -392,7 +387,7 @@
         <!-- Recording Items -->
         {#each recent_records as record}
           <div
-            class="p-4 rounded-lg bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 flex items-center justify-between hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+            class="p-4 rounded-[11px] bg-[color:var(--mac-bg-card)] border border-[color:var(--mac-separator)] flex items-center justify-between hover:border-[color:var(--mac-blue)] transition-colors"
           >
             <div class="flex items-center space-x-4">
               {#if record.cover}
@@ -502,5 +497,4 @@
         {/if}
       </div>
     </div>
-  </div>
-</div>
+</PageShell>

@@ -123,7 +123,7 @@ export interface TranscriptReviewUpdateEvent {
   reviewRequestToken: number;
 }
 
-export type HighlightDiscoveryAction = "blocked" | "auto" | "continue" | "rerun";
+export type HighlightDiscoveryAction = "blocked" | "auto" | "rerun";
 
 export interface HighlightReviewGate {
   allowed: boolean;
@@ -175,17 +175,27 @@ export function analysisWorkflowStage(input: {
     return "recognizing";
   }
   if (input.auditState === "error") return "proofreading";
-  if (input.auditState === "loaded" && input.pendingCriticalCount > 0) {
-    return "proofreading";
-  }
   return "discovering_highlights";
+}
+
+export function highlightWorkflowStage(input: {
+  hasTranscript: boolean;
+  isRecognizing: boolean;
+  auditState: TranscriptAuditState;
+  pendingCriticalCount: number;
+}): AnalysisWorkflowStage {
+  if (input.hasTranscript && !input.isRecognizing) {
+    // Proofreading protects promotion into the enterprise script, but loading
+    // or reviewing those items must not hide already discovered clip analysis.
+    return "discovering_highlights";
+  }
+  return analysisWorkflowStage(input);
 }
 
 export function highlightDiscoveryAction(input: {
   stage: AnalysisWorkflowStage;
   sourceKey: string;
   requestedSourceKey: string;
-  hadPendingCriticalReview: boolean;
   discoveryCompleted: boolean;
   isDiscovering: boolean;
 }): HighlightDiscoveryAction {
@@ -198,7 +208,7 @@ export function highlightDiscoveryAction(input: {
     return "blocked";
   }
   if (input.discoveryCompleted) return "rerun";
-  return input.hadPendingCriticalReview ? "continue" : "auto";
+  return "auto";
 }
 
 export function highlightReviewGate(
@@ -232,6 +242,21 @@ export function candidateReviewIdentity(
   candidateId: string,
 ): CandidateReviewIdentity {
   return { generation, candidateId };
+}
+
+export function candidateSelectionCancelsReview(
+  reviewingCandidateId: string,
+  nextCandidateId: string,
+): boolean {
+  return Boolean(reviewingCandidateId) && reviewingCandidateId !== nextCandidateId;
+}
+
+export function sessionReviewShouldContinue(
+  aborted: boolean,
+  requestGeneration: number,
+  currentGeneration: number,
+): boolean {
+  return !aborted && requestGeneration === currentGeneration;
 }
 
 export function isCurrentCandidateReview(
@@ -269,6 +294,10 @@ export function isUnresolvedTranscriptPlaceholder(value: string): boolean {
   return normalized.startsWith("[")
     && normalized.endsWith("]")
     && ["待确认", "听不清", "疑似"].some((sentinel) => normalized.includes(sentinel));
+}
+
+export function transcriptReviewChangesTranscript(current: string, updated: string): boolean {
+  return Boolean(updated.trim()) && current !== updated;
 }
 
 export function correctionProgress(

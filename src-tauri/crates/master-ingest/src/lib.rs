@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -6,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const MAX_PARAMETER_CARDS: usize = 30;
+pub const MAX_CONCURRENT_TRANSCRIPT_CHUNKS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -193,7 +195,24 @@ where
             .into_iter()
             .map(|row| (row.chunk_index, row))
             .collect::<BTreeMap<_, _>>();
+        let stale_running = checkpoints
+            .values()
+            .filter(|checkpoint| checkpoint.status == ChunkStatus::Running)
+            .cloned()
+            .collect::<Vec<_>>();
+        for checkpoint in stale_running {
+            let pending = self
+                .store
+                .persist(Checkpoint {
+                    status: ChunkStatus::Pending,
+                    error: None,
+                    ..checkpoint
+                })
+                .await?;
+            checkpoints.insert(pending.chunk_index, pending);
+        }
 
+        let mut pending = Vec::new();
         for (chunk_index, (start_ms, end_ms)) in plan.iter().copied().enumerate() {
             let input_hash = chunk_input_hash(
                 &request.source_key,
@@ -223,41 +242,62 @@ where
                 reviewed_srt: String::new(),
                 error: None,
             };
-            let running = self.store.persist(running).await?;
-            checkpoints.insert(chunk_index, running.clone());
+            pending.push(running);
+        }
 
-            match self
-                .transcriber
-                .transcribe(chunk_index, start_ms, end_ms, &request.selected_cards)
-                .await
-            {
+        let cards = &request.selected_cards;
+        let transcriber = &self.transcriber;
+        let store = &self.store;
+        let mut transcriptions = stream::iter(pending.into_iter().map(|running| async move {
+            let running = store.persist(running).await?;
+            let chunk_index = running.chunk_index;
+            let result = transcriber
+                .transcribe(chunk_index, running.start_ms, running.end_ms, cards)
+                .await;
+            let checkpoint = match result {
                 Ok(cues) => {
                     let srt = render_srt(&cues);
-                    let complete = Checkpoint {
+                    Checkpoint {
                         status: ChunkStatus::Complete,
                         raw_srt: srt.clone(),
                         reviewed_srt: srt,
                         ..running
-                    };
-                    let complete = self.store.persist(complete).await?;
-                    checkpoints.insert(chunk_index, complete);
+                    }
                 }
-                Err(error) => {
-                    let failed = Checkpoint {
-                        status: ChunkStatus::Failed,
-                        error: Some(error.clone()),
-                        ..running
-                    };
-                    let failed = self.store.persist(failed).await?;
-                    checkpoints.insert(chunk_index, failed);
-                    return Ok(IngestStatus::Failed {
-                        completed: matching_complete_count(&checkpoints, &request, &plan),
-                        total,
-                        failed_chunk: chunk_index,
-                        error,
-                    });
+                Err(error) => Checkpoint {
+                    status: ChunkStatus::Failed,
+                    error: Some(error),
+                    ..running
+                },
+            };
+            store.persist(checkpoint).await
+        }))
+        .buffer_unordered(MAX_CONCURRENT_TRANSCRIPT_CHUNKS);
+        let mut first_failure: Option<(usize, String)> = None;
+        while let Some(checkpoint) = transcriptions.next().await {
+            let checkpoint = checkpoint?;
+            if checkpoint.status == ChunkStatus::Failed {
+                let error = checkpoint
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "chunk transcription failed".into());
+                if first_failure
+                    .as_ref()
+                    .is_none_or(|(index, _)| checkpoint.chunk_index < *index)
+                {
+                    first_failure = Some((checkpoint.chunk_index, error));
                 }
             }
+            checkpoints.insert(checkpoint.chunk_index, checkpoint);
+        }
+
+        if let Some((failed_chunk, error)) = first_failure {
+            return Ok(IngestStatus::Failed {
+                completed: matching_complete_count(&checkpoints, &request, &plan),
+                total,
+                failed_chunk,
+                error,
+            });
         }
 
         let raw_chunks = collect_chunk_cues(&checkpoints, &plan, false)?;
@@ -353,6 +393,28 @@ pub fn select_parameter_cards(
     });
     ranked.truncate(limit.min(MAX_PARAMETER_CARDS));
     SelectedParameterCards { cards: ranked }
+}
+
+pub fn parameter_card_exact_match(
+    card: &ParameterCard,
+    title: &str,
+    recognized_terms: &[String],
+) -> bool {
+    if !valid_card(card) {
+        return false;
+    }
+    let title = normalize_phrase(title);
+    let terms = recognized_terms
+        .iter()
+        .map(|term| normalize_phrase(term))
+        .collect::<Vec<_>>();
+    std::iter::once(&card.canonical_name)
+        .chain(card.aliases.iter())
+        .map(|name| normalize_phrase(name))
+        .filter(|name| !name.is_empty())
+        .any(|name| {
+            phrase_matches(&title, &name) || terms.iter().any(|term| phrase_matches(term, &name))
+        })
 }
 
 pub fn chunk_input_hash(

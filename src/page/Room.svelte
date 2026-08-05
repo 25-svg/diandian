@@ -24,6 +24,7 @@
   import TikTokIcon from "../lib/components/TikTokIcon.svelte";
   import AutoRecordIcon from "../lib/components/AutoRecordIcon.svelte";
   import GenerateWholeClipModal from "../lib/components/GenerateWholeClipModal.svelte";
+  import PageShell from "../lib/components/PageShell.svelte";
   import { onMount } from "svelte";
 
   export let room_count = 0;
@@ -504,57 +505,37 @@
   });
 </script>
 
-<div
-  class="flex-1 p-6 overflow-auto custom-scrollbar-light bg-gray-50 dark:bg-black"
->
-  <div class="space-y-6">
-    <!-- Header -->
-    <div class="flex justify-between items-center">
-      <div class="flex items-center space-x-4">
-        <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">
-          直播间
-        </h1>
-        <div
-          class="flex items-center space-x-2 text-sm text-gray-500 dark:text-gray-400"
-        >
-          <span class="flex items-center space-x-1">
-            <span class="w-2 h-2 rounded-full bg-green-500"></span>
-            <span>{room_active} 直播中</span>
-          </span>
-          <span>•</span>
-          <span>{room_inactive} 未直播</span>
-        </div>
-      </div>
-      <div class="flex items-center space-x-3">
-        <div class="relative">
-          <Search
-            class="w-5 h-5 absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 dark:text-gray-500"
-          />
-          <input
-            type="text"
-            bind:value={searchQuery}
-            placeholder="搜索直播间..."
-            class="pl-10 pr-4 py-2 rounded-lg bg-gray-100 dark:bg-gray-700/50 border border-gray-200 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 text-gray-900 dark:text-white"
-          />
-        </div>
-        <button
-          class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center space-x-2"
-          on:click={() => {
-            addModal = true;
-          }}
-        >
-          <Plus class="w-5 h-5 icon-white" />
-          <span>添加新直播间</span>
-        </button>
-      </div>
+<PageShell title="直播间" subtitle={`${room_active} 直播中 · ${room_inactive} 未直播`}>
+  <div slot="actions" class="flex items-center gap-2">
+    <div class="relative">
+      <Search
+        class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[color:var(--mac-tertiary)]"
+      />
+      <input
+        type="text"
+        bind:value={searchQuery}
+        placeholder="搜索直播间..."
+        class="mac-field pl-9 pr-3 w-52"
+      />
     </div>
+    <button
+      type="button"
+      class="mac-btn mac-btn-primary"
+      on:click={() => {
+        addModal = true;
+      }}
+    >
+      <Plus class="w-4 h-4" />
+      <span>添加新直播间</span>
+    </button>
+  </div>
 
     <!-- Room Grid -->
     <div class="grid grid-cols-3 gap-4">
       <!-- Active Room Card -->
       {#each filteredRecorders as room (room.room_info.room_id)}
         <div
-          class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+          class="mac-card p-4 hover:border-[color:var(--mac-blue)] transition-colors"
         >
           <div class="relative">
             <img
@@ -702,26 +683,26 @@
 
       <!-- Add Room Card -->
       <button
-        class="p-4 rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-blue-500 dark:hover:border-blue-400 transition-colors flex flex-col items-center justify-center space-y-2"
+        type="button"
+        class="p-4 rounded-[14px] border-2 border-dashed border-[color:var(--mac-separator-strong)] hover:border-[color:var(--mac-blue)] transition-colors flex flex-col items-center justify-center space-y-2"
         on:click={() => {
           addModal = true;
         }}
       >
         <div
-          class="w-12 h-12 rounded-full bg-blue-500/10 flex items-center justify-center"
+          class="w-12 h-12 rounded-full bg-[color:var(--mac-blue-soft)] flex items-center justify-center"
         >
           <Plus class="w-6 h-6 icon-primary" />
         </div>
-        <span class="text-sm font-medium text-blue-600 dark:text-blue-400"
+        <span class="text-sm font-medium text-[color:var(--mac-blue)]"
           >添加新直播间</span
         >
-        <span class="text-xs text-gray-500 dark:text-gray-400"
+        <span class="text-xs text-[color:var(--mac-tertiary)]"
           >配置一个新直播间以及其相关设置</span
         >
       </button>
     </div>
-  </div>
-</div>
+</PageShell>
 {#if deleteModal}
   <div
     class="fixed inset-0 bg-black/20 dark:bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center"
@@ -752,11 +733,16 @@
           <button
             class="w-24 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
             on:click={async () => {
-              await invoke("remove_recorder", {
-                roomId: deleteRoom.room_info.room_id,
-                platform: deleteRoom.room_info.platform,
-              });
-              deleteModal = false;
+              try {
+                await invokeSensitive("remove_recorder", {
+                  roomId: deleteRoom.room_info.room_id,
+                  platform: deleteRoom.room_info.platform,
+                });
+                deleteModal = false;
+                await update_summary();
+              } catch (error) {
+                alert(`移除直播间失败：${error}`);
+              }
             }}
           >
             移除

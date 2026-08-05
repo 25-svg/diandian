@@ -288,9 +288,7 @@ fn normalize_model_cue_ids(sections: &mut serde_json::Value) {
                 let Some(field) = field.as_object_mut() else {
                     continue;
                 };
-                if let Some(cue_ids) =
-                    aliased_value_mut(field, "sourceCueIds", "source_cue_ids")
-                {
+                if let Some(cue_ids) = aliased_value_mut(field, "sourceCueIds", "source_cue_ids") {
                     normalize_cue_id_array(cue_ids);
                 }
             }

@@ -45,6 +45,62 @@ pub struct DanmuKeywordMatch {
     pub context_end: f64,
 }
 
+/// Result returned after exporting one user-selected learning segment.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LearningSegmentExport {
+    pub output_path: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub re_encoded: bool,
+}
+
+/// Export a time range from an existing video as a standalone MP4.
+///
+/// The source is selected by `video_id`, not an arbitrary frontend path, so the
+/// command can only read a video already known to the application. The first
+/// attempt stream-copies audio/video; a H.264/AAC fallback is used only when
+/// that MP4 remux fails.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn export_learning_segment(
+    state: state_type!(),
+    video_id: i64,
+    start_time: f64,
+    end_time: f64,
+) -> Result<LearningSegmentExport, String> {
+    if !(start_time.is_finite() && end_time.is_finite() && start_time >= 0.0 && end_time > start_time) {
+        return Err("Learning segment requires finite timestamps with 0 <= start_time < end_time".to_string());
+    }
+
+    let video = state.db.get_video(video_id).await
+        .map_err(|error| format!("Unable to load learning segment source video {video_id}: {error}"))?;
+    let output_root = state.config.read().await.output.clone();
+    let input_path = crate::handlers::video::resolve_external_playback_path(
+        state.db.as_ref(), Path::new(&output_root), video.id, &video.file,
+    ).await?;
+    if !input_path.is_file() {
+        return Err(format!("Learning segment source file does not exist: {}", input_path.display()));
+    }
+
+    let output_dir = Path::new(&output_root).join("learning-segments");
+    let output_path = output_dir.join(format!(
+        "learning-{}-{}-{:010.3}-{:010.3}.mp4",
+        video.id,
+        uuid::Uuid::new_v4(),
+        start_time,
+        end_time,
+    ));
+    let re_encoded = crate::ffmpeg::export_learning_segment_mp4(
+        &input_path, &output_path, start_time, end_time - start_time,
+    ).await?;
+
+    Ok(LearningSegmentExport {
+        output_path: output_path.to_string_lossy().to_string(),
+        start_time,
+        end_time,
+        re_encoded,
+    })
+}
+
 // Helper function to get ffmpeg path
 fn get_ffmpeg_path() -> PathBuf {
     let mut path = Path::new("ffmpeg").to_path_buf();
@@ -116,8 +172,18 @@ pub async fn extract_video_frames(
 }
 
 /// Extract a single frame at a specific timestamp
-async fn extract_frame_at_timestamp(video_path: &Path, timestamp: f64) -> Result<String, String> {
-    let output_path = std::env::temp_dir().join(format!("frame_{}.jpg", timestamp));
+pub(crate) async fn extract_frame_at_timestamp(
+    video_path: &Path,
+    timestamp: f64,
+) -> Result<String, String> {
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Failed to create frame identifier: {error}"))?
+        .as_nanos();
+    let output_path = std::env::temp_dir().join(format!(
+        "bsr-anchor-{}-{unique_id}-{timestamp:.3}.jpg",
+        std::process::id()
+    ));
 
     let ffmpeg_path = get_ffmpeg_path();
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
@@ -130,12 +196,18 @@ async fn extract_frame_at_timestamp(video_path: &Path, timestamp: f64) -> Result
     }
 
     cmd.args([
-        "-ss",
-        &timestamp.to_string(),
         "-i",
         video_path.to_str().unwrap(),
+        "-ss",
+        &timestamp.to_string(),
         "-vframes",
         "1",
+        "-update",
+        "1",
+        "-strict",
+        "unofficial",
+        "-pix_fmt",
+        "yuvj420p",
         "-q:v",
         "2",
         "-y",
@@ -646,6 +718,12 @@ pub async fn merge_videos(
         area: 0,
         created_at: chrono::Utc::now().to_rfc3339(),
         platform: videos[0].platform.clone(),
+        anchor_name: String::new(),
+        anchor_source: String::new(),
+        anchor_confidence: String::new(),
+        anchor_detection_status: "pending".to_string(),
+        anchor_detection_error: String::new(),
+        anchor_detected_at: String::new(),
     };
 
     // Insert into database

@@ -63,6 +63,19 @@ pub(crate) async fn request_minimax_text(
     messages: Vec<Value>,
     max_tokens: u32,
 ) -> Result<String, String> {
+    let request_body = json!({
+        "model": MINIMAX_MODEL,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": messages,
+    });
+    request_minimax_payload(api_key, &request_body).await
+}
+
+pub(crate) async fn request_minimax_payload(
+    api_key: &str,
+    request_body: &Value,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .timeout(std::time::Duration::from_secs(180))
@@ -70,13 +83,6 @@ pub(crate) async fn request_minimax_text(
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|error| format!("创建 MiniMax 客户端失败：{error}"))?;
-
-    let request_body = json!({
-        "model": MINIMAX_MODEL,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": messages,
-    });
 
     let mut response = None;
     let mut last_error = None;
@@ -87,7 +93,7 @@ pub(crate) async fn request_minimax_text(
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("connection", "close")
-            .json(&request_body)
+            .json(request_body)
             .send()
             .await
         {

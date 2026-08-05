@@ -35,6 +35,11 @@ pub struct LiveSessionImport {
     pub average_online: Option<i64>,
     pub average_watch_seconds: Option<i64>,
     pub viewer_conversion_rate: Option<f64>,
+    pub deal_buyer_count: Option<i64>,
+    pub deal_item_count: Option<i64>,
+    pub product_click_conversion_rate: Option<f64>,
+    pub exposure_viewer_rate: Option<f64>,
+    pub qianchuan_spend_fen: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +48,7 @@ pub struct LiveChannelImport {
     pub viewer_count: Option<i64>,
     pub payment_amount_fen: Option<i64>,
     pub order_count: Option<i64>,
+    pub qianchuan_spend_fen: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,10 +91,22 @@ pub fn parse_live_dashboard_xlsx(
 
     let basic = horizontal_values(&worksheet(&mut workbook, "基本信息")?)?;
     let board = horizontal_values(&worksheet(&mut workbook, "整体看板")?)?;
-    let session = parse_live_session(&basic, &board).map_err(LiveDashboardImportError::Invalid)?;
+    let conversion = vertical_values(&worksheet(&mut workbook, "流量分析-流量转化")?);
+    let mut session = parse_live_session(&basic, &board, &conversion)
+        .map_err(LiveDashboardImportError::Invalid)?;
     let channels = parse_channels(&worksheet(&mut workbook, "流量分析-渠道分析")?);
     let short_videos = parse_short_videos(&worksheet(&mut workbook, "流量分析-短视频引流")?);
     let products = parse_products(&worksheet(&mut workbook, "商品分析-商品明细")?);
+    let product_item_counts = products
+        .iter()
+        .filter_map(|product| product.sold_count)
+        .collect::<Vec<_>>();
+    session.deal_item_count =
+        (!product_item_counts.is_empty()).then(|| product_item_counts.into_iter().sum());
+    session.qianchuan_spend_fen = channels
+        .iter()
+        .find(|channel| channel.name == "整体")
+        .and_then(|channel| channel.qianchuan_spend_fen);
 
     Ok(LiveDashboardImport {
         session,
@@ -107,7 +125,9 @@ fn worksheet(
         .map_err(|_| LiveDashboardImportError::MissingSheet(name.to_string()))
 }
 
-fn horizontal_values(range: &Range<Data>) -> Result<HashMap<String, String>, LiveDashboardImportError> {
+fn horizontal_values(
+    range: &Range<Data>,
+) -> Result<HashMap<String, String>, LiveDashboardImportError> {
     let mut rows = range.rows();
     let headers = rows
         .next()
@@ -123,6 +143,17 @@ fn horizontal_values(range: &Range<Data>) -> Result<HashMap<String, String>, Liv
         .collect())
 }
 
+fn vertical_values(range: &Range<Data>) -> HashMap<String, String> {
+    range
+        .rows()
+        .filter_map(|row| {
+            let key = row.first().map(cell_text)?;
+            let value = row.get(1).map(cell_text)?;
+            (!key.is_empty()).then_some((key, value))
+        })
+        .collect()
+}
+
 fn parse_channels(range: &Range<Data>) -> Vec<LiveChannelImport> {
     tabular_rows(range)
         .into_iter()
@@ -131,8 +162,13 @@ fn parse_channels(range: &Range<Data>) -> Vec<LiveChannelImport> {
             (!name.is_empty()).then(|| LiveChannelImport {
                 name,
                 viewer_count: row.get("观看人数").and_then(|value| parse_integer(value)),
-                payment_amount_fen: row.get("用户支付金额").and_then(|value| parse_amount_to_fen(value)),
+                payment_amount_fen: row
+                    .get("用户支付金额")
+                    .and_then(|value| parse_amount_to_fen(value)),
                 order_count: row.get("成交订单数").and_then(|value| parse_integer(value)),
+                qianchuan_spend_fen: row
+                    .get("千川消耗")
+                    .and_then(|value| parse_amount_to_fen(value)),
             })
         })
         .collect()
@@ -165,17 +201,23 @@ fn parse_products(range: &Range<Data>) -> Vec<LiveProductImport> {
         .into_iter()
         .filter_map(|row| {
             let product_id = row.get("商品ID")?.trim().to_string();
-            if product_id.is_empty() || product_id == "-" || product_id == "商品ID" {
+            if product_id.is_empty() || product_id.starts_with('-') || product_id == "商品ID" {
                 return None;
             }
             Some(LiveProductImport {
                 product_id,
                 name: row.get("商品名称").cloned().unwrap_or_default(),
-                payment_amount_fen: row.get("用户支付金额").and_then(|value| parse_amount_to_fen(value)),
+                payment_amount_fen: row
+                    .get("用户支付金额")
+                    .and_then(|value| parse_amount_to_fen(value)),
                 sold_count: row.get("成交件数").and_then(|value| parse_integer(value)),
                 buyer_count: row.get("成交人数").and_then(|value| parse_integer(value)),
-                exposure_count: row.get("商品曝光人数").and_then(|value| parse_integer(value)),
-                click_count: row.get("商品点击人数").and_then(|value| parse_integer(value)),
+                exposure_count: row
+                    .get("商品曝光人数")
+                    .and_then(|value| parse_integer(value)),
+                click_count: row
+                    .get("商品点击人数")
+                    .and_then(|value| parse_integer(value)),
             })
         })
         .collect()
@@ -187,15 +229,14 @@ fn tabular_rows(range: &Range<Data>) -> Vec<HashMap<String, String>> {
         Some(headers) => headers.iter().map(cell_text).collect::<Vec<_>>(),
         None => return Vec::new(),
     };
-    rows
-        .map(|row| {
-            headers
-                .iter()
-                .zip(row.iter())
-                .map(|(header, value)| (header.clone(), cell_text(value)))
-                .collect()
-        })
-        .collect()
+    rows.map(|row| {
+        headers
+            .iter()
+            .zip(row.iter())
+            .map(|(header, value)| (header.clone(), cell_text(value)))
+            .collect()
+    })
+    .collect()
 }
 
 fn cell_text(value: &Data) -> String {
@@ -205,6 +246,7 @@ fn cell_text(value: &Data) -> String {
 fn parse_live_session(
     basic: &HashMap<String, String>,
     board: &HashMap<String, String>,
+    conversion: &HashMap<String, String>,
 ) -> Result<LiveSessionImport, String> {
     let started_at = required_field(basic, "直播时间")?
         .split('-')
@@ -238,6 +280,17 @@ fn parse_live_session(
         viewer_conversion_rate: board
             .get("直播间观看-成交率(人数)")
             .and_then(|value| parse_ratio(value)),
+        deal_buyer_count: conversion
+            .get("成交人数")
+            .and_then(|value| parse_integer(value)),
+        deal_item_count: None,
+        product_click_conversion_rate: board
+            .get("直播间商品点击-成交率(人数)")
+            .and_then(|value| parse_ratio(value)),
+        exposure_viewer_rate: board
+            .get("直播间曝光-观看率(人数)")
+            .and_then(|value| parse_ratio(value)),
+        qianchuan_spend_fen: None,
     })
 }
 
@@ -254,10 +307,7 @@ fn parse_integer(value: &str) -> Option<i64> {
 }
 
 fn parse_amount_to_fen(value: &str) -> Option<i64> {
-    let normalized = value
-        .trim()
-        .trim_start_matches('¥')
-        .replace(',', "");
+    let normalized = value.trim().trim_start_matches('¥').replace(',', "");
     if normalized.is_empty() || normalized == "—" {
         return None;
     }
@@ -340,7 +390,7 @@ mod tests {
             ("直播间观看-成交率(人数)".to_string(), "0.68%".to_string()),
         ]);
 
-        let session = parse_live_session(&basic, &board).unwrap();
+        let session = parse_live_session(&basic, &board, &HashMap::new()).unwrap();
 
         assert_eq!(session.account_key, "20296833869");
         assert_eq!(session.shop_name, "金典拍拍相机专卖店");
@@ -363,5 +413,21 @@ mod tests {
 
         assert_eq!(imported.session.account_key, "20296833869");
         assert_eq!(imported.session.payment_amount_fen, 23_655_200);
+    }
+
+    #[test]
+    fn parses_official_kpi_alignment_values_from_the_fixture() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/live-dashboard/valid-live-dashboard.xlsx"
+        ));
+
+        let imported = parse_live_dashboard_xlsx(path).unwrap();
+
+        assert_eq!(imported.session.deal_buyer_count, Some(46));
+        assert_eq!(imported.session.deal_item_count, Some(51));
+        assert_eq!(imported.session.product_click_conversion_rate, Some(0.0308));
+        assert_eq!(imported.session.exposure_viewer_rate, Some(0.1012));
+        assert_eq!(imported.session.qianchuan_spend_fen, Some(220_151));
     }
 }

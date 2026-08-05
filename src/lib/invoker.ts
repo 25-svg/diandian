@@ -1,4 +1,4 @@
-import { invoke as tauri_invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke as tauri_invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { fetch as tauri_fetch } from "@tauri-apps/plugin-http";
 import { listen as tauri_listen } from "@tauri-apps/api/event";
@@ -160,6 +160,9 @@ async function get_static_url(base: string, path: string) {
   }
   let staticUrl;
   if (TAURI_ENV) {
+    if (/^(?:[a-zA-Z]:[\\/]|\\\\)/.test(path)) {
+      return convertFileSrc(path);
+    }
     if (STATIC_PORT === 0) {
       STATIC_PORT = await invoke("get_static_port");
     }

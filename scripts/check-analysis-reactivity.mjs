@@ -80,6 +80,58 @@ assert.match(
   /await get_static_url[\s\S]{0,500}isCurrentInitializationRequest/,
   "initialization must validate its source token after resolving the video URL",
 );
+const initializationCode = componentSource.slice(
+  componentSource.indexOf("async function initialize"),
+  componentSource.indexOf("async function loadActiveMaster"),
+);
+const playbackLookupCode = componentSource.slice(
+  componentSource.indexOf("async function loadVideoPlaybackSource"),
+  componentSource.indexOf("async function loadActiveMaster"),
+);
+const playbackErrorCode = componentSource.slice(
+  componentSource.indexOf("async function handleVideoElementError"),
+  componentSource.indexOf("async function prepareVideoForPlayback"),
+);
+assert.match(
+  initializationCode,
+  /void loadVideoPlaybackSource\(selectedVideo, requestIdentity, requestId\)/,
+  "video playback lookup must not block the company analysis workspace when the database pool is busy",
+);
+assert.match(
+  initializationCode,
+  /analysisMode === "company_deal"\s*\?\s*void loadActiveMaster\(\)\s*:\s*await loadActiveMaster\(\)/,
+  "company analysis must render before optional master-script lookup completes",
+);
+assert.match(
+  playbackLookupCode,
+  /if \(nextPlaybackSource\.preparing\)\s*\{\s*void observeVideoPlaybackUntilReady/,
+  "an existing user-started playback task may be observed",
+);
+assert.doesNotMatch(
+  playbackLookupCode,
+  /else\s*\{\s*void prepareVideoForPlayback\(\);\s*\}/,
+  "opening an analysis page must never start a playback conversion",
+);
+assert.doesNotMatch(
+  playbackErrorCode,
+  /prepareVideoForPlayback\(\)/,
+  "a decode error must show the manual conversion action instead of repeatedly restarting FFmpeg",
+);
+assert.match(
+  componentSource,
+  /let playbackLoadError\s*=\s*""[\s\S]*?let transcriptLoadError\s*=\s*""/,
+  "media failures must have local player and transcript error state",
+);
+assert.match(
+  componentSource,
+  /const TASK_POLL_MAX_ATTEMPTS\s*=\s*120/,
+  "media task observation must be bounded instead of waiting forever",
+);
+assert.match(
+  componentSource,
+  /playbackLoadError\s*=\s*`播放器暂不可用：/,
+  "player lookup failure must not replace the global page status",
+);
 assert.match(
   componentSource,
   /async function reviewSelectedCandidate[\s\S]*?async function copyText/,

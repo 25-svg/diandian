@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
-use super::{
-    asr_text::normalize_commerce_text_boundaries, GenerateResult, SubtitleGeneratorType,
-};
+use super::{asr_text::normalize_commerce_text_boundaries, GenerateResult, SubtitleGeneratorType};
 
 const SUBMIT_ENDPOINT: &str = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit";
 const QUERY_ENDPOINT: &str = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query";

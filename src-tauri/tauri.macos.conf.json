@@ -1,7 +1,11 @@
 {
   "bundle": {
+    "resources": {
+      "resources/macos/universal/ffmpeg": "ffmpeg",
+      "resources/macos/universal/ffprobe": "ffprobe"
+    },
     "macOS": {
-      "minimumSystemVersion": "15.0"
+      "minimumSystemVersion": "13.0"
     }
   },
   "app": {

@@ -148,22 +148,46 @@ impl TaskManager {
         self.scheduler_handle = Some(handle);
     }
 
-    /// Stop the task manager's scheduler
-    #[allow(dead_code)]
-    pub async fn stop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
+    /// Cancel queued and running work before application shutdown.
+    ///
+    /// Running video jobs own their FFmpeg child handles. Aborting the Tokio
+    /// task drops those handles, which triggers `kill_on_drop(true)` on the
+    /// FFmpeg command and prevents the child process from outliving the app.
+    pub async fn shutdown(&self) {
+        if let Some(tx) = &self.shutdown_tx {
             let _ = tx.send(());
         }
+
+        let queued_ids = {
+            let mut queue = self.queue.lock().await;
+            queue.drain(..).map(|task| task.task_id).collect::<Vec<_>>()
+        };
+        let running_ids = {
+            let mut running = self.running_tasks.write().await;
+            running
+                .drain()
+                .map(|(task_id, handle)| {
+                    handle.abort();
+                    task_id
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut statuses = self.task_statuses.write().await;
+        for task_id in queued_ids.into_iter().chain(running_ids) {
+            statuses.insert(task_id, TaskStatus::Cancelled);
+        }
+    }
+
+    /// Stop the task manager's scheduler and wait for it to exit.
+    #[allow(dead_code)]
+    pub async fn stop(&mut self) {
+        self.shutdown().await;
 
         if let Some(handle) = self.scheduler_handle.take() {
             let _ = handle.await;
         }
-
-        // Cancel all running tasks
-        let running_tasks = self.running_tasks.read().await;
-        for handle in running_tasks.values() {
-            handle.abort();
-        }
+        self.shutdown_tx = None;
     }
 
     /// Add a task to the queue
@@ -402,6 +426,56 @@ mod tests {
         manager.cancel_task("test-cancel").await.unwrap();
         let status = manager.get_task_status("test-cancel").await;
         assert_eq!(status, Some(TaskStatus::Cancelled));
+
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_running_and_queued_tasks() {
+        let mut manager = TaskManager::with_config(TaskManagerConfig {
+            max_concurrent_tasks: 1,
+            check_interval_ms: 10,
+            max_queue_size: 10,
+        });
+        manager.start();
+
+        manager
+            .add_task(Task::new(
+                "running-on-exit".to_string(),
+                TaskPriority::Normal,
+                std::future::pending::<Result<(), String>>(),
+            ))
+            .await
+            .unwrap();
+        manager
+            .add_task(Task::new(
+                "queued-on-exit".to_string(),
+                TaskPriority::Normal,
+                std::future::pending::<Result<(), String>>(),
+            ))
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            if manager.running_count().await == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.running_count().await, 1);
+
+        manager.shutdown().await;
+
+        assert_eq!(manager.running_count().await, 0);
+        assert_eq!(manager.queue_size().await, 0);
+        assert_eq!(
+            manager.get_task_status("running-on-exit").await,
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(
+            manager.get_task_status("queued-on-exit").await,
+            Some(TaskStatus::Cancelled)
+        );
 
         manager.stop().await;
     }

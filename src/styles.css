@@ -2,6 +2,76 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  /* Apple HIG–inspired tokens (light) */
+  --mac-label: #1d1d1f;
+  --mac-secondary: #6e6e73;
+  --mac-tertiary: #86868b;
+  --mac-quaternary: #aeaeb2;
+
+  --mac-bg: #eef0f4;
+  --mac-bg-window: #f5f5f7;
+  --mac-bg-elevated: rgba(255, 255, 255, 0.88);
+  --mac-bg-card: #ffffff;
+  --mac-fill: rgba(118, 118, 128, 0.12);
+  --mac-fill-hover: rgba(118, 118, 128, 0.18);
+  --mac-separator: rgba(60, 60, 67, 0.12);
+  --mac-separator-strong: rgba(60, 60, 67, 0.18);
+
+  --mac-blue: #0071e3;
+  --mac-blue-hover: #0077ed;
+  --mac-blue-pressed: #006edb;
+  --mac-blue-soft: rgba(0, 113, 227, 0.1);
+  --mac-green: #30d158;
+  --mac-green-solid: #34c759;
+  --mac-red: #ff3b30;
+  --mac-orange: #ff9f0a;
+  --mac-purple: #bf5af2;
+
+  --mac-radius-sm: 8px;
+  --mac-radius-md: 11px;
+  --mac-radius-lg: 14px;
+  --mac-radius-xl: 20px;
+
+  --mac-shadow-sm: 0 1px 2px rgba(47, 53, 66, 0.04);
+  --mac-shadow-md: 0 8px 24px rgba(47, 53, 66, 0.08), 0 2px 6px rgba(47, 53, 66, 0.04);
+  --mac-shadow-lg: 0 18px 50px rgba(47, 53, 66, 0.12), 0 2px 6px rgba(47, 53, 66, 0.05);
+
+  --mac-font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+    "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  --mac-tracking-tight: -0.35px;
+}
+
+.dark {
+  --mac-label: #f5f5f7;
+  --mac-secondary: #98989d;
+  --mac-tertiary: #8e8e93;
+  --mac-quaternary: #636366;
+
+  --mac-bg: #1c1c1e;
+  --mac-bg-window: #1c1c1e;
+  --mac-bg-elevated: rgba(37, 37, 40, 0.9);
+  --mac-bg-card: #2c2c2e;
+  --mac-fill: rgba(118, 118, 128, 0.24);
+  --mac-fill-hover: rgba(118, 118, 128, 0.32);
+  --mac-separator: rgba(84, 84, 88, 0.65);
+  --mac-separator-strong: rgba(84, 84, 88, 0.8);
+
+  --mac-blue: #0a84ff;
+  --mac-blue-hover: #409cff;
+  --mac-blue-pressed: #0077ed;
+  --mac-blue-soft: rgba(10, 132, 255, 0.16);
+  --mac-green: #30d158;
+  --mac-green-solid: #30d158;
+  --mac-red: #ff453a;
+  --mac-orange: #ff9f0a;
+  --mac-purple: #bf5af2;
+
+  --mac-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --mac-shadow-md: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --mac-shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.32);
+}
+
 html,
 body {
   height: 100%;
@@ -10,25 +80,225 @@ body {
   cursor: default;
   margin: 0;
   overflow: hidden;
-  color: #1d1d1f;
-  background: #eef0f4;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  color: var(--mac-label);
+  background: var(--mac-bg);
+  font-family: var(--mac-font);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
-button, input, select, textarea { font-family: inherit; }
-input, textarea, [contenteditable="true"], .selectable-content, .selectable-content * {
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+input,
+textarea,
+[contenteditable="true"],
+.selectable-content,
+.selectable-content * {
   user-select: text;
   -webkit-user-select: text;
 }
-.selectable-content { cursor: text; }
-.selectable-content button, .selectable-content button * {
+.selectable-content {
+  cursor: text;
+}
+.selectable-content button,
+.selectable-content button * {
   user-select: none;
   -webkit-user-select: none;
   cursor: pointer;
 }
-::selection { color: #07192b; background: rgba(0, 122, 255, .22); }
+::selection {
+  color: #07192b;
+  background: rgba(0, 122, 255, 0.22);
+}
+
+/* —— Page chrome utilities —— */
+@layer components {
+  .mac-page {
+    @apply flex-1 overflow-auto;
+    padding: 22px 24px 28px;
+    background: linear-gradient(180deg, #fbfbfd 0%, #f2f3f6 100%);
+    color: var(--mac-label);
+  }
+  .dark .mac-page {
+    background: linear-gradient(180deg, #1c1c1e 0%, #161618 100%);
+  }
+
+  .mac-page-header {
+    @apply flex flex-wrap items-start justify-between gap-4;
+  }
+
+  .mac-page-title {
+    margin: 0;
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: var(--mac-tracking-tight);
+    color: var(--mac-label);
+    line-height: 1.15;
+  }
+
+  .mac-page-subtitle {
+    margin: 6px 0 0;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--mac-tertiary);
+  }
+
+  .mac-card {
+    border: 1px solid var(--mac-separator);
+    border-radius: var(--mac-radius-lg);
+    background: var(--mac-bg-card);
+    box-shadow: var(--mac-shadow-sm);
+  }
+
+  .mac-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 14px;
+    border: 1px solid var(--mac-separator-strong);
+    border-radius: 980px;
+    background: var(--mac-bg-card);
+    color: var(--mac-label);
+    font-size: 13px;
+    font-weight: 550;
+    letter-spacing: -0.1px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+  }
+  .mac-btn:hover {
+    background: var(--mac-fill);
+  }
+  .mac-btn:active {
+    transform: scale(0.98);
+  }
+  .mac-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .mac-btn-primary {
+    border-color: transparent;
+    background: var(--mac-blue);
+    color: #fff;
+  }
+  .mac-btn-primary:hover {
+    background: var(--mac-blue-hover);
+  }
+  .mac-btn-primary:active {
+    background: var(--mac-blue-pressed);
+  }
+
+  .mac-btn-success {
+    border-color: transparent;
+    background: var(--mac-green-solid);
+    color: #fff;
+  }
+  .mac-btn-success:hover {
+    filter: brightness(1.05);
+  }
+
+  .mac-segmented {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 10px;
+    background: var(--mac-fill);
+    gap: 2px;
+  }
+  .mac-segmented button {
+    height: 28px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--mac-secondary);
+    font-size: 13px;
+    font-weight: 550;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .mac-segmented button[aria-selected="true"],
+  .mac-segmented button.mac-segment-active {
+    color: var(--mac-label);
+    background: var(--mac-bg-card);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  }
+  .dark .mac-segmented button[aria-selected="true"],
+  .dark .mac-segmented button.mac-segment-active {
+    background: #3a3a3c;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  }
+
+  .mac-field {
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--mac-separator-strong);
+    border-radius: var(--mac-radius-sm);
+    background: var(--mac-fill);
+    color: var(--mac-label);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  }
+  .mac-field:focus {
+    border-color: var(--mac-blue);
+    background: var(--mac-bg-card);
+    box-shadow: 0 0 0 3px var(--mac-blue-soft);
+  }
+
+  .mac-table-wrap {
+    overflow-x: auto;
+    border-radius: var(--mac-radius-lg);
+  }
+
+  .mac-table {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+  }
+  .mac-table thead th {
+    padding: 10px 12px;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--mac-tertiary);
+    border-bottom: 1px solid var(--mac-separator);
+    background: transparent;
+  }
+  .mac-table tbody td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--mac-separator);
+    vertical-align: middle;
+  }
+  .mac-table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .mac-table tbody tr:hover {
+    background: rgba(0, 0, 0, 0.028);
+  }
+  .dark .mac-table tbody tr:hover {
+    background: rgba(255, 255, 255, 0.04);
+  }
+}
+
+.icon-white {
+  color: white;
+}
+
+.icon-primary {
+  color: var(--mac-blue);
+}
+
+.icon-danger {
+  color: var(--mac-red);
+}
 
 /* Hide Safari AirPlay button on video elements */
 video::-webkit-media-controls-wireless-playback-picker-button {
@@ -40,18 +310,6 @@ video::-webkit-media-controls-wireless-playback-picker-button {
 
 video::-webkit-media-controls-start-playback-button {
   display: none !important;
-}
-
-.icon-white {
-  color: white;
-}
-
-.icon-primary {
-  color: #007bff;
-}
-
-.icon-danger {
-  color: #dc3545;
 }
 
 /* 自定义滚动条样式 */
@@ -66,20 +324,19 @@ video::-webkit-media-controls-start-playback-button {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(99, 99, 102, .28);
+  background: rgba(99, 99, 102, 0.28);
   border-radius: 4px;
   transition: background-color 0.2s ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(99, 99, 102, .48);
+  background: rgba(99, 99, 102, 0.48);
 }
 
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-/* 针对侧边栏的特殊滚动条样式 */
 .sidebar-scrollbar::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -103,7 +360,6 @@ video::-webkit-media-controls-start-playback-button {
   background: transparent;
 }
 
-/* 针对表格的水平滚动条样式 */
 .sidebar-scrollbar::-webkit-scrollbar:horizontal {
   height: 6px;
 }
@@ -117,7 +373,6 @@ video::-webkit-media-controls-start-playback-button {
   background: #5c5c5e;
 }
 
-/* 针对深色主题的滚动条样式 */
 .dark .sidebar-scrollbar::-webkit-scrollbar-thumb {
   background: #4c4c4e;
 }
@@ -134,7 +389,6 @@ video::-webkit-media-controls-start-playback-button {
   background: #5c5c5e;
 }
 
-/* 针对 Summary 页面的浅色滚动条样式 */
 .custom-scrollbar-light::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -145,13 +399,13 @@ video::-webkit-media-controls-start-playback-button {
 }
 
 .custom-scrollbar-light::-webkit-scrollbar-thumb {
-  background: #d1d5db;
+  background: rgba(99, 99, 102, 0.28);
   border-radius: 3px;
   transition: background-color 0.2s ease;
 }
 
 .custom-scrollbar-light::-webkit-scrollbar-thumb:hover {
-  background: #9ca3af;
+  background: rgba(99, 99, 102, 0.48);
 }
 
 .custom-scrollbar-light::-webkit-scrollbar-corner {
@@ -163,118 +417,99 @@ video::-webkit-media-controls-start-playback-button {
 }
 
 .custom-scrollbar-light::-webkit-scrollbar-thumb:horizontal {
-  background: #d1d5db;
+  background: rgba(99, 99, 102, 0.28);
   border-radius: 3px;
 }
 
 .custom-scrollbar-light::-webkit-scrollbar-thumb:horizontal:hover {
-  background: #9ca3af;
+  background: rgba(99, 99, 102, 0.48);
 }
 
 /* Marked 表格样式 */
 .prose table {
   width: 100%;
-  min-width: 500px; /* 设置最小宽度 */
+  min-width: 500px;
   border-collapse: collapse;
   margin: 1rem 0;
   font-size: 0.875rem;
-  table-layout: auto; /* 允许表格根据内容自动调整列宽 */
+  table-layout: auto;
   overflow-x: auto;
 }
 
 .prose table th,
 .prose table td {
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--mac-separator);
   padding: 0.5rem 0.75rem;
   text-align: left;
-  word-wrap: break-word; /* 允许长单词换行 */
-  white-space: normal; /* 允许文本换行 */
-  min-width: 120px; /* 设置最小列宽 */
-  max-width: 300px; /* 设置最大列宽 */
+  word-wrap: break-word;
+  white-space: normal;
+  min-width: 120px;
+  max-width: 300px;
 }
 
 .prose table th {
-  background-color: #f9fafb;
+  background-color: var(--mac-fill);
   font-weight: 600;
-  color: #374151;
-  white-space: nowrap; /* 表头不换行 */
+  color: var(--mac-secondary);
+  white-space: nowrap;
 }
 
 .prose table tr:nth-child(even) {
-  background-color: #f9fafb;
+  background-color: rgba(118, 118, 128, 0.06);
 }
 
 .prose table tr:hover {
-  background-color: #f3f4f6;
+  background-color: var(--mac-fill);
 }
 
-/* 表格容器样式，支持水平滚动 */
 .prose {
   overflow-x: auto;
   max-width: 100%;
 }
 
-/* 深色主题下的表格样式 */
 .dark .prose table th,
 .dark .prose table td {
-  border-color: #4b5563;
+  border-color: var(--mac-separator);
 }
 
 .dark .prose table th {
-  background-color: #374151;
-  color: #f9fafb;
+  background-color: var(--mac-fill);
+  color: var(--mac-label);
 }
 
 .dark .prose table tr:nth-child(even) {
-  background-color: #374151;
+  background-color: rgba(255, 255, 255, 0.03);
 }
 
 .dark .prose table tr:hover {
-  background-color: #4b5563;
+  background-color: var(--mac-fill-hover);
 }
 
-/* 表格容器样式 */
 .table-container {
   overflow-x: auto;
   max-width: 100%;
-  border-radius: 0.5rem;
-}
-
-.table-container .prose {
-  min-width: 100%;
-}
-
-/* 确保表格在容器内正确显示 */
-.table-container .prose table {
-  margin: 0;
-  width: 100%;
-  min-width: 500px; /* 降低最小宽度，适应更多屏幕 */
-  max-width: none;
-}
-
-/* 消息中表格的特殊样式 */
-.table-container {
+  border-radius: var(--mac-radius-sm);
   scrollbar-width: thin;
-  scrollbar-color: #cbd5e1 #f1f5f9;
-  border-radius: 0.5rem;
-  background: #f8fafc;
+  scrollbar-color: rgba(99, 99, 102, 0.35) transparent;
+  background: var(--mac-fill);
   padding: 0.5rem;
   margin: 0.5rem 0;
 }
 
-.dark .table-container {
-  scrollbar-color: #475569 #1e293b;
-  background: #1e293b;
-}
-
-/* 确保表格内容不会溢出容器 */
 .table-container .prose {
+  min-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   margin: 0;
 }
 
-/* 响应式表格样式 */
+.table-container .prose table {
+  margin: 0;
+  width: 100%;
+  min-width: 500px;
+  max-width: none;
+}
+
 @media (max-width: 768px) {
   .table-container .prose table {
     min-width: 400px;
@@ -294,7 +529,6 @@ video::-webkit-media-controls-start-playback-button {
   }
 }
 
-/* 表格容器的滚动条样式 */
 .table-container::-webkit-scrollbar {
   height: 6px;
 }
@@ -304,18 +538,10 @@ video::-webkit-media-controls-start-playback-button {
 }
 
 .table-container::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: rgba(99, 99, 102, 0.28);
   border-radius: 3px;
 }
 
 .table-container::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
-}
-
-.dark .table-container::-webkit-scrollbar-thumb {
-  background: #475569;
-}
-
-.dark .table-container::-webkit-scrollbar-thumb:hover {
-  background: #64748b;
+  background: rgba(99, 99, 102, 0.48);
 }

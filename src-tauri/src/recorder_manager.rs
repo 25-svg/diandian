@@ -12,7 +12,7 @@ use crate::task::{Task, TaskManager, TaskPriority};
 use crate::webhook::events::{self, Payload};
 use crate::webhook::poster::WebhookPoster;
 use chrono::DateTime;
-use m3u8_rs::{MediaPlaylist, MediaPlaylistType};
+use m3u8_rs::{MediaPlaylist, MediaPlaylistType, Playlist};
 use recorder::account::Account;
 use recorder::danmu::{DanmuEntry, DanmuStorage};
 use recorder::errors::RecorderError;
@@ -39,10 +39,14 @@ use thiserror::Error;
 use tokio::fs::{remove_file, write, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 #[cfg(not(feature = "headless"))]
 use tauri::AppHandle;
+
+async fn clone_lock_value<T: Clone>(lock: &RwLock<T>) -> T {
+    lock.read().await.clone()
+}
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct RecorderList {
@@ -51,28 +55,98 @@ pub struct RecorderList {
 }
 
 async fn remove_archive_cache_dir(path: &Path) -> Result<(), RecorderManagerError> {
-    const ATTEMPTS: usize = 3;
+    const ATTEMPTS: usize = 5;
+    let path = path.to_path_buf();
     let mut last_error = None;
 
     for attempt in 0..ATTEMPTS {
-        match tokio::fs::remove_dir_all(path).await {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => last_error = Some(error),
+        let target = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::fs_util::remove_dir_all_with_fallbacks(&target)
+        })
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(join_error) => {
+                last_error = Some(std::io::Error::other(join_error.to_string()));
+            }
         }
         if attempt + 1 < ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt as u64 + 1))).await;
         }
     }
 
+    if !path.exists() {
+        return Ok(());
+    }
+
     let error = last_error.expect("archive delete attempt must record an error");
+    let hint = crate::fs_util::archive_cache_delete_hint(&path);
     Err(RecorderManagerError::HLSError {
-        err: format!(
-            "无法删除录播缓存 {}：{}。请关闭正在播放该录播的窗口后重试",
-            path.display(),
-            error
-        ),
+        err: format!("无法删除录播缓存 {}：{}。{}", path.display(), error, hint),
     })
+}
+
+async fn measure_recording_cache(work_dir: &Path) -> Result<(f64, u64), std::io::Error> {
+    let mut total_length = 0.0;
+    let mut total_size = 0u64;
+
+    let playlist_path = work_dir.join("playlist.m3u8");
+    if playlist_path.exists() {
+        let bytes = tokio::fs::read(&playlist_path).await?;
+        if let Ok((_, playlist)) = m3u8_rs::parse_playlist(&bytes) {
+            if let Playlist::MediaPlaylist(playlist) = playlist {
+                for segment in &playlist.segments {
+                    total_length += f64::from(segment.duration);
+                }
+            }
+        }
+    }
+
+    if work_dir.exists() {
+        let mut entries = tokio::fs::read_dir(work_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("ts") {
+                total_size += entry.metadata().await?.len();
+            }
+        }
+    }
+
+    Ok((total_length, total_size))
+}
+
+fn is_indexable_active_recording(recording: bool, live_id: &str) -> bool {
+    recording && !live_id.trim().is_empty()
+}
+
+#[cfg(test)]
+mod recording_cache_measure_tests {
+    use super::{is_indexable_active_recording, measure_recording_cache};
+
+    #[test]
+    fn empty_live_id_is_not_an_active_recording_for_archive_repair() {
+        assert!(!is_indexable_active_recording(true, ""));
+        assert!(!is_indexable_active_recording(true, "   "));
+        assert!(is_indexable_active_recording(true, "1785290000000"));
+    }
+
+    #[tokio::test]
+    async fn empty_recording_cache_has_zero_stats() {
+        let path = std::env::temp_dir().join(format!(
+            "shadowreplay-empty-recording-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+
+        let (length, size) = measure_recording_cache(&path).await.unwrap();
+
+        assert_eq!(length, 0.0);
+        assert_eq!(size, 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +175,24 @@ mod archive_delete_tests {
 
         assert!(error.to_string().contains("无法删除录播缓存"));
         std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod config_snapshot_tests {
+    use super::clone_lock_value;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn cloned_snapshot_does_not_block_later_settings_write() {
+        let config = RwLock::new(String::from("transcription settings"));
+
+        let snapshot = clone_lock_value(&config).await;
+        let writable = tokio::time::timeout(Duration::from_millis(50), config.write()).await;
+
+        assert_eq!(snapshot, "transcription settings");
+        assert!(writable.is_ok());
     }
 }
 
@@ -142,6 +234,69 @@ fn transcript_bigram_similarity(left: &str, right: &str) -> f64 {
     let containment = intersection / left_bigrams.len().min(right_bigrams.len()) as f64;
     let jaccard = intersection / union.max(1.0);
     jaccard.max(containment * 0.82)
+}
+
+type ArchiveSubtitleLocks = Mutex<HashMap<String, Arc<Mutex<()>>>>;
+
+async fn archive_subtitle_lock(locks: &ArchiveSubtitleLocks, archive_key: &str) -> Arc<Mutex<()>> {
+    let mut locks = locks.lock().await;
+    locks
+        .entry(archive_key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn subtitle_end_ms(value: &str) -> Option<u64> {
+    srtparse::from_str(value)
+        .ok()?
+        .into_iter()
+        .map(|item| item.end_time.into_duration().as_millis() as u64)
+        .max()
+}
+
+fn is_subtitle_coverage_regression(previous: &str, generated: &str) -> bool {
+    let Some(previous_end_ms) = subtitle_end_ms(previous) else {
+        return false;
+    };
+    let Some(generated_end_ms) = subtitle_end_ms(generated) else {
+        return true;
+    };
+
+    generated_end_ms.saturating_add(60_000) < previous_end_ms
+        && generated_end_ms.saturating_mul(10) < previous_end_ms.saturating_mul(9)
+}
+
+#[cfg(test)]
+mod archive_subtitle_guard_tests {
+    use super::{archive_subtitle_lock, is_subtitle_coverage_regression};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn cue(index: usize, start: &str, end: &str, text: &str) -> String {
+        format!("{index}\n{start} --> {end}\n{text}\n\n")
+    }
+
+    #[test]
+    fn rejects_a_refresh_that_truncates_a_two_hour_transcript_to_one_hour() {
+        let previous = cue(1, "00:00:00,000", "02:18:20,000", "完整文稿");
+        let generated = cue(1, "00:00:00,000", "00:59:59,000", "截断文稿");
+
+        assert!(is_subtitle_coverage_regression(&previous, &generated));
+        assert!(!is_subtitle_coverage_regression(&generated, &previous));
+    }
+
+    #[tokio::test]
+    async fn the_same_archive_reuses_one_generation_lock() {
+        let locks = Mutex::new(HashMap::new());
+
+        let first = archive_subtitle_lock(&locks, "douyin:room:live").await;
+        let second = archive_subtitle_lock(&locks, "douyin:room:live").await;
+        let different = archive_subtitle_lock(&locks, "douyin:room:other").await;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &different));
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -251,7 +406,10 @@ pub struct RecorderManager {
     to_remove: Arc<RwLock<HashSet<String>>>,
     event_tx: broadcast::Sender<RecorderEvent>,
     is_migrating: Arc<AtomicBool>,
+    subtitle_generation_locks: Arc<ArchiveSubtitleLocks>,
+    media_execution_gate: Arc<Semaphore>,
     webhook_poster: WebhookPoster,
+    nas_archive: Arc<crate::nas_archive::NasArchiveService>,
 }
 
 #[derive(Error, Debug)]
@@ -301,7 +459,9 @@ impl RecorderManager {
         db: Arc<Database>,
         config: Arc<RwLock<Config>>,
         task_manager: Arc<TaskManager>,
+        media_execution_gate: Arc<Semaphore>,
         webhook_poster: WebhookPoster,
+        nas_archive: Arc<crate::nas_archive::NasArchiveService>,
     ) -> RecorderManager {
         let (event_tx, _) = broadcast::channel(100);
         let manager = RecorderManager {
@@ -315,7 +475,10 @@ impl RecorderManager {
             to_remove: Arc::new(RwLock::new(HashSet::new())),
             event_tx,
             is_migrating: Arc::new(AtomicBool::new(false)),
+            subtitle_generation_locks: Arc::new(Mutex::new(HashMap::new())),
+            media_execution_gate,
             webhook_poster,
+            nas_archive,
         };
 
         // Start event listener
@@ -370,6 +533,9 @@ impl RecorderManager {
                         Payload::Room(recorder.clone()),
                     );
                     let _ = self.webhook_poster.post_event(&event).await;
+                    if !recorder.live_id.is_empty() {
+                        self.cleanup_empty_record(&recorder).await;
+                    }
                     self.handle_live_end(platform, &room_id, &recorder).await;
                     if self.config.read().await.live_end_notify {
                         #[cfg(feature = "gui")]
@@ -404,6 +570,14 @@ impl RecorderManager {
                     {
                         log::error!("Failed to add record entry into db: {e}");
                     }
+                    crate::handlers::anchor_detection::start_live_anchor_detection(
+                        self.clone(),
+                        self.db.clone(),
+                        self.config.clone(),
+                        platform.as_str().to_string(),
+                        room_id.clone(),
+                        recorder.live_id.clone(),
+                    );
                     let event =
                         events::new_webhook_event(events::RECORD_STARTED, Payload::Room(recorder));
                     let _ = self.webhook_poster.post_event(&event).await;
@@ -413,10 +587,13 @@ impl RecorderManager {
                     duration_secs,
                     cached_size_bytes,
                 } => {
-                    let _ = self
+                    if let Err(error) = self
                         .db
                         .update_record_delta(&live_id, duration_secs, cached_size_bytes)
-                        .await;
+                        .await
+                    {
+                        log::error!("Failed to update record stats for {live_id}: {error:?}");
+                    }
                 }
                 RecorderEvent::RecordEnd { recorder } => {
                     log::info!("Record end: {recorder:?}");
@@ -425,33 +602,11 @@ impl RecorderManager {
                         Payload::Room(recorder.clone()),
                     );
                     let _ = self.webhook_poster.post_event(&event).await;
-                    let live_id = recorder.live_id.clone();
-                    // check record in db, if length is 0, delete it
-                    let room_id = recorder.room_info.room_id.clone();
-                    let record = match self.db.get_record(&room_id, &live_id).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            log::error!("Record not found in db: {recorder:?}, err={e:?}");
-                            return;
-                        }
-                    };
-                    if record.size == 0 {
-                        let _ = self.db.remove_record(&live_id).await;
-                        // remove record folder
-                        let cache_folder = Path::new(self.config.read().await.cache.as_str())
-                            .join(
-                                PlatformType::from_str(&recorder.room_info.platform)
-                                    .unwrap_or(PlatformType::BiliBili)
-                                    .as_str(),
-                            )
-                            .join(room_id)
-                            .join(live_id);
-                        let _ = tokio::fs::remove_dir_all(&cache_folder).await;
-                        log::info!("Record folder removed: {cache_folder:?}");
-                    }
+                    self.cleanup_empty_record(&recorder).await;
                 }
                 RecorderEvent::ProgressUpdate { id, content } => {
-                    self.emitter
+                    let _ = self
+                        .emitter
                         .emit(&RecorderEvent::ProgressUpdate { id, content });
                 }
                 RecorderEvent::ProgressFinished {
@@ -459,17 +614,43 @@ impl RecorderManager {
                     success,
                     message,
                 } => {
-                    self.emitter.emit(&RecorderEvent::ProgressFinished {
+                    let _ = self.emitter.emit(&RecorderEvent::ProgressFinished {
                         id,
                         success,
                         message,
                     });
                 }
                 RecorderEvent::DanmuReceived { room, ts, content } => {
-                    self.emitter
+                    let _ = self
+                        .emitter
                         .emit(&RecorderEvent::DanmuReceived { room, ts, content });
                 }
             }
+        }
+    }
+
+    async fn cleanup_empty_record(&self, recorder: &RecorderInfo) {
+        let live_id = recorder.live_id.clone();
+        let room_id = recorder.room_info.room_id.clone();
+        let record = match self.db.get_record(&room_id, &live_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("Record not found in db: {recorder:?}, err={e:?}");
+                return;
+            }
+        };
+        if record.size == 0 {
+            let _ = self.db.remove_record(&live_id).await;
+            let cache_folder = Path::new(self.config.read().await.cache.as_str())
+                .join(
+                    PlatformType::from_str(&recorder.room_info.platform)
+                        .unwrap_or(PlatformType::BiliBili)
+                        .as_str(),
+                )
+                .join(room_id)
+                .join(live_id);
+            let _ = tokio::fs::remove_dir_all(&cache_folder).await;
+            log::info!("Empty record folder removed: {cache_folder:?}");
         }
     }
 
@@ -1397,7 +1578,9 @@ impl RecorderManager {
         // live recorder before returning the list.
         for recorder_ref in self.recorders.read().await.values() {
             let recorder = recorder_ref.info().await;
-            if recorder.recording && recorder.room_info.room_id == room_id {
+            if is_indexable_active_recording(recorder.recording, &recorder.live_id)
+                && recorder.room_info.room_id == room_id
+            {
                 let platform =
                     PlatformType::from_str(&recorder.room_info.platform).map_err(|_| {
                         RecorderManagerError::InvalidPlatformType {
@@ -1426,9 +1609,47 @@ impl RecorderManager {
                         )
                         .await?;
                 }
+                if let Err(error) = self
+                    .sync_active_recording_stats(platform, room_id, &recorder.live_id)
+                    .await
+                {
+                    log::warn!(
+                        "Failed to sync active recording stats for {room_id}:{}: {error}",
+                        recorder.live_id
+                    );
+                }
             }
         }
         Ok(self.db.get_records(room_id, offset, limit).await?)
+    }
+
+    async fn sync_active_recording_stats(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> Result<(), RecorderManagerError> {
+        let cache_root = self.config.read().await.cache.clone();
+        let work_dir = Path::new(&cache_root)
+            .join(platform.as_str())
+            .join(room_id)
+            .join(live_id);
+        let (cache_length, cache_size) = measure_recording_cache(&work_dir).await?;
+        if cache_length <= 0.0 && cache_size == 0 {
+            return Ok(());
+        }
+
+        let record = self.db.get_record(room_id, live_id).await?;
+        let length_delta = cache_length - record.length;
+        let size_delta = cache_size.saturating_sub(record.size as u64);
+        if length_delta <= 0.0 && size_delta == 0 {
+            return Ok(());
+        }
+
+        self.db
+            .update_record_delta(live_id, length_delta.max(0.0), size_delta)
+            .await?;
+        Ok(())
     }
 
     pub async fn get_archive(
@@ -1496,6 +1717,24 @@ impl RecorderManager {
         live_id: &str,
         reporter: Option<&ProgressReporter>,
     ) -> Result<String, RecorderManagerError> {
+        let archive_key = format!("{}:{room_id}:{live_id}", platform.as_str());
+        let generation_lock =
+            archive_subtitle_lock(&self.subtitle_generation_locks, &archive_key).await;
+        let _generation_guard = generation_lock.lock().await;
+        if let Some(reporter) = reporter {
+            reporter
+                .update("等待其他视频处理完成，字幕任务将按顺序执行")
+                .await;
+        }
+        let _media_permit = self
+            .media_execution_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RecorderManagerError::SubtitleGenerationFailed {
+                error: "media execution gate is closed".to_string(),
+            })?;
+
         // generate subtitle file under work_dir
         let work_dir = CachePath::new(
             self.config.read().await.cache.clone().into(),
@@ -1521,24 +1760,39 @@ impl RecorderManager {
             m3u8_index_file_path.full_path().display()
         );
 
-        // Generate a tmp mp4 clip file first
+        // Generate a tmp mp4 clip file first (reuse when a previous run already merged it).
         let clip_file_path = work_dir.with_filename("tmp.mp4");
-        if let Some(reporter) = reporter {
-            reporter.update("正在准备整场录播音频...").await;
+        let reuse_tmp_mp4 = tokio::fs::metadata(&clip_file_path.full_path())
+            .await
+            .ok()
+            .is_some_and(|meta| meta.is_file() && meta.len() > 1024 * 1024);
+        if reuse_tmp_mp4 {
+            log::info!(
+                "[{}]Reusing existing temp clip for subtitle generation: {}",
+                room_id,
+                clip_file_path.full_path().display()
+            );
+            if let Some(reporter) = reporter {
+                reporter.update("复用已合成的录播音频，跳过重新合并").await;
+            }
+        } else {
+            if let Some(reporter) = reporter {
+                reporter.update("正在准备整场录播音频...").await;
+            }
+            if let Err(e) = crate::ffmpeg::playlist::clip_from_playlist(
+                None::<&crate::progress::progress_reporter::ProgressReporter>,
+                Path::new(&m3u8_index_file_path.full_path()),
+                Path::new(&clip_file_path.full_path()),
+                None,
+            )
+            .await
+            {
+                return Err(RecorderManagerError::SubtitleGenerationFailed {
+                    error: e.to_string(),
+                });
+            }
+            log::info!("[{}]Temp clip file generated: {}", room_id, clip_file_path);
         }
-        if let Err(e) = crate::ffmpeg::playlist::clip_from_playlist(
-            None::<&crate::progress::progress_reporter::ProgressReporter>,
-            Path::new(&m3u8_index_file_path.full_path()),
-            Path::new(&clip_file_path.full_path()),
-            None,
-        )
-        .await
-        {
-            return Err(RecorderManagerError::SubtitleGenerationFailed {
-                error: e.to_string(),
-            });
-        }
-        log::info!("[{}]Temp clip file generated: {}", room_id, clip_file_path);
 
         // Read config to determine generator type. For the local engine, prepare
         // the managed model automatically on first use so non-technical users do
@@ -1563,7 +1817,7 @@ impl RecorderManager {
             config.save();
         }
 
-        let config = self.config.read().await;
+        let config = clone_lock_value(&self.config).await;
         let generator_type = config.subtitle_generator_type.as_str();
 
         // For third-party services (powerlive), extract opus audio from mp4
@@ -1773,11 +2027,33 @@ impl RecorderManager {
         log::info!("[{room_id}]Subtitle generated");
         let result = result.unwrap();
         let actual_generator = result.generator_type.as_str();
-        let subtitle_content = result
+        let generated_subtitle_content = result
             .subtitle_content
             .iter()
             .map(item_to_srt)
             .collect::<String>();
+        let subtitle_content = match tokio::fs::read_to_string(subtitle_file_path.full_path()).await
+        {
+            Ok(previous)
+                if !previous.trim().is_empty()
+                    && is_subtitle_coverage_regression(&previous, &generated_subtitle_content) =>
+            {
+                let truncated_candidate =
+                    work_dir.with_filename("subtitle.truncated-candidate.srt");
+                tokio::fs::write(
+                    truncated_candidate.full_path(),
+                    generated_subtitle_content.as_bytes(),
+                )
+                .await?;
+                log::warn!(
+                    "[{room_id}]Rejected truncated transcript generation: previous_end_ms={:?}, generated_end_ms={:?}",
+                    subtitle_end_ms(&previous),
+                    subtitle_end_ms(&generated_subtitle_content)
+                );
+                previous
+            }
+            _ => generated_subtitle_content,
+        };
         // Do not truncate the existing transcript until ASR has completed.
         // This keeps the last known-good transcript intact when a provider fails.
         tokio::fs::write(subtitle_file_path.full_path(), subtitle_content.as_bytes()).await?;
@@ -1853,6 +2129,7 @@ impl RecorderManager {
         platform: PlatformType,
         room_id: &str,
         live_id: &str,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<ArchiveSubtitleRefreshResult, RecorderManagerError> {
         let existing = self
             .get_archive_subtitle(platform, room_id, live_id)
@@ -1860,7 +2137,7 @@ impl RecorderManager {
             .ok()
             .filter(|value| !value.trim().is_empty());
         let generated = self
-            .generate_archive_subtitle(platform, room_id, live_id, None)
+            .generate_archive_subtitle(platform, room_id, live_id, reporter)
             .await?;
 
         let work_dir = CachePath::new(
@@ -1886,7 +2163,21 @@ impl RecorderManager {
         let similarity = transcript_bigram_similarity(&previous, &generated);
         let old_length = previous.len();
         let new_length = generated.len();
-        if similarity >= 0.48 {
+        if is_subtitle_coverage_regression(&previous, &generated) {
+            log::warn!(
+                "Rejected truncated archive transcript refresh: previous_end_ms={:?}, generated_end_ms={:?}",
+                subtitle_end_ms(&previous),
+                subtitle_end_ms(&generated)
+            );
+            tokio::fs::write(subtitle_path.full_path(), previous.as_bytes()).await?;
+            Ok(ArchiveSubtitleRefreshResult {
+                subtitle: previous,
+                decision: "kept".to_string(),
+                similarity,
+                old_length,
+                new_length,
+            })
+        } else if similarity >= 0.48 {
             tokio::fs::write(subtitle_path.full_path(), previous.as_bytes()).await?;
             Ok(ArchiveSubtitleRefreshResult {
                 subtitle: previous,
@@ -1926,10 +2217,41 @@ impl RecorderManager {
             .join(platform.as_str())
             .join(room_id)
             .join(live_id);
-        let to_delete = self.db.get_record(room_id, live_id).await?;
         remove_archive_cache_dir(&cache_folder).await?;
-        self.db.remove_record(live_id).await?;
-        Ok(to_delete)
+        let deleted_task_count = self
+            .db
+            .delete_archive_tasks(platform.as_str(), room_id, live_id)
+            .await?;
+        if deleted_task_count > 0 {
+            log::info!(
+                "Deleted {deleted_task_count} task(s) linked to archive {room_id}:{live_id}"
+            );
+        }
+        if let Some(to_delete) = self.db.try_remove_record(room_id, live_id).await? {
+            return Ok(to_delete);
+        }
+        log::warn!(
+            "Archive cache removed but record index was already missing: {room_id}:{live_id}"
+        );
+        Ok(RecordRow {
+            platform: platform.as_str().to_string(),
+            parent_id: live_id.to_string(),
+            live_id: live_id.to_string(),
+            room_id: room_id.to_string(),
+            title: String::new(),
+            length: 0.0,
+            size: 0,
+            created_at: String::new(),
+            cover: None,
+            anchor_name: String::new(),
+            anchor_source: String::new(),
+            anchor_confidence: String::new(),
+            anchor_detection_status: "not_requested".to_string(),
+            anchor_detection_error: String::new(),
+            anchor_detected_at: String::new(),
+            archive_kind: "competitor".to_string(),
+            classification_source: "auto_rule".to_string(),
+        })
     }
 
     pub async fn delete_archives(
@@ -1940,9 +2262,23 @@ impl RecorderManager {
     ) -> Result<Vec<RecordRow>, RecorderManagerError> {
         log::info!("Deleting archives in batch: {live_ids:?}");
         let mut to_deletes = Vec::new();
+        let mut failures = Vec::new();
         for live_id in live_ids {
-            let to_delete = self.delete_archive(platform, room_id, live_id).await?;
-            to_deletes.push(to_delete);
+            match self.delete_archive(platform, room_id, live_id).await {
+                Ok(to_delete) => to_deletes.push(to_delete),
+                Err(error) => failures.push(format!("{live_id}: {error}")),
+            }
+        }
+        if to_deletes.is_empty() && !failures.is_empty() {
+            return Err(RecorderManagerError::HLSError {
+                err: failures.join("; "),
+            });
+        }
+        if !failures.is_empty() {
+            log::warn!(
+                "Partial archive delete failure for {room_id}: {}",
+                failures.join("; ")
+            );
         }
         Ok(to_deletes)
     }
@@ -2216,8 +2552,22 @@ impl RecorderManager {
                 tags: String::new(),
                 area: 0,
                 platform: platform.as_str().to_string(),
+                anchor_name: String::new(),
+                anchor_source: String::new(),
+                anchor_confidence: String::new(),
+                anchor_detection_status: "pending".to_string(),
+                anchor_detection_error: String::new(),
+                anchor_detected_at: String::new(),
             })
             .await?;
+
+        if let Err(error) = self
+            .nas_archive
+            .enqueue(video.id, "recording", Path::new(&output_path))
+            .await
+        {
+            log::error!("录制视频加入 NAS 转存队列失败：{error}");
+        }
 
         let event =
             events::new_webhook_event(events::CLIP_GENERATED, events::Payload::Clip(video.clone()));

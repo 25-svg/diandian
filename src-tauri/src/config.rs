@@ -27,6 +27,36 @@ impl Default for NasVideoStorageConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct DoudianOrderConfig {
+    pub env_file: String,
+    pub token_file: String,
+    pub sdk_path: String,
+    pub shop_id: String,
+}
+
+impl Default for DoudianOrderConfig {
+    fn default() -> Self {
+        let desktop = std::env::var("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("C:\\Users\\Public"))
+            .join("Desktop");
+        Self {
+            env_file: desktop.join(".env").to_string_lossy().to_string(),
+            token_file: desktop
+                .join("doudian_token.env")
+                .to_string_lossy()
+                .to_string(),
+            sdk_path: desktop
+                .join("doudian-sdk-python-1.1.0-20260724091610")
+                .join("sdk-python")
+                .to_string_lossy()
+                .to_string(),
+            shop_id: String::new(),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
     pub cache: String,
@@ -87,6 +117,8 @@ pub struct Config {
     pub live_dashboard_download_dir: String,
     #[serde(default)]
     pub auto_download_enabled: bool,
+    #[serde(default)]
+    pub doudian_order: DoudianOrderConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -160,7 +192,12 @@ fn default_volcengine_resource_id() -> String {
 
 fn default_live_dashboard_download_dir() -> String {
     std::env::var("USERPROFILE")
-        .map(|profile| PathBuf::from(profile).join("Downloads").to_string_lossy().to_string())
+        .map(|profile| {
+            PathBuf::from(profile)
+                .join("Downloads")
+                .to_string_lossy()
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -224,6 +261,7 @@ impl Config {
             nas_video_storage: NasVideoStorageConfig::default(),
             live_dashboard_download_dir: default_live_dashboard_download_dir(),
             auto_download_enabled: false,
+            doudian_order: DoudianOrderConfig::default(),
         };
 
         config.save();
@@ -338,6 +376,21 @@ mod tests {
         assert!(config.nas_video_storage.archive_recordings);
         assert!(config.nas_video_storage.archive_imports);
         assert!(config.nas_video_storage.delete_local_after_archive);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_config_prefers_funasr_with_local_whisper_fallback_available() {
+        let root = unique_test_root("funasr-default");
+        let config_path = root.join("Conf.toml");
+        let cache = root.join("cache");
+        let output = root.join("output");
+
+        let config = Config::load(&config_path, &cache, &output).unwrap();
+
+        assert_eq!(config.subtitle_generator_type, "funasr");
+        assert!(!config.whisper_model.trim().is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -60,6 +60,14 @@ CREATE INDEX idx_live_dashboard_sessions_started_at ON live_dashboard_sessions(s
 CREATE INDEX idx_live_dashboard_imports_source_file ON live_dashboard_imports(source_file);
 "#;
 
+pub const LIVE_DASHBOARD_KPI_ALIGNMENT_MIGRATION_SQL: &str = r#"
+ALTER TABLE live_dashboard_sessions ADD COLUMN deal_buyer_count INTEGER;
+ALTER TABLE live_dashboard_sessions ADD COLUMN deal_item_count INTEGER;
+ALTER TABLE live_dashboard_sessions ADD COLUMN product_click_conversion_rate REAL;
+ALTER TABLE live_dashboard_sessions ADD COLUMN exposure_viewer_rate REAL;
+ALTER TABLE live_dashboard_sessions ADD COLUMN qianchuan_spend_fen INTEGER;
+"#;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveDashboardSessionRow {
@@ -73,6 +81,11 @@ pub struct LiveDashboardSessionRow {
     pub average_online: Option<i64>,
     pub average_watch_seconds: Option<i64>,
     pub viewer_conversion_rate: Option<f64>,
+    pub deal_buyer_count: Option<i64>,
+    pub deal_item_count: Option<i64>,
+    pub product_click_conversion_rate: Option<f64>,
+    pub exposure_viewer_rate: Option<f64>,
+    pub qianchuan_spend_fen: Option<i64>,
     pub source_file: String,
     pub imported_at: String,
 }
@@ -124,13 +137,15 @@ impl Database {
         let mut transaction = pool.begin().await?;
         let now = chrono::Utc::now().to_rfc3339();
         let session = sqlx::query_as::<_, LiveDashboardSessionRow>(
-            "INSERT INTO live_dashboard_sessions (account_key, shop_name, started_at, payment_amount_fen, per_thousand_payment_amount_fen, viewer_count, average_online, average_watch_seconds, viewer_conversion_rate, source_file, imported_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+            "INSERT INTO live_dashboard_sessions (account_key, shop_name, started_at, payment_amount_fen, per_thousand_payment_amount_fen, viewer_count, average_online, average_watch_seconds, viewer_conversion_rate, deal_buyer_count, deal_item_count, product_click_conversion_rate, exposure_viewer_rate, qianchuan_spend_fen, source_file, imported_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
              ON CONFLICT(account_key, started_at) DO UPDATE SET \
                shop_name=excluded.shop_name, payment_amount_fen=excluded.payment_amount_fen, \
                per_thousand_payment_amount_fen=excluded.per_thousand_payment_amount_fen, viewer_count=excluded.viewer_count, \
-               average_online=excluded.average_online, average_watch_seconds=excluded.average_watch_seconds, \
-               viewer_conversion_rate=excluded.viewer_conversion_rate, source_file=excluded.source_file, imported_at=excluded.imported_at \
+               average_online=excluded.average_online, average_watch_seconds=excluded.average_watch_seconds, viewer_conversion_rate=excluded.viewer_conversion_rate, \
+               deal_buyer_count=excluded.deal_buyer_count, deal_item_count=excluded.deal_item_count, \
+               product_click_conversion_rate=excluded.product_click_conversion_rate, exposure_viewer_rate=excluded.exposure_viewer_rate, \
+               qianchuan_spend_fen=excluded.qianchuan_spend_fen, source_file=excluded.source_file, imported_at=excluded.imported_at \
              RETURNING *",
         )
         .bind(&imported.session.account_key)
@@ -142,44 +157,74 @@ impl Database {
         .bind(imported.session.average_online)
         .bind(imported.session.average_watch_seconds)
         .bind(imported.session.viewer_conversion_rate)
+        .bind(imported.session.deal_buyer_count)
+        .bind(imported.session.deal_item_count)
+        .bind(imported.session.product_click_conversion_rate)
+        .bind(imported.session.exposure_viewer_rate)
+        .bind(imported.session.qianchuan_spend_fen)
         .bind(source_file)
         .bind(&now)
         .fetch_one(&mut *transaction)
         .await?;
 
-        for table in ["live_dashboard_channels", "live_dashboard_short_videos", "live_dashboard_products"] {
+        for table in [
+            "live_dashboard_channels",
+            "live_dashboard_short_videos",
+            "live_dashboard_products",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE session_id = $1"))
                 .bind(session.id)
                 .execute(&mut *transaction)
                 .await?;
         }
-        for channel in &imported.channels { insert_channel(&mut transaction, session.id, channel).await?; }
-        for video in &imported.short_videos { insert_short_video(&mut transaction, session.id, video).await?; }
-        for product in &imported.products { insert_product(&mut transaction, session.id, product).await?; }
+        for channel in &imported.channels {
+            insert_channel(&mut transaction, session.id, channel).await?;
+        }
+        for video in &imported.short_videos {
+            insert_short_video(&mut transaction, session.id, video).await?;
+        }
+        for product in &imported.products {
+            insert_product(&mut transaction, session.id, product).await?;
+        }
         sqlx::query("INSERT INTO live_dashboard_imports (session_id, source_file, status, message, imported_at) VALUES ($1,$2,'success','',$3)")
             .bind(session.id).bind(source_file).bind(now).execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(session)
     }
 
-    pub async fn list_live_dashboard_sessions(&self) -> Result<Vec<LiveDashboardSessionRow>, DatabaseError> {
+    pub async fn list_live_dashboard_sessions(
+        &self,
+    ) -> Result<Vec<LiveDashboardSessionRow>, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
-        Ok(sqlx::query_as("SELECT * FROM live_dashboard_sessions ORDER BY started_at DESC").fetch_all(&pool).await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM live_dashboard_sessions ORDER BY started_at DESC")
+                .fetch_all(&pool)
+                .await?,
+        )
     }
 
-    pub async fn list_live_dashboard_products(&self, session_id: i64) -> Result<Vec<LiveDashboardProductRow>, DatabaseError> {
+    pub async fn list_live_dashboard_products(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<LiveDashboardProductRow>, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
         Ok(sqlx::query_as("SELECT * FROM live_dashboard_products WHERE session_id=$1 ORDER BY payment_amount_fen DESC, id ASC")
             .bind(session_id).fetch_all(&pool).await?)
     }
 
-    pub async fn list_live_dashboard_channels(&self, session_id: i64) -> Result<Vec<LiveDashboardChannelRow>, DatabaseError> {
+    pub async fn list_live_dashboard_channels(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<LiveDashboardChannelRow>, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
         Ok(sqlx::query_as("SELECT * FROM live_dashboard_channels WHERE session_id=$1 ORDER BY payment_amount_fen DESC, id ASC")
             .bind(session_id).fetch_all(&pool).await?)
     }
 
-    pub async fn list_live_dashboard_short_videos(&self, session_id: i64) -> Result<Vec<LiveDashboardShortVideoRow>, DatabaseError> {
+    pub async fn list_live_dashboard_short_videos(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<LiveDashboardShortVideoRow>, DatabaseError> {
         let pool = self.db.read().await.clone().unwrap();
         Ok(sqlx::query_as("SELECT * FROM live_dashboard_short_videos WHERE session_id=$1 ORDER BY referral_count DESC, id ASC")
             .bind(session_id).fetch_all(&pool).await?)
@@ -187,7 +232,9 @@ impl Database {
 }
 
 async fn insert_channel(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>, session_id: i64, channel: &LiveChannelImport,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: i64,
+    channel: &LiveChannelImport,
 ) -> Result<(), DatabaseError> {
     sqlx::query("INSERT INTO live_dashboard_channels (session_id,name,viewer_count,payment_amount_fen,order_count) VALUES ($1,$2,$3,$4,$5)")
         .bind(session_id).bind(&channel.name).bind(channel.viewer_count).bind(channel.payment_amount_fen).bind(channel.order_count)
@@ -196,7 +243,9 @@ async fn insert_channel(
 }
 
 async fn insert_short_video(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>, session_id: i64, video: &LiveShortVideoImport,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: i64,
+    video: &LiveShortVideoImport,
 ) -> Result<(), DatabaseError> {
     sqlx::query("INSERT INTO live_dashboard_short_videos (session_id,title,published_at,exposure_count,referral_count,click_rate) VALUES ($1,$2,$3,$4,$5,$6)")
         .bind(session_id).bind(&video.title).bind(&video.published_at).bind(video.exposure_count).bind(video.referral_count).bind(video.click_rate)
@@ -205,7 +254,9 @@ async fn insert_short_video(
 }
 
 async fn insert_product(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>, session_id: i64, product: &LiveProductImport,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: i64,
+    product: &LiveProductImport,
 ) -> Result<(), DatabaseError> {
     sqlx::query("INSERT INTO live_dashboard_products (session_id,product_id,name,payment_amount_fen,sold_count,buyer_count,exposure_count,click_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
         .bind(session_id).bind(&product.product_id).bind(&product.name).bind(product.payment_amount_fen).bind(product.sold_count).bind(product.buyer_count).bind(product.exposure_count).bind(product.click_count)
@@ -230,6 +281,9 @@ mod tests {
             .await
             .unwrap();
         pool.execute(LIVE_DASHBOARD_MIGRATION_SQL).await.unwrap();
+        pool.execute(LIVE_DASHBOARD_KPI_ALIGNMENT_MIGRATION_SQL)
+            .await
+            .unwrap();
         let database = Database::new();
         database.set(pool).await;
         database
@@ -247,12 +301,18 @@ mod tests {
                 average_online: Some(22),
                 average_watch_seconds: Some(65),
                 viewer_conversion_rate: Some(0.0068),
+                deal_buyer_count: Some(46),
+                deal_item_count: Some(product_count as i64),
+                product_click_conversion_rate: Some(0.0308),
+                exposure_viewer_rate: Some(0.1012),
+                qianchuan_spend_fen: Some(220_151),
             },
             channels: vec![LiveChannelImport {
                 name: "整体".into(),
                 viewer_count: Some(6763),
                 payment_amount_fen: Some(23_655_200),
                 order_count: Some(51),
+                qianchuan_spend_fen: Some(220_151),
             }],
             short_videos: vec![LiveShortVideoImport {
                 title: "短视频".into(),
@@ -287,8 +347,23 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(database.list_live_dashboard_sessions().await.unwrap().len(), 1);
-        assert_eq!(database.list_live_dashboard_products(updated.id).await.unwrap().len(), 3);
+        assert_eq!(
+            database.list_live_dashboard_sessions().await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            database
+                .list_live_dashboard_products(updated.id)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(updated.source_file, "second.xlsx");
+        assert_eq!(updated.deal_buyer_count, Some(46));
+        assert_eq!(updated.deal_item_count, Some(3));
+        assert_eq!(updated.product_click_conversion_rate, Some(0.0308));
+        assert_eq!(updated.exposure_viewer_rate, Some(0.1012));
+        assert_eq!(updated.qianchuan_spend_fen, Some(220_151));
     }
 }

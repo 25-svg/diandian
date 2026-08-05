@@ -6,7 +6,8 @@ use crate::core::hls_recorder::{construct_stream_from_variant, HlsRecorder};
 use crate::core::{Codec, Format};
 use crate::errors::RecorderError;
 use crate::events::RecorderEvent;
-use crate::platforms::douyin::stream_info::DouyinStream;
+use crate::platforms::douyin::stream_info::{Data, DouyinStream, Main, Origin};
+use crate::platforms::douyin::api::DouyinBasicRoomInfo;
 use crate::traits::RecorderTrait;
 use crate::{Recorder, RoomInfo, UserInfo};
 use async_trait::async_trait;
@@ -29,6 +30,8 @@ pub type DouyinRecorder = Recorder<DouyinExtra>;
 pub struct DouyinExtra {
     sec_user_id: String,
     live_stream: Arc<RwLock<Option<DouyinStream>>>,
+    should_continue: Arc<atomic::AtomicBool>,
+    pre_live_id: Arc<RwLock<Option<String>>>,
 }
 
 fn get_best_stream_url(stream: &DouyinStream) -> Option<String> {
@@ -39,6 +42,36 @@ fn get_best_stream_url(stream: &DouyinStream) -> Option<String> {
     }
 
     Some(stream.data.origin.main.hls.clone())
+}
+
+fn parse_stream_from_room_info(info: &DouyinBasicRoomInfo) -> Option<DouyinStream> {
+    if !info.stream_data.is_empty() {
+        if let Ok(stream) = serde_json::from_str::<DouyinStream>(&info.stream_data) {
+            if get_best_stream_url(&stream).is_some() {
+                return Some(stream);
+            }
+        } else {
+            log::warn!(
+                "Failed to parse stream_data for room {}, falling back to hls_url",
+                info.room_id_str
+            );
+        }
+    }
+
+    if info.hls_url.is_empty() {
+        return None;
+    }
+
+    Some(DouyinStream {
+        data: Data {
+            origin: Origin {
+                main: Main {
+                    hls: info.hls_url.clone(),
+                    flv: String::new(),
+                },
+            },
+        },
+    })
 }
 
 impl DouyinRecorder {
@@ -74,6 +107,8 @@ impl DouyinRecorder {
             extra: DouyinExtra {
                 sec_user_id: sec_user_id.to_string(),
                 live_stream: Arc::new(RwLock::new(None)),
+                should_continue: Arc::new(atomic::AtomicBool::new(false)),
+                pre_live_id: Arc::new(RwLock::new(None)),
             },
         })
     }
@@ -130,6 +165,7 @@ impl DouyinRecorder {
                 }
 
                 if !live_status {
+                    self.clear_continuation().await;
                     self.reset().await;
 
                     return false;
@@ -141,24 +177,18 @@ impl DouyinRecorder {
                     return true;
                 }
 
-                // Get stream URL when live starts
-                if !info.hls_url.is_empty() {
-                    // Only set stream URL, don't create record yet
-                    // Record will be created when first ts download succeeds
-                    // parse info.stream_data into DouyinStream
-                    let stream_data = info.stream_data.clone();
-                    let Ok(stream) = serde_json::from_str::<DouyinStream>(&stream_data) else {
-                        log::error!("Failed to parse stream data: {:#?}", &info);
-                        return false;
-                    };
-                    let Some(new_stream_url) = get_best_stream_url(&stream) else {
-                        log::error!("No stream url found in stream_data: {stream:#?}");
-                        return false;
-                    };
-
-                    log::info!("New douyin stream URL: {}", new_stream_url.clone());
-                    *self.extra.live_stream.write().await = Some(stream);
-                    (*self.platform_live_id.write().await).clone_from(&info.room_id_str);
+                // Cache pull URL when live; stream_data alone is enough even if hls_url is empty.
+                if let Some(stream) = parse_stream_from_room_info(&info) {
+                    if let Some(new_stream_url) = get_best_stream_url(&stream) {
+                        log::info!("New douyin stream URL: {}", new_stream_url);
+                        *self.extra.live_stream.write().await = Some(stream);
+                        (*self.platform_live_id.write().await).clone_from(&info.room_id_str);
+                    }
+                } else {
+                    log::warn!(
+                        "[{}]Live detected but no HLS URL in API response yet",
+                        self.room_id
+                    );
                 }
 
                 true
@@ -249,6 +279,13 @@ impl DouyinRecorder {
         }
     }
 
+    async fn clear_continuation(&self) {
+        self.extra
+            .should_continue
+            .store(false, atomic::Ordering::Relaxed);
+        self.extra.pre_live_id.write().await.take();
+    }
+
     async fn update_entries(&self, live_id: &str) -> Result<(), RecorderError> {
         // Get current room info and stream URL
         let room_info = self.room_info.read().await.clone();
@@ -260,12 +297,44 @@ impl DouyinRecorder {
         };
 
         let work_dir = self.work_dir(live_id).await;
-        let _ = tokio::fs::create_dir_all(&work_dir.full_path()).await;
+        tokio::fs::create_dir_all(&work_dir.full_path())
+            .await
+            .map_err(|e| {
+                log::error!(
+                    "[{}]Failed to create recording cache dir {}: {e}",
+                    self.room_id,
+                    work_dir.full_path().display()
+                );
+                RecorderError::IoError(e)
+            })?;
 
-        // download cover
+        // Cover is optional; never abort the recording thread for cover failures.
         let cover_url = room_info.room_cover.clone();
-        let cover_path = work_dir.with_filename("cover.jpg");
-        let _ = api::download_file(&self.client, &cover_url, &cover_path.full_path()).await;
+        if cover_url.trim().is_empty() {
+            log::warn!("[{}]No cover url, skip cover download", self.room_id);
+        } else {
+            let cover_path = work_dir.with_filename("cover.jpg");
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                api::download_file(&self.client, &cover_url, &cover_path.full_path()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::warn!(
+                        "[{}]Cover download failed, continue recording: {e}",
+                        self.room_id
+                    );
+                }
+                Err(_) => {
+                    log::warn!(
+                        "[{}]Cover download timed out, continue recording",
+                        self.room_id
+                    );
+                }
+            }
+        }
 
         // Setup danmu store
         let danmu_file_path = work_dir.with_filename("danmu.txt");
@@ -281,9 +350,11 @@ impl DouyinRecorder {
             let _ = self_clone.danmu().await;
         }));
 
+        self.is_recording.store(true, atomic::Ordering::Relaxed);
         let _ = self.event_channel.send(RecorderEvent::RecordStart {
             recorder: self.info().await,
         });
+        log::info!("[{}]Record start", self.room_id);
 
         let hls_stream =
             construct_stream_from_variant(live_id, &stream_url, Format::TS, Codec::Avc)
@@ -323,25 +394,70 @@ impl crate::traits::RecorderTrait<DouyinExtra> for DouyinRecorder {
                 if self_clone.check_status().await {
                     // Live status is ok, start recording
                     if self_clone.should_record().await {
-                        self_clone
-                            .is_recording
-                            .store(true, atomic::Ordering::Relaxed);
-                        let live_id = Utc::now().timestamp_millis().to_string();
+                        let live_id = if self_clone
+                            .extra
+                            .should_continue
+                            .swap(false, atomic::Ordering::Relaxed)
+                        {
+                            self_clone
+                                .extra
+                                .pre_live_id
+                                .read()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| Utc::now().timestamp_millis().to_string())
+                        } else {
+                            let live_id = Utc::now().timestamp_millis().to_string();
+                            self_clone
+                                .extra
+                                .pre_live_id
+                                .write()
+                                .await
+                                .replace(live_id.clone());
+                            live_id
+                        };
+
+                        let mut should_emit_record_end = true;
                         if let Err(e) = self_clone.update_entries(&live_id).await {
-                            log::error!("[{}]Update entries error: {}", self_clone.room_id, e);
+                            if should_resume_recording(&e) {
+                                self_clone
+                                    .extra
+                                    .should_continue
+                                    .store(true, atomic::Ordering::Relaxed);
+                                should_emit_record_end = false;
+                                log::warn!(
+                                    "[{}]Temporary stream interruption, reconnecting into the current recording: {}",
+                                    self_clone.room_id,
+                                    e
+                                );
+                            } else {
+                                log::error!("[{}]Update entries error: {}", self_clone.room_id, e);
+                            }
                         }
-                    }
-                    if self_clone.is_recording.load(atomic::Ordering::Relaxed) {
-                        let _ = self_clone.event_channel.send(RecorderEvent::RecordEnd {
-                            recorder: self_clone.info().await,
-                        });
+
+                        if should_emit_record_end
+                            && self_clone.is_recording.load(atomic::Ordering::Relaxed)
+                        {
+                            let _ = self_clone.event_channel.send(RecorderEvent::RecordEnd {
+                                recorder: self_clone.info().await,
+                            });
+                            self_clone.clear_continuation().await;
+                        }
                     }
                     self_clone
                         .is_recording
                         .store(false, atomic::Ordering::Relaxed);
                     self_clone.reset().await;
-                    // Check status again after some seconds
-                    let secs = random::<u64>() % 5;
+                    if self_clone
+                        .extra
+                        .should_continue
+                        .load(atomic::Ordering::Relaxed)
+                    {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    // Check status again after some seconds.
+                    let secs = random::<u64>() % 4 + 2;
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                     continue;
                 }
@@ -353,5 +469,76 @@ impl crate::traits::RecorderTrait<DouyinExtra> for DouyinRecorder {
             }
             log::info!("[{}]Recording thread quit.", self_clone.room_id);
         }));
+    }
+}
+
+fn should_resume_recording(error: &RecorderError) -> bool {
+    matches!(
+        error,
+        RecorderError::UpdateTimeout
+            | RecorderError::StreamExpired { .. }
+            | RecorderError::NoStreamAvailable
+            | RecorderError::M3u8ParseFailed { .. }
+            | RecorderError::ClientError(_)
+    ) || matches!(error, RecorderError::ApiError { error } if error == "Cover download timed out")
+        || matches!(error, RecorderError::IoError(err) if err.to_string() == "Download failed")
+        || matches!(
+            error,
+            RecorderError::IoError(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(3)
+                    || err.raw_os_error() == Some(53)
+                    || err.raw_os_error() == Some(64)
+                    || err.raw_os_error() == Some(67)
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_stream_from_room_info_falls_back_to_hls_url() {
+        let info = DouyinBasicRoomInfo {
+            room_id_str: "123".to_string(),
+            room_title: "title".to_string(),
+            cover: None,
+            status: 0,
+            hls_url: "https://example.com/live.m3u8".to_string(),
+            stream_data: String::new(),
+            user_name: String::new(),
+            user_avatar: String::new(),
+            sec_user_id: String::new(),
+        };
+
+        let stream = parse_stream_from_room_info(&info).expect("hls_url fallback");
+        assert_eq!(
+            get_best_stream_url(&stream).as_deref(),
+            Some("https://example.com/live.m3u8")
+        );
+    }
+
+    #[test]
+    fn resumes_only_recoverable_recording_failures() {
+        assert!(should_resume_recording(&RecorderError::UpdateTimeout));
+        assert!(should_resume_recording(&RecorderError::StreamExpired {
+            expire: 1,
+        }));
+        assert!(!should_resume_recording(&RecorderError::FfmpegError(
+            "invalid segment".to_string(),
+        )));
+    }
+
+    #[test]
+    fn resumes_after_cover_download_timeout() {
+        assert!(should_resume_recording(&RecorderError::ApiError {
+            error: "Cover download timed out".to_string(),
+        }));
+    }
+
+    #[test]
+    fn resumes_after_missing_cache_path() {
+        let err = RecorderError::IoError(std::io::Error::from_raw_os_error(3));
+        assert!(should_resume_recording(&err));
     }
 }

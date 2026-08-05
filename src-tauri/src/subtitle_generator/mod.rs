@@ -11,6 +11,7 @@ pub mod model_manager;
 pub mod powerlive;
 pub mod transcript_artifacts;
 pub mod volcengine;
+#[cfg(feature = "local-whisper")]
 pub mod whisper_cpp;
 pub mod whisper_online;
 

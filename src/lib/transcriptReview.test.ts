@@ -10,10 +10,13 @@ import {
   createTranscriptReviewClient,
   analysisRequestIdentity,
   analysisWorkflowStage,
+  highlightWorkflowStage,
   firstPendingCorrectionId,
   highlightDiscoveryAction,
   highlightReviewGate,
   candidateReviewIdentity,
+  candidateSelectionCancelsReview,
+  sessionReviewShouldContinue,
   isCurrentCandidateReview,
   isCurrentCandidateGeneration,
   transcriptReviewLock,
@@ -21,6 +24,7 @@ import {
   isCurrentAnalysisRequest,
   isUnresolvedTranscriptPlaceholder,
   reviewStatusLabel,
+  transcriptReviewChangesTranscript,
   type InvokeFunction,
   type TranscriptAuditBundle,
   type TranscriptSource,
@@ -108,7 +112,7 @@ test("critical pending corrections block analysis", () => {
   assert.equal(canContinueAnalysis({ pendingCriticalCount: 0 }), true);
 });
 
-test("workflow stage waits for recognition and routes critical review before discovery", () => {
+test("workflow stage waits for recognition but allows discovery before critical review is complete", () => {
   assert.equal(analysisWorkflowStage({
     hasTranscript: false,
     isRecognizing: true,
@@ -126,13 +130,39 @@ test("workflow stage waits for recognition and routes critical review before dis
     isRecognizing: false,
     auditState: "loaded",
     pendingCriticalCount: 1,
-  }), "proofreading");
+  }), "discovering_highlights");
   assert.equal(analysisWorkflowStage({
     hasTranscript: true,
     isRecognizing: false,
     auditState: "loaded",
     pendingCriticalCount: 0,
   }), "discovering_highlights");
+});
+
+test("highlight review remains available while proofreading metadata loads or needs attention", () => {
+  const transcriptReady = {
+    hasTranscript: true,
+    isRecognizing: false,
+    pendingCriticalCount: 6,
+  };
+
+  assert.equal(highlightWorkflowStage({
+    ...transcriptReady,
+    auditState: "loading",
+  }), "discovering_highlights");
+  assert.equal(highlightWorkflowStage({
+    ...transcriptReady,
+    auditState: "error",
+  }), "discovering_highlights");
+  assert.equal(highlightWorkflowStage({
+    ...transcriptReady,
+    auditState: "loaded",
+  }), "discovering_highlights");
+  assert.equal(highlightWorkflowStage({
+    ...transcriptReady,
+    isRecognizing: true,
+    auditState: "loading",
+  }), "recognizing");
 });
 
 test("non-critical and legacy no-audit transcripts remain eligible for discovery", () => {
@@ -175,7 +205,7 @@ test("analysis request identity rejects stale source, source revision, transcrip
   assert.equal(isCurrentAnalysisRequest(active, active, 2, 3), false);
 });
 
-test("discovery action requires explicit continue after critical review", () => {
+test("discovery action starts automatically even when critical review is pending", () => {
   const base = {
     stage: "discovering_highlights" as const,
     sourceKey: "video:9",
@@ -183,11 +213,9 @@ test("discovery action requires explicit continue after critical review", () => 
     discoveryCompleted: false,
     isDiscovering: false,
   };
-  assert.equal(highlightDiscoveryAction({ ...base, hadPendingCriticalReview: false }), "auto");
-  assert.equal(highlightDiscoveryAction({ ...base, hadPendingCriticalReview: true }), "continue");
+  assert.equal(highlightDiscoveryAction(base), "auto");
   assert.equal(highlightDiscoveryAction({
     ...base,
-    hadPendingCriticalReview: true,
     discoveryCompleted: true,
   }), "rerun");
 });
@@ -197,7 +225,6 @@ test("discovery action blocks stale sources, proofreading, and in-flight work", 
     stage: "discovering_highlights" as const,
     sourceKey: "archive:douyin:room:live-2",
     requestedSourceKey: "archive:douyin:room:live-2",
-    hadPendingCriticalReview: false,
     discoveryCompleted: false,
     isDiscovering: false,
   };
@@ -251,6 +278,18 @@ test("candidate review identity rejects old generations even when candidate IDs 
   assert.equal(isCurrentCandidateGeneration(5, 5), true);
 });
 
+test("changing candidates cancels only a different in-flight single review", () => {
+  assert.equal(candidateSelectionCancelsReview("", "SEG-002"), false);
+  assert.equal(candidateSelectionCancelsReview("SEG-002", "SEG-002"), false);
+  assert.equal(candidateSelectionCancelsReview("SEG-001", "SEG-002"), true);
+});
+
+test("session review stops on cancellation or candidate generation changes", () => {
+  assert.equal(sessionReviewShouldContinue(false, 4, 4), true);
+  assert.equal(sessionReviewShouldContinue(true, 4, 4), false);
+  assert.equal(sessionReviewShouldContinue(false, 3, 4), false);
+});
+
 test("review labels use novice language", () => {
   assert.equal(reviewStatusLabel("pending"), "等你确认");
   assert.equal(reviewStatusLabel("approved"), "已采用修改");
@@ -265,6 +304,14 @@ test("unresolved transcript placeholders cannot be approved", () => {
   assert.equal(isUnresolvedTranscriptPlaceholder("[疑似影石 Ace Pro 2]"), true);
   assert.equal(isUnresolvedTranscriptPlaceholder("影石 Ace Pro 2 99新"), false);
   assert.equal(isUnresolvedTranscriptPlaceholder("待确认后回复"), false);
+});
+
+test("keeping the original text does not invalidate the active transcript review", () => {
+  const original = "00:00:00,000 --> 00:00:01,000\nXT50。\n";
+
+  assert.equal(transcriptReviewChangesTranscript(original, original), false);
+  assert.equal(transcriptReviewChangesTranscript(original, ""), false);
+  assert.equal(transcriptReviewChangesTranscript(original, "00:00:00,000 --> 00:00:01,000\nXS20。\n"), true);
 });
 
 test("audit loading preserves archive and video source serialization", async () => {

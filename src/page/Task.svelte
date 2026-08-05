@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "../lib/invoker";
+  import { invoke, invokeSensitive } from "../lib/invoker";
   import { scale, fade } from "svelte/transition";
   import {
     Clock,
@@ -9,10 +9,17 @@
     Loader2,
     RefreshCw,
     ChevronDown,
+    ExternalLink,
     X,
   } from "lucide-svelte";
-  import type { TaskRow } from "../lib/db";
+  import type { RecordItem, TaskRow } from "../lib/db";
+  import type { VideoItem } from "../lib/interface";
+  import {
+    isMissingArchiveError,
+    taskNavigationTarget,
+  } from "../lib/taskNavigation";
   import { onMount, onDestroy } from "svelte";
+  import PageShell from "../lib/components/PageShell.svelte";
 
   let tasks: TaskRow[] = [];
   let loading = true;
@@ -39,7 +46,7 @@
   async function delete_task(id: string) {
     try {
       actionTaskId = id;
-      await invoke("delete_task", { id });
+      await invokeSensitive("delete_task", { id });
       await update_tasks();
     } catch (error) {
       console.error("删除任务失败:", error);
@@ -69,6 +76,7 @@
         return CheckCircle;
       case "failed":
       case "error":
+      case "interrupted":
         return XCircle;
       case "running":
       case "processing":
@@ -88,6 +96,7 @@
         return "text-green-600 dark:text-green-400";
       case "failed":
       case "error":
+      case "interrupted":
         return "text-red-600 dark:text-red-400";
       case "running":
       case "processing":
@@ -107,6 +116,7 @@
         return "bg-green-100 dark:bg-green-900/20";
       case "failed":
       case "error":
+      case "interrupted":
         return "bg-red-100 dark:bg-red-900/20";
       case "running":
       case "processing":
@@ -189,6 +199,36 @@
     expandedTasks = expandedTasks; // 触发响应式更新
   }
 
+  async function openTask(task: TaskRow): Promise<void> {
+    const target = taskNavigationTarget(task);
+    if (!target) return;
+    try {
+      if (target.kind === "archive") {
+        const archive = await invoke<RecordItem>("get_archive", {
+          roomId: target.roomId,
+          liveId: target.liveId,
+        });
+        window.dispatchEvent(
+          new CustomEvent("bsr:open-archive-analysis", { detail: archive }),
+        );
+        return;
+      }
+      const video = await invoke<VideoItem>("get_video", {
+        id: target.videoId,
+      });
+      window.dispatchEvent(
+        new CustomEvent("bsr:open-video-analysis", { detail: video }),
+      );
+    } catch (error) {
+      console.error("打开任务来源失败:", error);
+      if (target.kind === "archive" && isMissingArchiveError(error)) {
+        alert("该录播已删除，无法打开分析页面。可在任务列表中移除此任务。");
+        return;
+      }
+      alert(`无法打开对应分析页面：${String(error)}`);
+    }
+  }
+
   // 设置自动刷新
   onMount(async () => {
     // 初始化时加载任务列表
@@ -208,36 +248,20 @@
   });
 </script>
 
-<div class="flex-1 p-6 overflow-auto custom-scrollbar-light bg-gray-50">
-  <div class="space-y-6">
-    <!-- Header -->
-    <div class="flex justify-between items-center">
-      <div class="flex items-center space-x-4">
-        <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">
-          任务列表
-        </h1>
-        <div
-          class="flex items-center space-x-2 text-sm text-gray-500 dark:text-gray-400"
-        >
-          <span> 共 {tasks.length} 个任务</span>
-        </div>
-      </div>
-      <button
-        on:click={update_tasks}
-        class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center space-x-2"
-        disabled={loading}
-      >
-        {#if loading}
-          <Loader2 class="w-5 h-5 icon-white animate-spin" />
-        {:else}
-          <RefreshCw class="w-5 h-5 icon-white" />
-        {/if}
-        <span>刷新</span>
-      </button>
-    </div>
+<PageShell title="任务" subtitle={`共 ${tasks.length} 个任务`}>
+  <div slot="actions">
+    <button type="button" class="mac-btn mac-btn-primary" on:click={update_tasks} disabled={loading}>
+      {#if loading}
+        <Loader2 class="w-4 h-4 animate-spin" />
+      {:else}
+        <RefreshCw class="w-4 h-4" />
+      {/if}
+      <span>刷新</span>
+    </button>
+  </div>
 
     <!-- Task List -->
-    <div class="space-y-4">
+    <div class="space-y-3">
       {#if loading && tasks.length === 0}
         <div class="flex items-center justify-center py-12">
           <Loader2 class="w-8 h-8 text-gray-400 animate-spin" />
@@ -260,7 +284,7 @@
       {:else}
         {#each tasks as task (task.id)}
           <div
-            class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-blue-400 transition-colors"
+            class="mac-card p-4 hover:border-[color:var(--mac-blue)] transition-colors"
             in:scale={{ duration: 150, start: 0.95 }}
             out:scale={{ duration: 150, start: 0.95 }}
           >
@@ -273,11 +297,23 @@
                         task.task_type,
                       )} rounded-full"
                     ></div>
-                    <span
-                      class="text-sm font-medium text-gray-900 dark:text-white"
-                    >
-                      {get_task_type_name(task.task_type)}
-                    </span>
+                    {#if taskNavigationTarget(task)}
+                      <button
+                        type="button"
+                        class="flex items-center gap-1 text-sm font-medium text-blue-700 hover:underline dark:text-blue-300"
+                        title="进入对应片段分析页面"
+                        on:click={() => openTask(task)}
+                      >
+                        <span>{get_task_type_name(task.task_type)}</span>
+                        <ExternalLink class="h-3.5 w-3.5" />
+                      </button>
+                    {:else}
+                      <span
+                        class="text-sm font-medium text-gray-900 dark:text-white"
+                      >
+                        {get_task_type_name(task.task_type)}
+                      </span>
+                    {/if}
                   </div>
                   <div class="flex items-center space-x-2">
                     <div
@@ -341,6 +377,17 @@
               </div>
 
               <div class="flex items-center space-x-2 ml-4">
+                {#if taskNavigationTarget(task)}
+                  <button
+                    type="button"
+                    class="flex items-center gap-1 rounded-lg px-3 py-2 text-xs font-medium text-blue-600 hover:bg-blue-50 hover:text-blue-700 dark:text-blue-400 dark:hover:bg-blue-900/20"
+                    title="进入对应片段分析页面"
+                    on:click={() => openTask(task)}
+                  >
+                    <ExternalLink class="h-4 w-4" />
+                    <span>进入</span>
+                  </button>
+                {/if}
                 <button
                   class={`p-2 rounded-lg transition-colors flex items-center space-x-1 ${
                     is_cancelable_status(task.status)
@@ -368,5 +415,4 @@
         {/each}
       {/if}
     </div>
-  </div>
-</div>
+</PageShell>

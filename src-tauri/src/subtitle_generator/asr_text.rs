@@ -18,11 +18,11 @@ pub fn normalize_commerce_text_boundaries(input: &str) -> String {
             let model_words = value[..at].trim_end().split_whitespace().rev();
             let has_ascii_model_prefix = has_ascii_model_suffix
                 || model_words
-                .take_while(|word| {
-                    word.chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-                })
-                .any(|word| word.chars().any(|ch| ch.is_ascii_alphabetic()));
+                    .take_while(|word| {
+                        word.chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+                    })
+                    .any(|word| word.chars().any(|ch| ch.is_ascii_alphabetic()));
             if previous.is_some_and(|ch| ch.is_ascii_alphanumeric())
                 && !value[..at].ends_with(' ')
                 && has_ascii_model_prefix
@@ -59,7 +59,10 @@ mod tests {
 
     #[test]
     fn leaves_plain_number_and_condition_unchanged() {
-        assert_eq!(normalize_commerce_text_boundaries("一共199新的"), "一共199新的");
+        assert_eq!(
+            normalize_commerce_text_boundaries("一共199新的"),
+            "一共199新的"
+        );
     }
 
     #[test]
@@ -76,7 +79,10 @@ mod tests {
             normalize_commerce_text_boundaries("影石A4PRO2"),
             "影石A4PRO2"
         );
-        assert_eq!(normalize_commerce_text_boundaries("到手价99新币"), "到手价99新币");
+        assert_eq!(
+            normalize_commerce_text_boundaries("到手价99新币"),
+            "到手价99新币"
+        );
         assert_eq!(normalize_commerce_text_boundaries("R50白色"), "R50白色");
     }
 

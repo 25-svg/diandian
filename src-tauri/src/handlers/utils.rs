@@ -14,6 +14,47 @@ use {
     tokio::io::AsyncWriteExt,
 };
 
+/// Prefer a drive-letter path when a UNC media path sits on a mapped network drive.
+/// Filenames like `[imported]...ts` break `cmd start` / some shell opens on raw UNC.
+pub fn prefer_accessible_windows_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") {
+            if let Some(mapped) = map_unc_to_existing_drive(path) {
+                return mapped;
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn map_unc_to_existing_drive(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim_start_matches(r"\\");
+    let parts: Vec<&str> = trimmed
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect();
+    // \\server\share\rest...
+    if parts.len() < 3 {
+        return None;
+    }
+    let relative: PathBuf = parts[2..].iter().collect();
+    for letter in b'D'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if !root.exists() {
+            continue;
+        }
+        let candidate = root.join(&relative);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[allow(dead_code)]
 pub fn copy_dir_all(
     src: impl AsRef<std::path::Path>,
@@ -37,10 +78,9 @@ pub fn copy_dir_all(
 pub fn show_in_folder(path: String) {
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer")
-            .args(["/select,", &path]) // The comma after select is not a typo
-            .spawn()
-            .unwrap();
+        let accessible = prefer_accessible_windows_path(Path::new(&path));
+        let arg = format!("/select,{}", accessible.to_string_lossy());
+        let _ = Command::new("explorer").arg(&arg).spawn();
     }
 
     #[cfg(target_os = "linux")]
@@ -269,6 +309,43 @@ pub async fn open_live(
 #[tauri::command]
 pub async fn open_clip(state: state_type!(), video_id: i64) -> Result<(), String> {
     log::info!("Open clip window: {video_id}");
+    let video = state
+        .db
+        .get_video(video_id)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // Imported / transport-stream sources cannot play inside the Clip webview.
+    // Jump to the download path and open with the OS player instead.
+    if should_open_clip_externally(&video.platform, &video.file) {
+        let output = state.config.read().await.output.clone();
+        let path =
+            resolve_playable_disk_path(state.db.as_ref(), Path::new(&output), video_id, &video.file)
+                .await?;
+        let path = crate::handlers::utils::prefer_accessible_windows_path(&path);
+        if !path.is_file() {
+            return Err(format!(
+                "视频文件不存在或当前不可访问：{}",
+                path.display()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let arg = format!("/select,{}", path.to_string_lossy());
+            let _ = Command::new("explorer").arg(&arg).spawn();
+            open::that_detached(&path).map_err(|error| {
+                format!("无法启动系统播放器（{}）：{error}", path.display())
+            })?;
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            return open::that_detached(&path).map_err(|error| {
+                format!("无法用系统播放器打开视频（{}）：{error}", path.display())
+            });
+        }
+    }
+
     let builder = tauri::WebviewWindowBuilder::new(
         &state.app_handle,
         format!("Clip:{video_id}"),
@@ -289,9 +366,67 @@ pub async fn open_clip(state: state_type!(), video_id: i64) -> Result<(), String
 
     if let Err(e) = builder.decorations(true).build() {
         log::error!("clip window build failed: {e}");
+        return Err(format!("无法打开切片窗口: {e}"));
     }
 
     Ok(())
+}
+
+fn should_open_clip_externally(platform: &str, file: &str) -> bool {
+    if platform == "imported" {
+        return true;
+    }
+    Path::new(file)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "ts" | "m2ts" | "mts" | "flv"
+            )
+        })
+}
+
+async fn resolve_playable_disk_path(
+    db: &crate::database::Database,
+    output: &Path,
+    video_id: i64,
+    file: &str,
+) -> Result<PathBuf, String> {
+    if let Some(archive) = db
+        .get_video_archive_by_video(video_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if archive.status == "archived" && !archive.nas_path.trim().is_empty() {
+            let nas = PathBuf::from(archive.nas_path.trim());
+            if nas.is_file() {
+                return Ok(crate::handlers::utils::prefer_accessible_windows_path(&nas));
+            }
+        }
+    }
+
+    let candidate = PathBuf::from(file.trim());
+    if candidate.is_absolute() {
+        return if candidate.is_file() {
+            Ok(crate::handlers::utils::prefer_accessible_windows_path(&candidate))
+        } else {
+            Err(format!(
+                "视频文件不存在或当前不可访问：{}",
+                candidate.display()
+            ))
+        };
+    }
+
+    let joined = output.join(file);
+    if joined.is_file() {
+        Ok(crate::handlers::utils::prefer_accessible_windows_path(&joined))
+    } else {
+        Err(format!(
+            "视频文件不存在或当前不可访问：{}",
+            joined.display()
+        ))
+    }
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
@@ -514,5 +649,29 @@ mod tests {
         let short_name = "test.mp4";
         let result = sanitize_filename_advanced(short_name, Some(50));
         assert_eq!(result, "test.mp4");
+    }
+
+    #[test]
+    fn prefer_accessible_windows_path_keeps_local_paths() {
+        let local = PathBuf::from(r"D:\videos\demo.mp4");
+        assert_eq!(super::prefer_accessible_windows_path(&local), local);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prefer_accessible_windows_path_maps_unc_when_drive_exists() {
+        let unc = PathBuf::from(
+            r"\\192.168.8.188\personal_folder\直播大屏·专业版\2026-07-29\[imported]直播大屏·专业版20260729_085927.ts",
+        );
+        if !unc.is_file() {
+            return;
+        }
+        let mapped = super::prefer_accessible_windows_path(&unc);
+        assert!(mapped.is_file(), "mapped path should exist: {}", mapped.display());
+        assert!(
+            !mapped.to_string_lossy().starts_with(r"\\"),
+            "should prefer drive letter over UNC: {}",
+            mapped.display()
+        );
     }
 }

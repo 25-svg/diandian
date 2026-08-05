@@ -64,7 +64,7 @@ impl EventEmitter {
         }
     }
 
-    pub fn emit(&self, event: &RecorderEvent) {
+    pub fn emit(&self, event: &RecorderEvent) -> Result<(), String> {
         #[cfg(feature = "gui")]
         {
             match event {
@@ -74,7 +74,7 @@ impl EventEmitter {
                             &format!("progress-update:{}", id),
                             UpdateEvent { id, content },
                         )
-                        .unwrap();
+                        .map_err(|error| error.to_string())?;
                 }
                 RecorderEvent::ProgressFinished {
                     id,
@@ -90,7 +90,7 @@ impl EventEmitter {
                                 message,
                             },
                         )
-                        .unwrap();
+                        .map_err(|error| error.to_string())?;
                 }
                 RecorderEvent::DanmuReceived { room, ts, content } => {
                     self.app_handle
@@ -101,14 +101,18 @@ impl EventEmitter {
                                 content: content.clone(),
                             },
                         )
-                        .unwrap();
+                        .map_err(|error| error.to_string())?;
                 }
                 _ => {}
             }
         }
 
         #[cfg(feature = "headless")]
-        let _ = self.sender.send(event.clone());
+        {
+            let _ = self.sender.send(event.clone());
+        }
+
+        Ok(())
     }
 }
 impl ProgressReporter {
@@ -128,10 +132,15 @@ impl ProgressReporter {
 #[async_trait]
 impl ProgressReporterTrait for ProgressReporter {
     async fn update(&self, content: &str) {
-        self.emitter.emit(&RecorderEvent::ProgressUpdate {
+        if let Err(error) = self.emitter.emit(&RecorderEvent::ProgressUpdate {
             id: self.event_id.clone(),
             content: content.to_string(),
-        });
+        }) {
+            log::warn!(
+                "Unable to deliver progress update {}: {error}",
+                self.event_id
+            );
+        }
         let _ = self
             .db
             .update_task(&self.event_id, "processing", content, None)
@@ -139,10 +148,15 @@ impl ProgressReporterTrait for ProgressReporter {
     }
 
     async fn finish(&self, success: bool, message: &str) {
-        self.emitter.emit(&RecorderEvent::ProgressFinished {
+        if let Err(error) = self.emitter.emit(&RecorderEvent::ProgressFinished {
             id: self.event_id.clone(),
             success,
             message: message.to_string(),
-        });
+        }) {
+            log::warn!(
+                "Unable to deliver progress completion {}: {error}",
+                self.event_id
+            );
+        }
     }
 }

@@ -268,6 +268,48 @@ git add src/lib/liveDashboard.ts src/lib/liveDashboard.test.ts src/page/LiveData
 git commit -m "feat: add live data dashboard"
 ```
 
+### Task 6: 官方大屏 KPI 第二行对齐（UI 增强）
+
+**Files:**
+- Modify: `src-tauri/src/live_data_import.rs`（若 session 缺字段则补解析）
+- Modify: `src-tauri/src/database/live_dashboard.rs`
+- Modify: `src/lib/liveDashboard.ts`
+- Modify: `src/lib/liveDashboard.test.ts`
+- Modify: `src/page/LiveDataDashboard.svelte`
+
+**必读：** `docs/integrations/douyin/live-dashboard-xlsx-field-map.md` 与 design spec「官方大屏 KPI 对齐」节。
+
+**Interfaces:**
+- `dashboardMetricCards()` 返回两行共 11 张 KPI（或第一行 6 + 第二行 5 分开导出）。
+- 缺失 XLSX 源的数据（如「直播间成交金额」）显示 `— / 官方导出未提供`。
+
+- [ ] **Step 1: 补解析与 DB 字段**
+
+从 XLSX 写入 session：`buyer_count`（成交人数）、`item_count`（商品汇总行成交件数之和）、`product_click_conversion_rate`、`exposure_view_rate`、`qianchuan_spend_fen`（渠道「整体」千川消耗）。
+
+- [ ] **Step 2: 更新 `dashboardMetricCards` 测试**
+
+断言 fixture 场次：用户支付 ¥236,552、成交人数 46、成交件数 51、千川消耗 ¥2,201.51、商品点击-成交率 3.08%。
+
+- [ ] **Step 3: LiveDataDashboard 两行卡片布局**
+
+第一行 6 张 + 第二行 5 张；**不要**添加「直播间成交金额」卡片（XLSX 无源）。
+
+- [ ] **Step 4: 跑测试**
+
+```powershell
+$env:CARGO_TARGET_DIR = "...\src-tauri\target"
+cargo test --bin bili-shadowreplay live_data_import::tests database::live_dashboard::tests
+node --loader ts-node/esm src/lib/liveDashboard.test.ts
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src-tauri/src/live_data_import.rs src-tauri/src/database/live_dashboard.rs src/lib/liveDashboard.ts src/lib/liveDashboard.test.ts src/page/LiveDataDashboard.svelte
+git commit -m "feat: align live dashboard KPIs with official compass export"
+```
+
 ### Task 5: 端到端验证与回归
 
 **Files:**

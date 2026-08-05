@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Instant;
 
 mod audited_calibration;
 pub mod general;
@@ -9,14 +10,20 @@ pub mod playlist;
 
 use crate::constants;
 use crate::progress::progress_reporter::{ProgressReporter, ProgressReporterTrait};
+#[cfg(feature = "local-whisper")]
+use crate::subtitle_generator::whisper_cpp;
 use crate::subtitle_generator::{funasr, powerlive, whisper_online};
 use crate::subtitle_generator::{
-    whisper_cpp, GenerateResult, SubtitleGenerator, SubtitleGeneratorType,
+    item_to_srt, volcengine::VolcengineAsr, GenerateResult, SubtitleGenerator,
+    SubtitleGeneratorType,
 };
 use async_ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
 use async_ffmpeg_sidecar::log_parser::FfmpegLogParser;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::io::BufReader;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 // 视频元数据结构
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +63,12 @@ impl Range {
     }
 }
 
+fn output_is_mp4(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "m4v" | "mov"))
+}
+
 pub async fn transcode(
     reporter: Option<&impl ProgressReporterTrait>,
     file: &Path,
@@ -68,10 +81,16 @@ pub async fn transcode(
     #[cfg(target_os = "windows")]
     ffmpeg_process.creation_flags(CREATE_NO_WINDOW);
 
+    if copy_codecs {
+        ffmpeg_process.args(["-fflags", "+genpts+igndts"]);
+    }
     ffmpeg_process.args(["-i", file.to_str().unwrap()]);
 
     if copy_codecs {
-        ffmpeg_process.args(["-c:v", "copy"]).args(["-c:a", "copy"]);
+        ffmpeg_process
+            .args(["-c:v", "copy"])
+            .args(["-c:a", "copy"])
+            .args(["-avoid_negative_ts", "make_zero"]);
     } else {
         let video_encoder = hwaccel::get_x264_encoder().await;
         hwaccel::apply_x264_encoder_args(
@@ -82,6 +101,10 @@ pub async fn transcode(
         ffmpeg_process.args(["-c:a", "aac"]);
         hwaccel::apply_x264_quality_args(&mut ffmpeg_process, video_encoder);
         ffmpeg_process.args(["-threads", "0"]);
+    }
+
+    if output_is_mp4(output_path) {
+        ffmpeg_process.args(["-movflags", "+faststart"]);
     }
 
     let child = ffmpeg_process
@@ -850,24 +873,88 @@ pub async fn generate_video_subtitle(
 
     if generator_type == "funasr" {
         if let Err(error) = &result {
-            log::warn!("FunASR failed, falling back to local Whisper: {error}");
-            if let Some(reporter) = reporter {
-                reporter.update("FunASR不可用，正在使用本地备用识别").await;
+            // Only fall back when this binary actually ships local Whisper.
+            // Otherwise the fallback masks the real FunASR failure with
+            // "Local Whisper is disabled in this build".
+            #[cfg(feature = "local-whisper")]
+            {
+                log::warn!("FunASR failed, falling back to local Whisper: {error}");
+                if let Some(reporter) = reporter {
+                    reporter.update("FunASR不可用，正在使用本地备用识别").await;
+                }
+                let whisper_result = generate_video_subtitle_once(
+                    reporter,
+                    file,
+                    "whisper",
+                    whisper_model,
+                    whisper_prompt,
+                    openai_api_key,
+                    openai_api_endpoint,
+                    language_hint,
+                )
+                .await;
+                return whisper_result.map_err(|whisper_error| {
+                    format!(
+                        "FunASR failed: {error}; local Whisper fallback also failed: {whisper_error}"
+                    )
+                });
             }
-            return generate_video_subtitle_once(
-                reporter,
-                file,
-                "whisper",
-                whisper_model,
-                whisper_prompt,
-                openai_api_key,
-                openai_api_endpoint,
-                language_hint,
-            )
-            .await;
+            #[cfg(not(feature = "local-whisper"))]
+            {
+                log::warn!("FunASR failed (no Whisper fallback in this build): {error}");
+                return Err(format!(
+                    "中文直播识别（FunASR）失败：{error}。当前构建未启用本地 Whisper，不会自动回退。请检查 FunASR 服务/模型是否已安装，或改用火山识别。"
+                ));
+            }
         }
     }
     result
+}
+
+/// Parallel Volcengine chunk requests. Keep conservative to avoid rate limits.
+const VOLCENGINE_ASR_CONCURRENCY: usize = 3;
+
+fn list_volcengine_mp3_chunks(chunk_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut chunks = std::fs::read_dir(chunk_dir)
+        .map_err(|error| format!("读取火山ASR临时分段失败: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("mp3"))
+        .collect::<Vec<_>>();
+    chunks.sort();
+    Ok(chunks)
+}
+
+fn load_cached_volcengine_chunk_srt(chunk: &Path) -> Result<Option<GenerateResult>, String> {
+    let cached_srt = chunk.with_extension("srt");
+    if !cached_srt.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&cached_srt)
+        .map_err(|error| format!("读取火山ASR缓存分段失败: {error}"))?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GenerateResult {
+        subtitle_id: String::new(),
+        subtitle_content: srtparse::from_str(&content)
+            .map_err(|error| format!("解析火山ASR缓存分段失败: {error}"))?,
+        generator_type: SubtitleGeneratorType::Volcengine,
+    }))
+}
+
+async fn save_cached_volcengine_chunk_srt(
+    chunk: &Path,
+    result: &GenerateResult,
+) -> Result<(), String> {
+    let content = result
+        .subtitle_content
+        .iter()
+        .map(item_to_srt)
+        .collect::<String>();
+    tokio::fs::write(chunk.with_extension("srt"), content)
+        .await
+        .map_err(|error| format!("写入火山ASR缓存分段失败: {error}"))
 }
 
 /// Convert an MP4 (or any FFmpeg-readable media) into 10-minute, 16kHz mono
@@ -883,9 +970,15 @@ pub async fn extract_volcengine_audio_chunks(file: &Path) -> Result<Vec<PathBuf>
         .unwrap_or("recording");
     let chunk_dir = parent.join(format!("{stem}.volc-asr-chunks"));
     if chunk_dir.is_dir() {
-        tokio::fs::remove_dir_all(&chunk_dir)
-            .await
-            .map_err(|error| format!("清理火山ASR临时分段失败: {error}"))?;
+        let existing = list_volcengine_mp3_chunks(&chunk_dir)?;
+        if !existing.is_empty() {
+            log::info!(
+                "Reusing {} existing Volcengine ASR audio chunks from {}",
+                existing.len(),
+                chunk_dir.display()
+            );
+            return Ok(existing);
+        }
     }
     tokio::fs::create_dir_all(&chunk_dir)
         .await
@@ -965,38 +1058,105 @@ pub async fn generate_volcengine_video_subtitle(
                 None
             }
         };
+    let total_chunks = chunks.len();
+    let mut chunk_results: Vec<Option<GenerateResult>> = vec![None; total_chunks];
+    let mut pending_indices = Vec::new();
+    let mut cached_count = 0usize;
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        match load_cached_volcengine_chunk_srt(chunk)? {
+            Some(cached) => {
+                chunk_results[index] = Some(cached);
+                cached_count += 1;
+            }
+            None => pending_indices.push(index),
+        }
+    }
+
+    if cached_count > 0 {
+        log::info!("Reusing {cached_count}/{total_chunks} cached Volcengine ASR chunk transcripts");
+    }
+
+    if !pending_indices.is_empty() {
+        if let Some(reporter) = reporter {
+            reporter
+                .update(&format!(
+                    "火山ASR识别中（待处理 {} 段，已缓存 {} 段，并发 {}）",
+                    pending_indices.len(),
+                    cached_count,
+                    VOLCENGINE_ASR_CONCURRENCY
+                ))
+                .await;
+        }
+
+        let semaphore = Arc::new(Semaphore::new(VOLCENGINE_ASR_CONCURRENCY));
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(cached_count));
+        let mut join_set = JoinSet::new();
+
+        for index in pending_indices {
+            let chunk = chunks[index].clone();
+            let client = client.clone();
+            let danmu_timeline = danmu_timeline.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let completed = Arc::clone(&completed);
+            let reporter = reporter.cloned();
+
+            join_set.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| format!("火山ASR并发控制失败: {error}"))?;
+
+                let chunk_context = danmu_timeline
+                    .as_ref()
+                    .and_then(|timeline| timeline.for_chunk(index as u64 * 600_000, 600_000));
+
+                let result = client
+                    .recognize_file(
+                        &chunk,
+                        chunk_context
+                            .as_ref()
+                            .map(|context| context.payload.as_str()),
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("火山ASR第 {}/{} 段失败: {error}", index + 1, total_chunks)
+                    })?;
+
+                save_cached_volcengine_chunk_srt(&chunk, &result).await?;
+
+                let done = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if let Some(reporter) = reporter.as_ref() {
+                    reporter
+                        .update(&format!(
+                            "火山ASR识别第 {}/{} 段（{done}/{total_chunks} 完成）",
+                            index + 1,
+                            total_chunks
+                        ))
+                        .await;
+                }
+
+                Ok::<(usize, GenerateResult), String>((index, result))
+            });
+        }
+
+        while let Some(join_result) = join_set.join_next().await {
+            let (index, result) =
+                join_result.map_err(|error| format!("火山ASR分段任务异常: {error}"))??;
+            chunk_results[index] = Some(result);
+        }
+    }
+
     let mut full_result = GenerateResult {
         generator_type: SubtitleGeneratorType::Volcengine,
         subtitle_id: String::new(),
         subtitle_content: Vec::new(),
     };
-    for (index, chunk) in chunks.iter().enumerate() {
-        if let Some(reporter) = reporter {
-            reporter
-                .update(&format!("火山ASR识别第 {}/{} 段", index + 1, chunks.len()))
-                .await;
-        }
-        let chunk_context = danmu_timeline
+    for (index, chunk_result) in chunk_results.iter().enumerate() {
+        let result = chunk_result
             .as_ref()
-            .and_then(|timeline| timeline.for_chunk(index as u64 * 600_000, 600_000));
-        if let Some(context) = &chunk_context {
-            log::info!(
-                "Volcengine ASR chunk {}/{} dynamic context evidence_count={}",
-                index + 1,
-                chunks.len(),
-                context.evidence_count
-            );
-        }
-        let result = client
-            .recognize_file(
-                chunk,
-                chunk_context
-                    .as_ref()
-                    .map(|context| context.payload.as_str()),
-            )
-            .await
-            .map_err(|error| format!("火山ASR第 {}/{} 段失败: {error}", index + 1, chunks.len()))?;
-        full_result.concat_with_offset_ms(&result, index as u64 * 600_000);
+            .ok_or_else(|| format!("火山ASR第 {}/{} 段缺少识别结果", index + 1, total_chunks))?;
+        full_result.concat_with_offset_ms(result, index as u64 * 600_000);
     }
     if let Some(timeline) = &danmu_timeline {
         let (audited_result, audit) = audited_calibration::apply_calibration_if_audited(
@@ -1022,8 +1182,11 @@ pub async fn generate_volcengine_video_subtitle(
             }
         }
     }
-    if let Some(path) = chunk_dir {
-        let _ = tokio::fs::remove_dir_all(path).await;
+    if let Some(path) = &chunk_dir {
+        log::info!(
+            "Keeping Volcengine ASR chunk cache for faster resume: {}",
+            path.display()
+        );
     }
     if full_result.subtitle_content.is_empty() {
         return Err("火山ASR没有识别到可用文字".to_string());
@@ -1183,6 +1346,7 @@ async fn generate_video_subtitle_once(
 
             Ok(funasr::into_generate_result(&response))
         }
+        #[cfg(feature = "local-whisper")]
         "whisper" => {
             if whisper_model.is_empty() {
                 return Err("Whisper model not configured".to_string());
@@ -1297,6 +1461,8 @@ async fn generate_video_subtitle_once(
 
             Ok(full_result)
         }
+        #[cfg(not(feature = "local-whisper"))]
+        "whisper" => Err("Local Whisper is disabled in this build. Use FunASR, Volcengine, or enable the local-whisper feature.".to_string()),
         "whisper_online" => {
             if openai_api_key.is_empty() {
                 return Err("API key not configured".to_string());
@@ -1423,21 +1589,51 @@ pub fn ffmpeg_command() -> tokio::process::Command {
 }
 
 pub fn ffmpeg_path() -> PathBuf {
-    let mut path = Path::new("ffmpeg").to_path_buf();
-    if cfg!(windows) {
-        path.set_extension("exe");
-    }
+    resolve_bundled_binary("ffmpeg")
+}
 
-    path
+/// FFmpeg on Windows opens UNC shares more reliably with forward slashes.
+fn ffmpeg_cli_media_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if raw.starts_with("\\\\") || raw.starts_with("//") {
+            return PathBuf::from(raw.replace('\\', "/"));
+        }
+    }
+    path.to_path_buf()
 }
 
 fn ffprobe_path() -> PathBuf {
-    let mut path = Path::new("ffprobe").to_path_buf();
+    resolve_bundled_binary("ffprobe")
+}
+
+fn resolve_bundled_binary(name: &str) -> PathBuf {
+    let mut file_name = PathBuf::from(name);
     if cfg!(windows) {
-        path.set_extension("exe");
+        file_name.set_extension("exe");
     }
 
-    path
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(&file_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+
+            // Tauri bundles macOS resources in <App>.app/Contents/Resources,
+            // while the executable lives in <App>.app/Contents/MacOS.
+            #[cfg(target_os = "macos")]
+            if let Some(contents) = dir.parent() {
+                let candidate = contents.join("Resources").join(&file_name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    file_name
 }
 
 // 从视频文件切片
@@ -1448,41 +1644,127 @@ pub async fn clip_from_video_file(
     start_time: f64,
     duration: f64,
 ) -> Result<(), String> {
-    let output_folder = output_path.parent().unwrap();
+    let video_encoder = hwaccel::get_x264_encoder().await;
+    match clip_from_video_file_with_encoder(
+        reporter,
+        input_path,
+        output_path,
+        start_time,
+        duration,
+        &video_encoder,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(hardware_error) if video_encoder != "libx264" => {
+            log::warn!(
+                "切片硬件编码器 {video_encoder} 失败，自动使用 libx264 重试：{hardware_error}"
+            );
+            let _ = tokio::fs::remove_file(output_path).await;
+            clip_from_video_file_with_encoder(
+                reporter,
+                input_path,
+                output_path,
+                start_time,
+                duration,
+                "libx264",
+            )
+            .await
+            .map_err(|software_error| {
+                format!("切片硬件与软件编码均失败。硬件：{hardware_error}；软件：{software_error}")
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn clip_from_video_file_with_encoder(
+    reporter: Option<&impl ProgressReporterTrait>,
+    input_path: &Path,
+    output_path: &Path,
+    start_time: f64,
+    duration: f64,
+    video_encoder: &str,
+) -> Result<(), String> {
+    if !input_path.is_file() {
+        return Err(format!(
+            "切片源文件不存在或当前不可访问：{}",
+            input_path.display()
+        ));
+    }
+    if !(duration.is_finite() && duration > 0.0) {
+        return Err(format!("切片时长无效：{duration}"));
+    }
+
+    let ffmpeg_input = ffmpeg_cli_media_path(input_path);
+
+    let output_folder = output_path
+        .parent()
+        .ok_or_else(|| format!("切片输出路径无效：{}", output_path.display()))?;
     if !output_folder.exists() {
-        std::fs::create_dir_all(output_folder).unwrap();
+        std::fs::create_dir_all(output_folder)
+            .map_err(|e| format!("无法创建切片目录 {}：{e}", output_folder.display()))?;
     }
 
     let mut ffmpeg_process = ffmpeg_command();
     #[cfg(target_os = "windows")]
     ffmpeg_process.creation_flags(CREATE_NO_WINDOW);
 
-    let video_encoder = hwaccel::get_x264_encoder().await;
-
+    // Pass Path directly so Windows keeps wide/UNC paths intact.
+    // Seek slightly before the requested boundary, then perform the remaining
+    // seek after input. HEVC transport streams frequently begin between GOPs;
+    // the pre-roll gives the decoder reference frames without scanning from 0.
+    let fast_seek_start = (start_time - 12.0).max(0.0);
+    let accurate_seek = start_time - fast_seek_start;
     ffmpeg_process
-        .args(["-i", &format!("{}", input_path.display())])
-        .args(["-ss", &start_time.to_string()])
-        .args(["-t", &duration.to_string()]);
+        .args(["-ss", &fast_seek_start.to_string()])
+        // Network TS recordings can start between HEVC keyframes.  Keep the
+        // fast seek, generate timestamps, and discard corrupt pre-roll rather
+        // than aborting the whole learning clip on those recoverable frames.
+        .args(["-fflags", "+genpts+discardcorrupt"])
+        .args(["-err_detect", "ignore_err"])
+        .arg("-i")
+        .arg(&ffmpeg_input)
+        .args(["-ss", &accurate_seek.to_string()])
+        .args(["-t", &duration.to_string()])
+        .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]);
     hwaccel::apply_x264_encoder_args(&mut ffmpeg_process, video_encoder, None);
     ffmpeg_process.args(["-c:a", "aac"]);
-    hwaccel::apply_x264_quality_args(&mut ffmpeg_process, video_encoder);
+    if video_encoder == "h264_amf" {
+        ffmpeg_process.args(["-quality", "speed"]);
+    } else if video_encoder == "libx264" {
+        ffmpeg_process.args(["-preset", "veryfast", "-crf", "20"]);
+    } else {
+        hwaccel::apply_x264_quality_args(&mut ffmpeg_process, video_encoder);
+    }
+    ffmpeg_process.kill_on_drop(true);
     let child = ffmpeg_process
         .args(["-avoid_negative_ts", "make_zero"])
-        .args(["-y", output_path.to_str().unwrap()])
+        .args(["-movflags", "+faststart"])
+        // `-progress` is a global option.  It must precede the output path;
+        // placing it after the path makes FFmpeg parse it as another output
+        // option and the clip job exits with `Invalid argument` / -22.
         .args(["-progress", "pipe:2"])
+        .arg("-y")
+        .arg(output_path)
         .stderr(Stdio::piped())
         .spawn();
 
-    if let Err(e) = child {
-        return Err(format!("启动ffmpeg进程失败: {e}"));
-    }
-
-    let mut child = child.unwrap();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            return Err(format!(
+                "启动ffmpeg进程失败（{}）：{e}",
+                ffmpeg_path().display()
+            ));
+        }
+    };
     let stderr = child.stderr.take().unwrap();
     let reader = BufReader::new(stderr);
     let mut parser = FfmpegLogParser::new(reader);
 
     let mut clip_error = None;
+    let mut last_log = String::new();
     while let Ok(event) = parser.parse_next_event().await {
         match event {
             FfmpegEvent::Progress(p) => {
@@ -1492,8 +1774,9 @@ pub async fn clip_from_video_file(
             }
             FfmpegEvent::LogEOF => break,
             FfmpegEvent::Log(level, content) => {
-                if content.contains("error") || level == LogLevel::Error {
+                if content.to_ascii_lowercase().contains("error") || level == LogLevel::Error {
                     log::error!("切片错误: {content}");
+                    last_log = content;
                 }
             }
             FfmpegEvent::Error(e) => {
@@ -1504,15 +1787,137 @@ pub async fn clip_from_video_file(
         }
     }
 
-    if let Err(e) = child.wait().await {
-        return Err(e.to_string());
-    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待ffmpeg结束失败: {e}"))?;
 
     if let Some(error) = clip_error {
-        Err(error)
-    } else {
-        log::info!("切片任务完成: {}", output_path.display());
-        Ok(())
+        return Err(format!("切片失败（源: {}）：{error}", input_path.display()));
+    }
+    if !status.success() {
+        return Err(format!(
+            "切片失败（源: {}，退出码: {}）{}",
+            input_path.display(),
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            if last_log.is_empty() {
+                String::new()
+            } else {
+                format!("：{last_log}")
+            }
+        ));
+    }
+    if !output_path.is_file() {
+        return Err(format!(
+            "切片完成但未生成文件（源: {} → 输出: {}）{}",
+            input_path.display(),
+            output_path.display(),
+            if last_log.is_empty() {
+                String::new()
+            } else {
+                format!("：{last_log}")
+            }
+        ));
+    }
+
+    log::info!(
+        "切片任务完成（编码器: {}）: {}",
+        video_encoder,
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Exports an MP4 learning segment. It first attempts a stream copy so a short
+/// selection is available almost immediately. If the source/container cannot be
+/// copied into MP4, it retries with H.264/AAC for broadly compatible output.
+pub async fn export_learning_segment_mp4(
+    input_path: &Path,
+    output_path: &Path,
+    start_time: f64,
+    duration: f64,
+) -> Result<bool, String> {
+    if !input_path.is_file() {
+        return Err(format!(
+            "Learning segment source file does not exist: {}",
+            input_path.display()
+        ));
+    }
+    if !(start_time.is_finite() && start_time >= 0.0 && duration.is_finite() && duration > 0.0) {
+        return Err(
+            "Learning segment timestamps must be finite, with start >= 0 and duration > 0"
+                .to_string(),
+        );
+    }
+    let output_dir = output_path
+        .parent()
+        .ok_or_else(|| "Learning segment output path has no parent directory".to_string())?;
+    std::fs::create_dir_all(output_dir).map_err(|error| {
+        format!(
+            "Unable to create learning segment output directory {}: {error}",
+            output_dir.display()
+        )
+    })?;
+
+    async fn run(
+        input_path: &Path,
+        output_path: &Path,
+        start_time: f64,
+        duration: f64,
+        copy: bool,
+    ) -> Result<(), String> {
+        let _ = tokio::fs::remove_file(output_path).await;
+        let ffmpeg_input = ffmpeg_cli_media_path(input_path);
+        let mut command = ffmpeg_command();
+        #[cfg(target_os = "windows")]
+        command.creation_flags(CREATE_NO_WINDOW);
+
+        command
+            .args(["-ss", &start_time.to_string()])
+            .arg("-i")
+            .arg(ffmpeg_input)
+            .args(["-t", &duration.to_string(), "-map", "0"]);
+        if copy {
+            command.args(["-c", "copy"]);
+        } else {
+            command.args([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a",
+                "192k",
+            ]);
+        }
+        let output = command
+            .args([
+                "-avoid_negative_ts",
+                "make_zero",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(output_path)
+            .output()
+            .await
+            .map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
+        if output.status.success() && output_path.is_file() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+    match run(input_path, output_path, start_time, duration, true).await {
+        Ok(()) => Ok(false),
+        Err(copy_error) => {
+            log::warn!(
+                "Learning segment stream-copy export failed; retrying with H.264/AAC: {copy_error}"
+            );
+            run(input_path, output_path, start_time, duration, false)
+                .await
+                .map_err(|encode_error| format!("Learning segment export failed. Stream copy: {copy_error}; re-encode: {encode_error}"))?;
+            Ok(true)
+        }
     }
 }
 
@@ -1631,16 +2036,75 @@ pub async fn generate_thumbnail(video_full_path: &Path, timestamp: f64) -> Resul
 }
 
 // 执行FFmpeg转换的通用函数
+fn format_conversion_duration(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).ceil() as u64;
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}分{seconds}秒")
+    } else {
+        format!("{seconds}秒")
+    }
+}
+
+fn parse_ffmpeg_progress_time(value: &str) -> Option<f64> {
+    let mut parts = value.trim().split(':');
+    let hours = parts.next()?.parse::<f64>().ok()?;
+    let minutes = parts.next()?.parse::<f64>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn format_conversion_progress(
+    processed_secs: f64,
+    total_secs: f64,
+    elapsed_secs: f64,
+    mode_name: &str,
+) -> String {
+    if total_secs <= 0.0 || elapsed_secs <= 0.0 {
+        return format!(
+            "正在转换视频格式... {:.1}秒（{mode_name}）",
+            processed_secs.max(0.0)
+        );
+    }
+    let processed_secs = processed_secs.clamp(0.0, total_secs);
+    let percent = processed_secs / total_secs * 100.0;
+    let speed = processed_secs / elapsed_secs;
+    let remaining_secs = (total_secs - processed_secs) / speed.max(0.01);
+    format!(
+        "转换 {:.0}% · {:.1}x · 预计剩余 {}（{mode_name}）",
+        percent,
+        speed,
+        format_conversion_duration(remaining_secs)
+    )
+}
+
 pub async fn execute_ffmpeg_conversion(
+    cmd: tokio::process::Command,
+    reporter: &ProgressReporter,
+    mode_name: &str,
+) -> Result<(), String> {
+    execute_ffmpeg_conversion_with_duration(cmd, reporter, mode_name, None).await
+}
+
+async fn execute_ffmpeg_conversion_with_duration(
     mut cmd: tokio::process::Command,
     reporter: &ProgressReporter,
     mode_name: &str,
+    total_duration_secs: Option<f64>,
 ) -> Result<(), String> {
     use async_ffmpeg_sidecar::event::FfmpegEvent;
     use async_ffmpeg_sidecar::log_parser::FfmpegLogParser;
     use std::process::Stdio;
     use tokio::io::BufReader;
 
+    // TaskManager cancellation aborts the owning future. Without this flag,
+    // dropping Tokio's Child leaves FFmpeg running even though the task row is
+    // already marked cancelled.
+    cmd.kill_on_drop(true);
     let mut child = cmd
         .stderr(Stdio::piped())
         .spawn()
@@ -1650,13 +2114,28 @@ pub async fn execute_ffmpeg_conversion(
     let reader = BufReader::new(stderr);
     let mut parser = FfmpegLogParser::new(reader);
 
+    let started_at = Instant::now();
     let mut conversion_error = None;
     while let Ok(event) = parser.parse_next_event().await {
         match event {
             FfmpegEvent::Progress(p) => {
-                reporter
-                    .update(&format!("正在转换视频格式... {} ({})", p.time, mode_name))
-                    .await;
+                let message = total_duration_secs
+                    .map(|total| {
+                        parse_ffmpeg_progress_time(&p.time)
+                            .map(|processed| {
+                                format_conversion_progress(
+                                    processed,
+                                    total,
+                                    started_at.elapsed().as_secs_f64(),
+                                    mode_name,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                format!("正在转换视频格式... {} ({})", p.time, mode_name)
+                            })
+                    })
+                    .unwrap_or_else(|| format!("正在转换视频格式... {} ({})", p.time, mode_name));
+                reporter.update(&message).await;
             }
             FfmpegEvent::LogEOF => break,
             FfmpegEvent::Log(level, content) => {
@@ -1762,6 +2241,315 @@ pub async fn try_high_quality_conversion(
     execute_ffmpeg_conversion(cmd, reporter, "高质量转换").await
 }
 
+/// Many recorders (including Windows Screen Sketch) write `mdat` first and `moov`
+/// at EOF. WebView/HTML5 players then show a black frame at 0:00 until the full
+/// file is fetched, or fail outright over HTTP range requests.
+pub fn mp4_moov_at_end(source_path: &Path) -> Result<bool, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let metadata = std::fs::metadata(source_path).map_err(|error| error.to_string())?;
+    let file_len = metadata.len();
+    if file_len < 12 {
+        return Ok(false);
+    }
+
+    let mut file = std::fs::File::open(source_path).map_err(|error| error.to_string())?;
+    let head_len = usize::try_from(file_len.min(1024 * 1024)).unwrap_or(1024 * 1024);
+    let mut head = vec![0u8; head_len];
+    file.read_exact(&mut head)
+        .map_err(|error| format!("读取 MP4 头部失败: {error}"))?;
+    let head_has_mdat = head.windows(4).any(|window| window == b"mdat");
+    let head_has_moov = head.windows(4).any(|window| window == b"moov");
+    if head_has_moov {
+        return Ok(false);
+    }
+
+    let tail_len = usize::try_from(file_len.min(2 * 1024 * 1024)).unwrap_or(2 * 1024 * 1024);
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::End(-(tail_len as i64)))
+        .map_err(|error| format!("读取 MP4 尾部失败: {error}"))?;
+    file.read_exact(&mut tail)
+        .map_err(|error| format!("读取 MP4 尾部失败: {error}"))?;
+    let tail_has_moov = tail.windows(4).any(|window| window == b"moov");
+
+    Ok(head_has_mdat && tail_has_moov)
+}
+
+/// Move the `moov` atom to the front for streaming/web playback without re-encoding.
+pub async fn remux_mp4_faststart(
+    source: &Path,
+    dest: &Path,
+    reporter: &ProgressReporter,
+) -> Result<(), String> {
+    remux_mp4_faststart_with_duration(source, dest, reporter, None).await
+}
+
+pub async fn remux_mp4_faststart_with_duration(
+    source: &Path,
+    dest: &Path,
+    reporter: &ProgressReporter,
+    total_duration_secs: Option<f64>,
+) -> Result<(), String> {
+    reporter
+        .update("正在优化 MP4 网页播放结构（不重编码）…")
+        .await;
+
+    let mut cmd = tokio::process::Command::new(ffmpeg_path());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    cmd.args([
+        "-fflags",
+        "+genpts+igndts",
+        "-i",
+        &source.to_string_lossy(),
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:2",
+        "-y",
+        &dest.to_string_lossy(),
+    ]);
+    execute_ffmpeg_conversion_with_duration(cmd, reporter, "MP4 网页优化", total_duration_secs)
+        .await
+}
+
+/// Build a seekable HLS presentation from a browser-compatible source without
+/// touching its original bytes.  This is deliberately a real segmented
+/// playlist, rather than a one-entry playlist that points at a multi-GB TS
+/// file: WebView MediaSource implementations can otherwise block while
+/// parsing the whole transport stream and make the desktop application appear
+/// unresponsive.
+pub async fn package_hls_for_browser(
+    source: &Path,
+    playlist: &Path,
+    segment_pattern: &Path,
+    reporter: &ProgressReporter,
+) -> Result<(), String> {
+    let parent = playlist
+        .parent()
+        .ok_or_else(|| "HLS playlist path has no parent directory".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("Failed to create HLS directory: {error}"))?;
+
+    reporter
+        .update("正在建立项目内嵌 TS 播放索引（不重编码、不修改原文件）…")
+        .await;
+    let mut cmd = tokio::process::Command::new(ffmpeg_path());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    cmd.args([
+        "-fflags",
+        "+genpts+igndts",
+        "-i",
+        &source.to_string_lossy(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-f",
+        "hls",
+        "-hls_time",
+        "4",
+        "-hls_list_size",
+        "0",
+        "-hls_playlist_type",
+        "vod",
+        "-hls_segment_type",
+        "mpegts",
+        "-hls_segment_filename",
+        &segment_pattern.to_string_lossy(),
+        "-progress",
+        "pipe:2",
+        "-y",
+        &playlist.to_string_lossy(),
+    ]);
+    execute_ffmpeg_conversion(cmd, reporter, "TS 内嵌播放索引").await
+}
+
+/// Re-encode a source that the embedded browser cannot decode. Prefer the
+/// locally available AMD encoder so long livestream recordings do not occupy
+/// the CPU for tens of hours. Fall back to a fast software H.264 profile when
+/// the driver rejects AMF.
+pub async fn try_browser_compatible_conversion(
+    source: &Path,
+    dest: &Path,
+    reporter: &ProgressReporter,
+) -> Result<(), String> {
+    try_browser_compatible_conversion_with_metadata(source, dest, reporter, None).await
+}
+
+pub async fn try_browser_compatible_conversion_with_metadata(
+    source: &Path,
+    dest: &Path,
+    reporter: &ProgressReporter,
+    metadata: Option<&VideoMetadata>,
+) -> Result<(), String> {
+    let total_duration_secs = metadata
+        .map(|value| value.duration)
+        .filter(|duration| *duration > 0.0);
+    let copy_audio = metadata.is_some_and(|value| {
+        matches!(
+            value.audio_codec.trim().to_ascii_lowercase().as_str(),
+            "aac" | "mp3" | "mp2"
+        )
+    });
+    let encoder = hwaccel::get_x264_encoder().await;
+
+    if encoder != "libx264" {
+        reporter
+            .update(&format!("正在使用 {encoder} 硬件编码生成可播放版本…"))
+            .await;
+
+        let mut hardware = tokio::process::Command::new(ffmpeg_path());
+        #[cfg(target_os = "windows")]
+        hardware.creation_flags(0x08000000);
+        hardware.args(["-i", &source.to_string_lossy()]);
+        hwaccel::apply_x264_encoder_only(&mut hardware, encoder);
+        if encoder == "h264_amf" {
+            hardware.args(["-quality", "speed"]);
+        } else {
+            hwaccel::apply_x264_quality_args(&mut hardware, encoder);
+        }
+        append_browser_audio_args(&mut hardware, copy_audio);
+        hardware.args([
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:2",
+            "-y",
+            &dest.to_string_lossy(),
+        ]);
+
+        match execute_ffmpeg_conversion_with_duration(
+            hardware,
+            reporter,
+            &format!("{encoder} 硬件转换"),
+            total_duration_secs,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(hardware_error) => {
+                log::warn!(
+                    "{encoder} H.264 conversion failed: {hardware_error}; falling back to fast libx264"
+                );
+                reporter
+                    .update("硬件编码不可用，正在使用快速兼容转换…")
+                    .await;
+            }
+        }
+    } else {
+        reporter
+            .update("未发现可用硬件编码器，正在使用快速兼容转换…")
+            .await;
+    }
+
+    let mut software = tokio::process::Command::new(ffmpeg_path());
+    #[cfg(target_os = "windows")]
+    software.creation_flags(0x08000000);
+    software.args([
+        "-i",
+        &source.to_string_lossy(),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+    ]);
+    append_browser_audio_args(&mut software, copy_audio);
+    software.args([
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:2",
+        "-y",
+        &dest.to_string_lossy(),
+    ]);
+    execute_ffmpeg_conversion_with_duration(software, reporter, "快速兼容转换", total_duration_secs)
+        .await
+}
+
+fn append_browser_audio_args(command: &mut tokio::process::Command, copy_audio: bool) {
+    if copy_audio {
+        command.args(["-c:a", "copy"]);
+    } else {
+        command.args(["-c:a", "aac", "-b:a", "160k"]);
+    }
+}
+
+/*
+    reporter
+        .update("正在使用 AMD 硬件编码生成可播放版本...")
+        .await;
+
+    let mut amd = tokio::process::Command::new(ffmpeg_path());
+    #[cfg(target_os = "windows")]
+    amd.creation_flags(0x08000000);
+    amd.args([
+        "-i",
+        &source.to_string_lossy(),
+        "-c:v",
+        "h264_amf",
+        "-quality",
+        "speed",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:2",
+        "-y",
+        &dest.to_string_lossy(),
+    ]);
+
+    match execute_ffmpeg_conversion(amd, reporter, "AMD 硬件转换").await {
+        Ok(()) => Ok(()),
+        Err(amd_error) => {
+            log::warn!("AMD H.264 conversion failed: {amd_error}; falling back to fast libx264");
+            reporter
+                .update("AMD 编码不可用，正在使用快速兼容转换...")
+                .await;
+
+            let mut software = tokio::process::Command::new(ffmpeg_path());
+            #[cfg(target_os = "windows")]
+            software.creation_flags(0x08000000);
+            software.args([
+                "-i",
+                &source.to_string_lossy(),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:2",
+                "-y",
+                &dest.to_string_lossy(),
+            ]);
+            execute_ffmpeg_conversion(software, reporter, "快速兼容转换").await
+        }
+    }
+}*/
+
 // 带进度的视频格式转换函数（智能质量保持策略）
 pub async fn convert_video_format(
     source: &Path,
@@ -1838,6 +2626,23 @@ pub async fn check_videos(video_paths: &[&Path]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversion_progress_shows_percent_speed_and_eta() {
+        assert_eq!(
+            format_conversion_progress(300.0, 600.0, 100.0, "硬件转换"),
+            "转换 50% · 3.0x · 预计剩余 1分40秒（硬件转换）"
+        );
+    }
+
+    #[test]
+    fn output_is_mp4_detects_browser_playback_containers() {
+        assert!(output_is_mp4(Path::new("clip.mp4")));
+        assert!(output_is_mp4(Path::new("clip.M4V")));
+        assert!(output_is_mp4(Path::new("clip.mov")));
+        assert!(!output_is_mp4(Path::new("clip.ts")));
+        assert!(!output_is_mp4(Path::new("clip.opus")));
+    }
 
     // 测试 Range 结构体
     #[test]
@@ -2009,6 +2814,25 @@ mod tests {
     }
 
     // 测试路径构建函数
+    #[test]
+    fn mp4_moov_at_end_detects_tail_metadata() {
+        use std::io::Write;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("bsr-mp4-layout-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let file_path = temp_dir.join("tail-moov.mp4");
+        {
+            let mut file = std::fs::File::create(&file_path).unwrap();
+            file.write_all(b"----ftypmp42----mdat").unwrap();
+            file.write_all(&vec![0u8; 4096]).unwrap();
+            file.write_all(b"----moov").unwrap();
+        }
+
+        assert!(mp4_moov_at_end(&file_path).unwrap());
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
     #[test]
     fn test_ffmpeg_paths() {
         let ffmpeg_path = ffmpeg_path();

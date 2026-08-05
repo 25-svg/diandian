@@ -1,9 +1,13 @@
 use crate::config::Config;
 use crate::database::knowledge::KnowledgeDocumentRecord;
 use crate::database::master_script::{MasterChunkInput, MasterChunkRow};
+use crate::database::video::{VideoTranscriptChunkInput, VideoTranscriptChunkRow};
 use crate::database::Database;
 use crate::ffmpeg;
-use crate::subtitle_generator::transcript_artifacts::{TranscriptArtifactStore, TranscriptSource};
+use crate::subtitle_generator::transcript_artifacts::{
+    apply_approved_transcript_replacements, normalize_srt_model_numbers,
+    ApprovedTranscriptReplacement, TranscriptArtifactStore, TranscriptSource,
+};
 use crate::subtitle_generator::volcengine::VolcengineAsr;
 use async_trait::async_trait;
 use master_ingest::{
@@ -158,9 +162,55 @@ impl CheckpointStore for DatabaseCheckpointStore {
 }
 
 #[derive(Clone)]
+pub struct VideoCheckpointStore {
+    database: Arc<Database>,
+}
+
+impl VideoCheckpointStore {
+    pub fn new(database: Arc<Database>) -> Self {
+        Self { database }
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for VideoCheckpointStore {
+    async fn list(&self, video_id: i64) -> Result<Vec<Checkpoint>, String> {
+        self.database
+            .list_video_transcript_chunks(video_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(checkpoint_from_video_row)
+            .collect()
+    }
+
+    async fn persist(&self, checkpoint: Checkpoint) -> Result<Checkpoint, String> {
+        let input = VideoTranscriptChunkInput {
+            video_id: checkpoint.source_id,
+            chunk_index: i64::try_from(checkpoint.chunk_index)
+                .map_err(|error| error.to_string())?,
+            start_ms: i64::try_from(checkpoint.start_ms).map_err(|error| error.to_string())?,
+            end_ms: i64::try_from(checkpoint.end_ms).map_err(|error| error.to_string())?,
+            status: checkpoint.status.as_str().into(),
+            input_hash: checkpoint.input_hash,
+            raw_srt: checkpoint.raw_srt,
+            reviewed_srt: checkpoint.reviewed_srt,
+            error: checkpoint.error,
+        };
+        checkpoint_from_video_row(
+            self.database
+                .upsert_video_transcript_chunk(input)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    }
+}
+
+#[derive(Clone)]
 pub struct TranscriptArtifactSink {
     source: TranscriptSource,
     directory: PathBuf,
+    approved_replacements: Vec<ApprovedTranscriptReplacement>,
 }
 
 impl TranscriptArtifactSink {
@@ -168,7 +218,16 @@ impl TranscriptArtifactSink {
         Self {
             source,
             directory: directory.as_ref().to_path_buf(),
+            approved_replacements: Vec::new(),
         }
+    }
+
+    pub fn with_approved_replacements(
+        mut self,
+        replacements: Vec<ApprovedTranscriptReplacement>,
+    ) -> Self {
+        self.approved_replacements = replacements;
+        self
     }
 }
 
@@ -191,12 +250,19 @@ impl ArtifactSink for TranscriptArtifactSink {
         } else {
             artifacts.raw_srt
         };
+        let (corrected_srt, mut corrections) =
+            normalize_srt_model_numbers(&artifacts.corrected_srt)
+                .map_err(|error| error.to_string())?;
+        let (corrected_srt, dictionary_corrections) =
+            apply_approved_transcript_replacements(&corrected_srt, &self.approved_replacements)
+                .map_err(|error| error.to_string())?;
+        corrections.extend(dictionary_corrections);
         TranscriptArtifactStore::initialize(
             self.source.clone(),
             &self.directory,
             &raw_srt,
-            &artifacts.corrected_srt,
-            Vec::new(),
+            &corrected_srt,
+            corrections,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -248,6 +314,26 @@ fn checkpoint_from_row(row: MasterChunkRow) -> Result<Checkpoint, String> {
             "complete" => ChunkStatus::Complete,
             "failed" => ChunkStatus::Failed,
             value => return Err(format!("unknown master chunk status: {value}")),
+        },
+        input_hash: row.input_hash,
+        raw_srt: row.raw_srt,
+        reviewed_srt: row.reviewed_srt,
+        error: row.error,
+    })
+}
+
+fn checkpoint_from_video_row(row: VideoTranscriptChunkRow) -> Result<Checkpoint, String> {
+    Ok(Checkpoint {
+        source_id: row.video_id,
+        chunk_index: usize::try_from(row.chunk_index).map_err(|error| error.to_string())?,
+        start_ms: u64::try_from(row.start_ms).map_err(|error| error.to_string())?,
+        end_ms: u64::try_from(row.end_ms).map_err(|error| error.to_string())?,
+        status: match row.status.as_str() {
+            "pending" => ChunkStatus::Pending,
+            "running" => ChunkStatus::Running,
+            "complete" => ChunkStatus::Complete,
+            "failed" => ChunkStatus::Failed,
+            value => return Err(format!("unknown video transcript chunk status: {value}")),
         },
         input_hash: row.input_hash,
         raw_srt: row.raw_srt,

@@ -5,6 +5,7 @@ use crate::database::live_dashboard::{
     LiveDashboardChannelRow, LiveDashboardProductRow, LiveDashboardSessionRow,
     LiveDashboardShortVideoRow,
 };
+use crate::live_dashboard_download_filter::is_official_live_dashboard_export;
 use crate::live_data_import::parse_live_dashboard_xlsx;
 use crate::state::State;
 use crate::state_type;
@@ -149,12 +150,7 @@ pub async fn start_live_dashboard_download_poller(state: State) {
                     last_directory_error = None;
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        let extension = path.extension().and_then(|value| value.to_str());
-                        let temporary = path
-                            .file_name()
-                            .and_then(|value| value.to_str())
-                            .is_some_and(|name| name.starts_with("~$"));
-                        if extension != Some("xlsx") || temporary {
+                        if !is_official_live_dashboard_export(&path) {
                             continue;
                         }
                         let Ok(metadata) = entry.metadata() else {
@@ -180,6 +176,11 @@ pub async fn start_live_dashboard_download_poller(state: State) {
                                         "Failed to emit live dashboard import event: {error}"
                                     );
                                 }
+                                #[cfg(feature = "gui")]
+                                crate::compass_auto_download::notify_compass_imported(
+                                    &state.app_handle,
+                                    &session.started_at,
+                                );
                             }
                             Err(error) => {
                                 log::warn!(

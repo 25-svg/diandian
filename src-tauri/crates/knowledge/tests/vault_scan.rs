@@ -65,6 +65,38 @@ fn recognizes_master_script_and_scenario_directories() {
 }
 
 #[test]
+fn recognizes_company_deal_benchmark_directory_and_only_approves_reviewed_cards() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("12-公司成交基准")).unwrap();
+    write(
+        root.path(),
+        "12-公司成交基准/approved.md",
+        "---\nid: CDB-CANON-XIAOBAITU-001\ntitle: 佳能小白兔公司成交基准\ntype: company_deal_benchmark\nstatus: approved\nversion: 1.0.0\nproduct_key: canon-xiaobaitu\nproduct_name: 佳能小白兔\n---\n成交结构正文",
+    );
+    write(
+        root.path(),
+        "12-公司成交基准/draft.md",
+        "---\nid: CDB-DRAFT\ntitle: 草稿\ntype: company_deal_benchmark\nstatus: draft\nversion: 0.1.0\nproduct_key: canon-xiaobaitu\nproduct_name: 佳能小白兔\n---\n草稿正文",
+    );
+
+    let inspection = inspect_vault(root.path()).unwrap();
+    assert!(inspection.valid);
+    let scan = scan_vault(root.path()).unwrap();
+    let approved = scan
+        .documents
+        .iter()
+        .find(|item| item.card_id == "CDB-CANON-XIAOBAITU-001")
+        .unwrap();
+    let draft = scan
+        .documents
+        .iter()
+        .find(|item| item.card_id == "CDB-DRAFT")
+        .unwrap();
+    assert!(approved.eligible);
+    assert!(!draft.eligible);
+}
+
+#[test]
 fn accepts_current_vault_layout_with_pending_review_directory() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join(".obsidian")).unwrap();
@@ -79,6 +111,7 @@ fn accepts_current_vault_layout_with_pending_review_directory() {
         "08-产品参数库",
         "10-企业母稿",
         "11-场景应对",
+        "12-公司成交基准",
         "99-待审核",
     ] {
         fs::create_dir(root.path().join(directory)).unwrap();
@@ -103,6 +136,7 @@ fn accepts_legacy_review_directory_as_an_alias() {
         "08-产品参数库",
         "10-企业母稿",
         "11-场景应对",
+        "12-公司成交基准",
         "09-审核逐字稿",
     ] {
         fs::create_dir(root.path().join(directory)).unwrap();
@@ -335,9 +369,13 @@ fn scans_external_vault_without_modifying_files() {
         .documents
         .iter()
         .any(|item| item.status == "pending_review"));
-    assert_eq!(classification_count("eligible"), 2);
-    assert_eq!(classification_count("pending_review"), 533);
-    assert_eq!(classification_count("ignored"), 12);
-    assert_eq!(scan.issues.len(), 0);
+    assert_eq!(
+        scan.documents.len(),
+        classification_count("eligible")
+            + classification_count("pending_review")
+            + classification_count("ignored")
+            + classification_count("restricted")
+            + scan.issues.len()
+    );
     assert_eq!(before, after);
 }

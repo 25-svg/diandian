@@ -7,7 +7,7 @@
   import type { AccountInfo } from "../db";
   import type { Marker, RecorderList, RecorderInfo, Range } from "../interface";
 
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onDestroy } from "svelte";
   import {
     GridOutline,
     SortHorizontalOutline,
@@ -34,6 +34,19 @@
   export function seek(offset: number) {
     video.currentTime = offset;
   }
+
+  function handleEmbedSeekMessage(event: MessageEvent): void {
+    if (event.data?.type !== "bsr:embed-seek") return;
+    if (!video) return;
+    const offsetSec = Number(event.data.offsetSec);
+    if (!Number.isFinite(offsetSec)) return;
+    seek(Math.max(0, offsetSec - focus_start));
+    void video.play()?.catch(() => undefined);
+  }
+
+  onDestroy(() => {
+    window.removeEventListener("message", handleEmbedSeekMessage);
+  });
   let video: HTMLVideoElement;
   let show_detail = false;
   let show_list = false;
@@ -369,6 +382,7 @@ ${mediaPlaylistUrl}`;
     }, 5 * 1000);
 
     video = document.getElementById("video") as HTMLVideoElement;
+    window.addEventListener("message", handleEmbedSeekMessage);
     video.crossOrigin = "anonymous";
     video.disableRemotePlayback = true;
     video.setAttribute("x-webkit-airplay", "deny");

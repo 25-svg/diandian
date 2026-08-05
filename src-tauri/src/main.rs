@@ -7,12 +7,16 @@ mod config;
 mod constants;
 mod danmu2ass;
 mod database;
+mod doudian_orders;
 mod ffmpeg;
 mod fs_util;
 mod handlers;
 #[cfg(feature = "headless")]
 mod http_server;
 mod knowledge_writer;
+mod compass_auto_download;
+mod live_dashboard_binding;
+mod live_dashboard_download_filter;
 mod live_data_import;
 mod master_script;
 mod migration;
@@ -542,6 +546,30 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::live_dashboard::LIVE_DASHBOARD_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 30,
+            description: "align_live_dashboard_kpis",
+            sql: database::live_dashboard::LIVE_DASHBOARD_KPI_ALIGNMENT_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 31,
+            description: "add_live_dashboard_bindings",
+            sql: database::live_dashboard_binding::LIVE_DASHBOARD_BINDINGS_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 32,
+            description: "add_competitor_reference_candidates",
+            sql: database::master_script::COMPETITOR_REFERENCE_CANDIDATES_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 33,
+            description: "add_record_archive_kind",
+            sql: database::record::RECORD_ARCHIVE_KIND_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -618,6 +646,7 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
         .expect("Failed to run migrations");
 
     db.set(db_pool).await;
+    db.configure_sqlite_runtime().await?;
     db.finish_pending_tasks().await?;
 
     let progress_manager = Arc::new(ProgressManager::new());
@@ -631,11 +660,13 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
         db.clone(),
         config.clone(),
     ));
+    let media_execution_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let recorder_manager = Arc::new(RecorderManager::new(
         emitter,
         db.clone(),
         config.clone(),
         task_manager.clone(),
+        media_execution_gate.clone(),
         webhook_poster.clone(),
         nas_archive.clone(),
     ));
@@ -661,6 +692,9 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
         recorder_manager,
         nas_archive,
         task_manager,
+        video_preview_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        video_preview_prepare_gate: Arc::new(tokio::sync::Mutex::new(())),
+        media_execution_gate,
         static_server,
         storage_migration,
         progress_manager,
@@ -707,6 +741,7 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         tauri_plugin_sql::DbPool::Sqlite(pool) => Some(pool),
     };
     db_clone.set(sqlite_pool.unwrap().clone()).await;
+    db_clone.configure_sqlite_runtime().await?;
     db_clone.finish_pending_tasks().await?;
     let webhook_poster =
         webhook::poster::create_webhook_poster(&config.read().await.webhook_url, None).unwrap();
@@ -718,6 +753,7 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         db.clone(),
         config.clone(),
     ));
+    let media_execution_gate = Arc::new(tokio::sync::Semaphore::new(1));
 
     let recorder_manager = Arc::new(RecorderManager::new(
         app.app_handle().clone(),
@@ -725,6 +761,7 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         db.clone(),
         config.clone(),
         task_manager.clone(),
+        media_execution_gate.clone(),
         webhook_poster.clone(),
         nas_archive.clone(),
     ));
@@ -751,6 +788,9 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         recorder_manager,
         nas_archive,
         task_manager,
+        video_preview_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        video_preview_prepare_gate: Arc::new(tokio::sync::Mutex::new(())),
+        media_execution_gate,
         static_server,
         storage_migration,
         app_handle: app.handle().clone(),
@@ -846,6 +886,15 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::live_dashboard::get_live_dashboard_detail,
         crate::handlers::live_dashboard::get_live_dashboard_settings,
         crate::handlers::live_dashboard::set_live_dashboard_download_dir,
+        crate::compass_auto_download::query_compass_live_sessions,
+        crate::compass_auto_download::start_compass_live_downloads,
+        crate::compass_auto_download::close_compass_auto_download,
+        crate::handlers::live_dashboard_binding::resolve_live_dashboard_for_record,
+        crate::handlers::live_dashboard_binding::bind_live_dashboard_session,
+        crate::handlers::live_dashboard_binding::list_live_dashboard_bindings_for_live_ids,
+        crate::handlers::doudian_orders::fetch_doudian_payment_events,
+        crate::handlers::doudian_orders::get_doudian_order_config,
+        crate::handlers::doudian_orders::update_doudian_order_config,
         crate::handlers::master_script::start_master_ingest,
         crate::handlers::master_script::create_master_sample_batch,
         crate::handlers::master_script::list_master_sample_batches,
@@ -860,8 +909,13 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::master_script::publish_master_script,
         crate::handlers::master_script::get_master_script_status,
         crate::handlers::master_script::get_master_baseline,
+        crate::handlers::master_script::get_master_section_index,
+        crate::handlers::master_script::import_deal_refinement_candidates,
         crate::handlers::master_script::list_support_candidates,
         crate::handlers::master_script::decide_support_candidate,
+        crate::handlers::master_script::list_competitor_reference_candidates,
+        crate::handlers::master_script::decide_competitor_reference_candidate,
+        crate::handlers::master_script::publish_competitor_reference,
         crate::handlers::master_script::preview_master_upgrade,
         crate::handlers::master_script::publish_master_upgrade,
         crate::handlers::master_script::compare_highlight_to_master,
@@ -876,6 +930,8 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::recorder::get_archive_disk_usage,
         crate::handlers::recorder::get_archives,
         crate::handlers::recorder::get_archive,
+        crate::handlers::recorder::set_archive_kind,
+        crate::handlers::recorder::auto_classify_archive_kinds,
         crate::handlers::recorder::get_archives_by_parent_id,
         crate::handlers::recorder::get_archive_subtitle,
         crate::handlers::recorder::get_archive_transcript_audit,
@@ -914,12 +970,18 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::video::list_video_archives,
         crate::handlers::video::retry_video_archive,
         crate::handlers::video::open_video_archive_location,
+        crate::handlers::video::open_video_externally,
         crate::handlers::video::get_video_typelist,
         crate::handlers::video::update_video_cover,
         crate::handlers::video::generate_video_subtitle,
         crate::handlers::video::get_video_subtitle,
         crate::handlers::video::get_video_playback_source,
         crate::handlers::video::prepare_video_playback,
+        crate::handlers::video::prepare_video_playback_preview,
+        crate::handlers::video::stop_video_playback_preview,
+        crate::handlers::video::start_native_video_playback,
+        crate::handlers::video::stop_native_video_playback,
+        crate::handlers::video::resize_native_video_playback,
         crate::handlers::video::update_video_subtitle,
         crate::handlers::video::update_video_note,
         crate::handlers::video::encode_video_subtitle,
@@ -927,6 +989,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::video::import_external_video,
         crate::handlers::video::batch_import_external_videos,
         crate::handlers::video::clip_video,
+        crate::handlers::video::queue_deal_auto_clips,
         crate::handlers::video::get_file_size,
         crate::handlers::video::get_import_progress,
         crate::handlers::video::generate_audio_sample,
@@ -952,6 +1015,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::video_editing::search_danmu_keywords,
         crate::handlers::video_editing::merge_videos,
         crate::handlers::video_editing::extract_video_audio,
+        crate::handlers::video_editing::export_learning_segment,
     ])
 }
 
@@ -1019,14 +1083,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build(tauri::generate_context!())?
         .run(|app_handle: &tauri::AppHandle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                // stop all recorders
-                let recorder_manager = app_handle.state::<State>().recorder_manager.clone();
-                log::info!("Stopping all recorders...");
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                let state = app_handle.state::<State>();
+                let task_manager = state.task_manager.clone();
+                let recorder_manager = state.recorder_manager.clone();
+                let app_state = state.inner().clone();
+                log::info!("Stopping background tasks and recorders before exit...");
                 tauri::async_runtime::block_on(async move {
+                    task_manager.shutdown().await;
+                    app_state.stop_all_video_previews().await;
                     recorder_manager.stop_all().await;
                 });
-                log::info!("All recorders stopped successfully.");
+                log::info!("Background tasks and recorders stopped successfully.");
             }
         });
 

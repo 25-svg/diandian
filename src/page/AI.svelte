@@ -19,6 +19,7 @@
   import ImportVideoDialog from "../lib/components/ImportVideoDialog.svelte";
   import MasterSourceDialog from "../lib/components/master/MasterSourceDialog.svelte";
   import SupportCandidateQueue from "../lib/components/master/SupportCandidateQueue.svelte";
+  import CompetitorReferenceQueue from "../lib/components/analysis/CompetitorReferenceQueue.svelte";
   import ReviewSampleDialog from "../lib/components/ai/ReviewSampleDialog.svelte";
   import type { ReviewSample, VideoItem } from "../lib/interface";
 
@@ -32,6 +33,7 @@
   let showImportDialog = false;
   let masterSourceVideo: VideoItem | null = null;
   let showSupportCandidateQueue = false;
+  let showCompetitorReferenceQueue = false;
   let showSampleDialog = false;
   let importWorkflowStatus = "";
   let adminMode = false;
@@ -216,7 +218,7 @@
   const commercePresetPrompts = [
     { title: "整场自动挖样本", description: "从整场录播定位并切出五类训练片段", prompt: "请对最新一场已结束的直播执行整场样本挖掘：先获取或生成带时间戳逐字稿，再按时间顺序分块筛选候选片段，合并重叠区间，分别寻找成交、疑似成交、问价未见成交信号、转品/上链接、讲得散片段。每个候选必须给出时间范围、原文证据和分类置信度；不得把报价或上链接当成成交。然后调用切片工具生成候选视频，并对每个切片按 V1.1 做复盘。", icon: "🧪" },
     { title: "复盘逐字稿", description: "粘贴逐字稿后判断片段类型", prompt: "请按直播成交片段复盘官 V1.1 分析我接下来提交的逐字稿；信息不足时仅做片段级判断。\n\n[请在这里粘贴逐字稿]", icon: "📋" },
-    { title: "成交片段诊断", description: "拆解成交机制并生成可复用口播", prompt: "请复盘我指定的成交片段，核验证据、拆解逐句话术，并输出可直接口播的优化版本。", icon: "🎯" },
+    { title: "成交片段诊断", description: "拆解成交机制并生成参考表达", prompt: "请复盘我指定的成交片段，核验证据、拆解逐句话术，并输出须经人工定稿的参考改写建议。", icon: "🎯" },
     { title: "未成交诊断", description: "定位问价后没有推进的断点", prompt: "请分析我指定的问价未成交片段，找出交易链路停在哪一步，并给出最小修改口播。", icon: "🔎" },
     { title: "转品与上链接", description: "检查商品、价格、链接和CTA承接", prompt: "请分析我指定的转品或上链接片段，检查商品与链接是否一致、承接是否清楚。", icon: "🔗" },
     { title: "讲得散诊断", description: "识别打断、重复和主线缺失", prompt: "请分析我指定的直播片段为什么讲得散，并重排成连续的交易主线。", icon: "🧭" },
@@ -227,7 +229,7 @@
   $: aiReady = Boolean(agent) || settings.provider === "minimax";
   $: assistantTitle = agentMode === "commerce-review" ? "直播成交片段复盘官" : "小轴";
   $: assistantDescription = agentMode === "commerce-review"
-    ? "读取录播字幕，预分类片段，核验证据并生成可直接口播的优化稿。"
+    ? "读取录播字幕，预分类片段，核验证据并生成须经人工定稿的参考表达。"
     : "管理直播录制、生成精彩切片并分析弹幕内容。";
   $: lastReviewContent = getLastReviewContent(messages);
 
@@ -1270,6 +1272,15 @@
                 </button>
                 <button
                   class="px-2.5 py-1.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors flex items-center space-x-1.5 text-sm"
+                  on:click={() => showCompetitorReferenceQueue = true}
+                  disabled={isProcessing}
+                  title="竞品对照：人工批准后写入案例库"
+                >
+                  <Clipboard class="w-3.5 h-3.5" />
+                  <span>竞品参考</span>
+                </button>
+                <button
+                  class="px-2.5 py-1.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors flex items-center space-x-1.5 text-sm"
                   on:click={() => showSampleDialog = true}
                   disabled={isProcessing}
                   title="打开M1样本库"
@@ -1335,6 +1346,9 @@
 
   {#if showSupportCandidateQueue}
     <SupportCandidateQueue on:close={() => showSupportCandidateQueue = false} />
+  {/if}
+  {#if showCompetitorReferenceQueue}
+    <CompetitorReferenceQueue on:close={() => showCompetitorReferenceQueue = false} />
   {/if}
 
   <ReviewSampleDialog

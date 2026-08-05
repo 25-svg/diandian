@@ -1,6 +1,7 @@
 <script type="ts">
   import { open } from "../lib/invoker";
   import { BookOpen, MessageCircle, Video, Heart } from "lucide-svelte";
+  import PageShell from "../lib/components/PageShell.svelte";
   import { hasNewVersion, latestVersion } from "../lib/stores/version";
   let version = `v${__APP_VERSION__}`;
   let showDonateModal = false;
@@ -56,27 +57,27 @@
   }
 </script>
 
-<div class="flex-1 p-6 overflow-auto custom-scrollbar-light bg-gray-50">
+<PageShell title="关于" subtitle="产品信息、版本说明与支持渠道。">
   <div class="max-w-2xl mx-auto space-y-8">
     <!-- App Info -->
     <div class="text-center space-y-4">
       <div
-        class="w-24 h-24 mx-auto bg-gradient-to-br from-blue-500 to-purple-600 rounded-2xl shadow-lg flex items-center justify-center"
+        class="w-24 h-24 mx-auto rounded-[22px] shadow-mac flex items-center justify-center"
+        style="background:linear-gradient(145deg,#43a7ff 0%,var(--mac-blue) 55%,#0058c9 100%)"
       >
         <Video class="w-12 h-12 icon-white" />
       </div>
       <div>
-        <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">
-          典典直播切片
-        </h1>
-        <p class="text-gray-500 dark:text-gray-400">Version {version}</p>
+        <h1 class="mac-page-title" style="font-size:28px">典典直播切片</h1>
+        <p class="mac-page-subtitle">Version {version}</p>
       </div>
     </div>
 
     <!-- Quick Actions -->
     <div class="grid grid-cols-3 gap-4">
       <button
-        class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
+        type="button"
+        class="mac-card p-4 hover:bg-[color:var(--mac-fill)] transition-colors"
         on:click={() => {
           // tauri open url
           open("https://bsr.xinrea.cn/");
@@ -84,7 +85,7 @@
       >
         <div class="flex flex-col items-center space-y-2">
           <div
-            class="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center"
+            class="w-10 h-10 rounded-full bg-[color:var(--mac-blue-soft)] flex items-center justify-center"
           >
             <BookOpen class="w-5 h-5 icon-primary" />
           </div>
@@ -94,7 +95,7 @@
         </div>
       </button>
       <button
-        class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
+        type="button" class="mac-card p-4 hover:bg-[color:var(--mac-fill)] transition-colors"
         on:click={() => {
           // tauri open url
           open("https://qm.qq.com/q/v4lrE6gyum");
@@ -102,7 +103,7 @@
       >
         <div class="flex flex-col items-center space-y-2">
           <div
-            class="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center"
+            class="w-10 h-10 rounded-full bg-[color:var(--mac-blue-soft)] flex items-center justify-center"
           >
             <MessageCircle class="w-5 h-5 icon-primary" />
           </div>
@@ -112,7 +113,7 @@
         </div>
       </button>
       <button
-        class="p-4 rounded-xl bg-white dark:bg-[#3c3c3e] border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
+        type="button" class="mac-card p-4 hover:bg-[color:var(--mac-fill)] transition-colors"
         on:click={toggleDonateModal}
       >
         <div class="flex flex-col items-center space-y-2">
@@ -130,12 +131,8 @@
 
     <!-- What's New -->
     <div class="space-y-4">
-      <h2 class="text-lg font-medium text-gray-900 dark:text-white">
-        What's New
-      </h2>
-      <div
-        class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700"
-      >
+      <h2 class="text-[15px] font-semibold text-[color:var(--mac-label)]">更新说明</h2>
+      <div class="mac-card">
         {#each releases as release}
           <!-- svelte-ignore a11y-click-events-have-key-events -->
           <div
@@ -167,7 +164,7 @@
       </div>
     </div>
   </div>
-</div>
+</PageShell>
 
 {#if showDonateModal}
   <div

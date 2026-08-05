@@ -55,6 +55,13 @@ pub struct TranscriptCorrection {
     pub decided_text: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedTranscriptReplacement {
+    pub candidate_id: i64,
+    pub source_text: String,
+    pub target_text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptAuditBundle {
@@ -138,6 +145,267 @@ struct SrtCue {
     text: String,
 }
 
+/// Converts the ASR-specific Chinese-digit rendering of an alphanumeric model
+/// code (for example `R五二`, `R七`, or `叉D`) back to its literal form (`R52`,
+/// `R7`, or `XD`). A single Chinese digit is only converted at a clear model-code
+/// boundary, so ordinary Chinese phrases such as `A二手` are left unchanged.
+pub fn normalize_letter_prefixed_model_numbers(value: &str) -> String {
+    let value = normalize_spaced_x_prefix(value);
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < characters.len() {
+        let original = characters[index];
+        if !original.is_ascii_alphabetic() {
+            normalized.push(original);
+            index += 1;
+            continue;
+        }
+
+        // ASR may spell a model prefix as `XD 三零` or `R 七`. Only consume
+        // whitespace when Chinese model digits actually follow it.
+        let mut prefix_end = index;
+        while prefix_end < characters.len() && characters[prefix_end].is_ascii_alphabetic() {
+            prefix_end += 1;
+        }
+        let mut cursor = prefix_end;
+        while cursor < characters.len() && characters[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        let mut digits = String::new();
+        while cursor < characters.len() && digits.len() < 4 {
+            // `Z6二代` and `M50二代` describe a generation. The ordinal is
+            // not part of the numeric model code, so keep it as spoken.
+            if !digits.is_empty()
+                && characters[cursor] == '二'
+                && characters.get(cursor + 1).copied() == Some('代')
+            {
+                break;
+            }
+            let Some(digit) = chinese_digit(characters[cursor]) else {
+                break;
+            };
+            digits.push(digit);
+            cursor += 1;
+        }
+        let has_clear_boundary = cursor == characters.len()
+            || characters
+                .get(cursor)
+                .copied()
+                .is_some_and(is_model_number_boundary)
+            || (characters.get(cursor).copied() == Some('二')
+                && characters.get(cursor + 1).copied() == Some('代'));
+        if digits.len() >= 2 || (digits.len() == 1 && has_clear_boundary) {
+            normalized.push_str(
+                &characters[index..prefix_end]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_uppercase(),
+            );
+            normalized.push_str(&digits);
+            index = cursor;
+        } else {
+            normalized.push(original);
+            index += 1;
+        }
+    }
+    normalized
+}
+
+/// Volcengine sometimes emits the spoken `叉 D` spelling of `XD` with a space.
+/// This conversion only applies when 叉 is directly followed by whitespace and
+/// an ASCII model character; normal Chinese words such as `叉子` are untouched.
+fn normalize_spaced_x_prefix(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] != '叉' {
+            normalized.push(characters[index]);
+            index += 1;
+            continue;
+        }
+        let mut next = index + 1;
+        while next < characters.len() && characters[next].is_whitespace() {
+            next += 1;
+        }
+        if characters
+            .get(next)
+            .copied()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        {
+            normalized.push('X');
+            index = next;
+        } else {
+            normalized.push('叉');
+            index += 1;
+        }
+    }
+    normalized
+}
+
+fn is_model_number_boundary(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '，' | '。'
+                | '、'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | ','
+                | '.'
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | ')'
+                | '）'
+                | ']'
+                | '】'
+                | '的'
+                | '呢'
+                | '啊'
+                | '呀'
+                | '哦'
+        )
+}
+
+pub fn normalize_srt_model_numbers(srt: &str) -> io::Result<(String, Vec<TranscriptCorrection>)> {
+    let mut normalized = srt.to_string();
+    let mut corrections = Vec::new();
+    for cue in parse_srt_cues(srt) {
+        let replacement = normalize_letter_prefixed_model_numbers(&cue.text);
+        if replacement == cue.text {
+            continue;
+        }
+        normalized = replace_cue_text(
+            &normalized,
+            cue.start_ms,
+            cue.end_ms,
+            &cue.text,
+            &replacement,
+        )?;
+        corrections.push(TranscriptCorrection {
+            id: stable_correction_id(
+                cue.start_ms,
+                cue.end_ms,
+                &cue.text,
+                &replacement,
+                "model_number_format",
+            ),
+            start_ms: cue.start_ms,
+            end_ms: cue.end_ms,
+            original: cue.text,
+            proposed: replacement.clone(),
+            category: "model_number_format".into(),
+            evidence: vec!["letter_prefixed_chinese_digits".into()],
+            critical: false,
+            decision: ReviewDecision::Approved,
+            decided_text: Some(replacement),
+        });
+    }
+    Ok((normalized, corrections))
+}
+
+fn drop_duplicate_unresolved_reviews_covered_by_model_formatting(
+    corrections: &mut Vec<TranscriptCorrection>,
+    model_corrections: &[TranscriptCorrection],
+) {
+    corrections.retain(|correction| {
+        let is_unresolved_duplicate = correction.decision == ReviewDecision::Pending
+            && is_pending_placeholder(&correction.proposed)
+            && model_corrections.iter().any(|model_correction| {
+                model_correction.category == "model_number_format"
+                    && model_correction.decision == ReviewDecision::Approved
+                    && model_correction.start_ms == correction.start_ms
+                    && model_correction.end_ms == correction.end_ms
+                    && model_correction.original == correction.original
+            });
+        !is_unresolved_duplicate
+    });
+}
+
+pub fn apply_approved_transcript_replacements(
+    srt: &str,
+    replacements: &[ApprovedTranscriptReplacement],
+) -> io::Result<(String, Vec<TranscriptCorrection>)> {
+    let mut replacements = replacements
+        .iter()
+        .filter(|rule| {
+            !rule.source_text.trim().is_empty()
+                && !rule.target_text.trim().is_empty()
+                && rule.source_text != rule.target_text
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    replacements.sort_by(|left, right| {
+        right
+            .source_text
+            .chars()
+            .count()
+            .cmp(&left.source_text.chars().count())
+            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+    });
+
+    let mut corrected = srt.to_string();
+    let mut corrections = Vec::new();
+    for rule in replacements {
+        for cue in parse_srt_cues(&corrected) {
+            if !cue.text.contains(&rule.source_text) {
+                continue;
+            }
+            let replacement = cue.text.replace(&rule.source_text, &rule.target_text);
+            corrected = replace_cue_text(
+                &corrected,
+                cue.start_ms,
+                cue.end_ms,
+                &cue.text,
+                &replacement,
+            )?;
+            corrections.push(TranscriptCorrection {
+                id: stable_correction_id(
+                    cue.start_ms,
+                    cue.end_ms,
+                    &cue.text,
+                    &replacement,
+                    &format!("approved_dictionary:{}", rule.candidate_id),
+                ),
+                start_ms: cue.start_ms,
+                end_ms: cue.end_ms,
+                original: cue.text,
+                proposed: replacement.clone(),
+                category: "approved_dictionary".into(),
+                evidence: vec![format!(
+                    "approved_dictionary_candidate:{}",
+                    rule.candidate_id
+                )],
+                critical: false,
+                decision: ReviewDecision::Approved,
+                decided_text: Some(replacement),
+            });
+        }
+    }
+    Ok((corrected, corrections))
+}
+
+fn chinese_digit(character: char) -> Option<char> {
+    match character {
+        '零' | '〇' => Some('0'),
+        '一' => Some('1'),
+        '二' | '两' => Some('2'),
+        '三' => Some('3'),
+        '四' => Some('4'),
+        '五' => Some('5'),
+        '六' => Some('6'),
+        '七' => Some('7'),
+        '八' => Some('8'),
+        '九' => Some('9'),
+        _ => None,
+    }
+}
+
 impl TranscriptArtifactStore {
     const RAW: &'static str = "subtitle.raw.srt";
     const CORRECTED: &'static str = "subtitle.corrected.srt";
@@ -196,12 +464,19 @@ impl TranscriptArtifactStore {
             ),
             _ => (None, generated_srt.to_string(), Vec::new()),
         };
-        let (raw_srt, safe_corrected_srt, corrections) = prepare_asr_artifacts(
+        let (raw_srt, safe_corrected_srt, mut corrections) = prepare_asr_artifacts(
             raw_sidecar,
             deterministic_srt,
             proposals,
             fact_card.as_ref(),
         )?;
+        let (safe_corrected_srt, model_number_corrections) =
+            normalize_srt_model_numbers(&safe_corrected_srt)?;
+        drop_duplicate_unresolved_reviews_covered_by_model_formatting(
+            &mut corrections,
+            &model_number_corrections,
+        );
+        corrections.extend(model_number_corrections);
 
         Self::initialize(source, dir, &raw_srt, &safe_corrected_srt, corrections).await
     }
@@ -1455,6 +1730,109 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_letter_prefixed_chinese_model_digits_without_touching_words() {
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("R五二和A六四零零现货"),
+            "R52和A6400现货"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("微单版的R七。"),
+            "微单版的R7。"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("R七的镜头"),
+            "R7的镜头"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("这个叉D好成色。"),
+            "这个XD好成色。"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("这个叉 d 三零二代。"),
+            "这个XD30二代。"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("尼康 Z六二代"),
+            "尼康 Z6二代"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("叉子和叉路口"),
+            "叉子和叉路口"
+        );
+        assert_eq!(
+            normalize_letter_prefixed_model_numbers("A二手相机"),
+            "A二手相机"
+        );
+    }
+
+    #[test]
+    fn records_model_number_normalization_in_srt_audit() {
+        let srt = one_cue_srt("老师看一下R五二，99新");
+        let (normalized, corrections) = normalize_srt_model_numbers(&srt).unwrap();
+        assert!(normalized.contains("R52"));
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].decision, ReviewDecision::Approved);
+    }
+
+    #[test]
+    fn auto_normalized_model_cue_drops_duplicate_unresolved_review() {
+        let mut corrections = vec![TranscriptCorrection {
+            id: "pending-danmu".into(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            original: "xt 五零。".into(),
+            proposed: "[待确认]".into(),
+            category: "nearby_danmu_entity_equivalence".into(),
+            evidence: vec!["XT50和XS20有什么区别".into()],
+            critical: true,
+            decision: ReviewDecision::Pending,
+            decided_text: None,
+        }];
+        let model_corrections = vec![TranscriptCorrection {
+            id: "model-number".into(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            original: "xt 五零。".into(),
+            proposed: "XT50。".into(),
+            category: "model_number_format".into(),
+            evidence: vec!["letter_prefixed_chinese_digits".into()],
+            critical: false,
+            decision: ReviewDecision::Approved,
+            decided_text: Some("XT50。".into()),
+        }];
+
+        drop_duplicate_unresolved_reviews_covered_by_model_formatting(
+            &mut corrections,
+            &model_corrections,
+        );
+
+        assert!(corrections.is_empty());
+    }
+
+    #[test]
+    fn approved_dictionary_rules_only_change_corrected_srt_and_create_an_audit_entry() {
+        let raw = one_cue_srt("A4PRO299 is available");
+        let (corrected, corrections) = apply_approved_transcript_replacements(
+            &raw,
+            &[ApprovedTranscriptReplacement {
+                candidate_id: 12,
+                source_text: "A4PRO299".into(),
+                target_text: "A4 PRO 2 99 new".into(),
+            }],
+        )
+        .unwrap();
+
+        assert!(raw.contains("A4PRO299"));
+        assert!(corrected.contains("A4 PRO 2 99 new"));
+        assert_eq!(corrections[0].category, "approved_dictionary");
+        assert_eq!(corrections[0].decision, ReviewDecision::Approved);
+        assert_eq!(
+            corrections[0].evidence,
+            vec!["approved_dictionary_candidate:12"]
+        );
+    }
 
     #[tokio::test]
     async fn archive_and_video_initialization_write_the_same_artifact_set() {

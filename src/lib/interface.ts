@@ -73,6 +73,20 @@ export interface VideoItem {
   area: number;
   created_at: string;
   platform?: string;
+  anchor_name: string;
+  anchor_source: string;
+  anchor_confidence: string;
+  anchor_detection_status: string;
+  anchor_detection_error: string;
+  anchor_detected_at: string;
+}
+
+/** True for clipped MP4s under clips/ — not a full live session. */
+export function isClipVideo(video: Pick<VideoItem, "platform" | "file"> | null | undefined): boolean {
+  if (!video) return false;
+  if ((video.platform || "").toLowerCase() === "clip") return true;
+  const file = (video.file || "").replace(/\\/g, "/");
+  return file.startsWith("clips/") || file.includes("/clips/");
 }
 
 export interface ReviewSample {
@@ -200,6 +214,15 @@ export interface Config {
   danmu_ass_options: Danmu2AssOptions;
   powerlive_key: string;
   knowledge_vault_path: string;
+  nas_video_storage: NasVideoStorageConfig;
+}
+
+export interface NasVideoStorageConfig {
+  enabled: boolean;
+  root_path: string;
+  archive_recordings: boolean;
+  archive_imports: boolean;
+  delete_local_after_archive: boolean;
 }
 
 export interface Danmu2AssOptions {

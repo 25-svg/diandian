@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::{path::PathBuf, sync::Arc};
 
 use chrono::Utc;
-use m3u8_rs::{MediaPlaylist, Playlist};
+use m3u8_rs::{MediaPlaylist, MediaSegment, Playlist};
 use reqwest::header::HeaderMap;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
@@ -16,7 +16,9 @@ use crate::errors::RecorderError;
 use crate::ffmpeg::VideoMetadata;
 use crate::{core::HlsStream, events::RecorderEvent};
 
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(20);
+// Douyin occasionally returns an empty or unchanged playlist while the live is still on.
+// Keep the current recording alive long enough for the platform layer to refresh the URL.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(90);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYLIST_FILE_NAME: &str = "playlist.m3u8";
 const DOWNLOAD_RETRY: u32 = 3;
@@ -131,6 +133,29 @@ impl HlsRecorder {
         while self.enabled.load(Ordering::Relaxed) {
             let result = self.update_entries().await;
             if let Err(e) = result {
+                if is_transient_playlist_error(&e) {
+                    if playlist_update_timed_out(
+                        self.updated_at.load(Ordering::Relaxed),
+                        chrono::Utc::now().timestamp_millis(),
+                    ) {
+                        log::error!(
+                            "[{}]Playlist remained unavailable for {:?}: {}",
+                            self.room_id,
+                            UPDATE_TIMEOUT,
+                            e
+                        );
+                        return Err(RecorderError::UpdateTimeout);
+                    }
+
+                    log::warn!(
+                        "[{}]Temporary playlist error, retrying without ending the recording: {}",
+                        self.room_id,
+                        e
+                    );
+                    tokio::time::sleep(UPDATE_INTERVAL).await;
+                    continue;
+                }
+
                 match e {
                     RecorderError::ResolutionChanged { .. } => {
                         log::error!("Resolution changed: {}", e);
@@ -141,7 +166,6 @@ impl HlsRecorder {
                         log::error!(
                             "Source playlist is not updated for a long time, stop recording"
                         );
-                        self.playlist.lock().await.close().await?;
                         return Err(e);
                     }
                     RecorderError::M3u8ParseFailed { .. } => {
@@ -257,19 +281,30 @@ impl HlsRecorder {
             }
 
             // check if the stream is changed
-            let segment_metadata = crate::ffmpeg::extract_video_metadata(&segment_path)
-                .await
-                .map_err(RecorderError::FfmpegError)?;
+            let segment_metadata =
+                probe_segment_metadata(&segment_path, &segment, &self.room_id).await;
 
             // IMPORTANT: This handles bilibili ts stream segment, which might lack of SPS/PPS and need to be appended behind last segment
             if segment_metadata.seems_corrupted() {
                 let mut playlist = self.playlist.lock().await;
                 if playlist.is_empty().await {
-                    // ignore this segment
-                    log::error!(
-                        "Segment is corrupted and has no previous segment, ignore: {}",
+                    let duration = segment_duration_from_metadata(&segment_metadata, &segment);
+                    log::warn!(
+                        "[{}]Accepting first segment via playlist duration {:.3}s: {}",
+                        self.room_id,
+                        duration,
                         segment_path.display()
                     );
+                    let mut new_segment = segment.clone();
+                    new_segment.duration = duration as f32;
+                    playlist.add_segment(new_segment).await?;
+                    duration_delta += duration;
+                    size_delta += size;
+                    drop(playlist);
+                    self.update_sequence(segment_sequence).await;
+                    self.updated_at
+                        .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                    updated = true;
                     continue;
                 }
 
@@ -292,7 +327,8 @@ impl HlsRecorder {
                 let _ = tokio::fs::remove_file(&segment_path).await;
                 playlist.append_last_segment(segment.clone()).await?;
 
-                duration_delta += segment_metadata.duration;
+                let duration = segment_duration_from_metadata(&segment_metadata, &segment);
+                duration_delta += duration;
                 size_delta += size;
                 self.update_sequence(segment_sequence).await;
                 self.updated_at
@@ -302,24 +338,28 @@ impl HlsRecorder {
             }
 
             if let Some(last_metadata) = &last_metadata {
-                if last_metadata != &segment_metadata {
+                if last_metadata != &segment_metadata
+                    && !segment_metadata.seems_corrupted()
+                    && !last_metadata.seems_corrupted()
+                {
                     return Err(RecorderError::ResolutionChanged {
                         err: "Resolution changed".to_string(),
                     });
                 }
-            } else {
+            } else if !segment_metadata.seems_corrupted() {
                 self.pre_metadata
                     .write()
                     .await
                     .replace(segment_metadata.clone());
             }
 
+            let duration = segment_duration_from_metadata(&segment_metadata, &segment);
             let mut new_segment = segment.clone();
-            new_segment.duration = segment_metadata.duration as f32;
+            new_segment.duration = duration as f32;
 
             self.playlist.lock().await.add_segment(new_segment).await?;
 
-            duration_delta += segment_metadata.duration;
+            duration_delta += duration;
             size_delta += size;
             self.update_sequence(segment_sequence).await;
             self.updated_at
@@ -328,10 +368,10 @@ impl HlsRecorder {
         }
 
         // Source playlist may not be updated for a long time, check if it's timeout
-        let current_time = chrono::Utc::now().timestamp_millis();
-        if self.updated_at.load(Ordering::Relaxed) + (UPDATE_TIMEOUT.as_millis() as i64)
-            < current_time
-        {
+        if playlist_update_timed_out(
+            self.updated_at.load(Ordering::Relaxed),
+            chrono::Utc::now().timestamp_millis(),
+        ) {
             return Err(RecorderError::UpdateTimeout);
         }
 
@@ -363,6 +403,48 @@ impl HlsRecorder {
             .unwrap();
         let _ = file.flush().await;
     }
+}
+
+fn segment_duration_from_metadata(metadata: &VideoMetadata, segment: &MediaSegment) -> f64 {
+    if metadata.duration > 0.0 {
+        metadata.duration
+    } else {
+        f64::from(segment.duration)
+    }
+}
+
+async fn probe_segment_metadata(
+    segment_path: &Path,
+    segment: &MediaSegment,
+    room_id: &str,
+) -> VideoMetadata {
+    match crate::ffmpeg::extract_video_metadata(segment_path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            log::warn!(
+                "[{room_id}]ffprobe failed for {}: {error}",
+                segment_path.display()
+            );
+            VideoMetadata {
+                duration: f64::from(segment.duration),
+                width: 0,
+                height: 0,
+                video_codec: String::new(),
+                audio_codec: String::new(),
+            }
+        }
+    }
+}
+
+fn is_transient_playlist_error(error: &RecorderError) -> bool {
+    matches!(
+        error,
+        RecorderError::M3u8ParseFailed { .. } | RecorderError::ClientError(_)
+    )
+}
+
+fn playlist_update_timed_out(updated_at: i64, current_time: i64) -> bool {
+    updated_at + (UPDATE_TIMEOUT.as_millis() as i64) < current_time
 }
 
 /// Download url content into fpath
@@ -481,6 +563,43 @@ mod tests {
     use crate::core::{Codec, Format};
 
     use super::*;
+
+    #[test]
+    fn retries_transient_playlist_failures_before_timeout() {
+        assert!(is_transient_playlist_error(
+            &RecorderError::M3u8ParseFailed {
+                content: String::new(),
+            }
+        ));
+        assert!(!is_transient_playlist_error(&RecorderError::UpdateTimeout));
+    }
+
+    #[test]
+    fn detects_stalled_playlist_after_grace_period() {
+        let updated_at = 1_000;
+        assert!(!playlist_update_timed_out(updated_at, updated_at + 89_999));
+        assert!(playlist_update_timed_out(updated_at, updated_at + 90_001));
+    }
+
+    #[test]
+    fn segment_duration_falls_back_to_playlist_extinf() {
+        use crate::ffmpeg::VideoMetadata;
+
+        let metadata = VideoMetadata {
+            duration: 0.0,
+            width: 0,
+            height: 0,
+            video_codec: String::new(),
+            audio_codec: String::new(),
+        };
+        let segment = MediaSegment {
+            uri: "1.ts".to_string(),
+            duration: 2.5,
+            ..Default::default()
+        };
+
+        assert_eq!(segment_duration_from_metadata(&metadata, &segment), 2.5);
+    }
 
     #[tokio::test]
     async fn test_construct_stream_from_variant() {

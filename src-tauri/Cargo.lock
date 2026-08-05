@@ -798,7 +798,9 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "webview2-com",
  "whisper-cpp-rs",
+ "windows 0.61.3",
 ]
 
 [[package]]

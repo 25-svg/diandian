@@ -16,6 +16,7 @@
   import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
   import type { RecordItem } from "./lib/db";
   import type { VideoItem } from "./lib/interface";
+  import type { ClipReviewRequest } from "./lib/clipReview";
   import { getMasterBaseline, listMasterSampleBatches } from "./lib/masterScript";
   import { onMount } from "svelte";
 
@@ -23,7 +24,54 @@
   let analysisArchive: RecordItem | null = null;
   let analysisVideo: VideoItem | null = null;
   let analysisRefreshToken = 0;
+  let analysisMode: "legacy" | "company_deal" = "legacy";
+  let analysisNavigationLock = false;
+  let liveDashboardSessionId: number | null = null;
   let masterSourceVideo: VideoItem | null = null;
+  let clipReviewRequest: ClipReviewRequest | null = null;
+
+  function resolveVideoAnalysisDetail(detail: unknown): {
+    video: VideoItem | null;
+    mode: "legacy" | "company_deal";
+  } {
+    if (!detail || typeof detail !== "object") {
+      return { video: null, mode: "legacy" };
+    }
+    const record = detail as Record<string, unknown>;
+    const nested = record.video;
+    if (nested && typeof nested === "object" && nested !== null && "id" in nested) {
+      return {
+        video: nested as VideoItem,
+        mode: record.analysisMode === "company_deal" ? "company_deal" : "legacy",
+      };
+    }
+    if ("id" in record) {
+      return { video: detail as VideoItem, mode: "legacy" };
+    }
+    return { video: null, mode: "legacy" };
+  }
+
+  function openAnalysisPage(options: {
+    archive?: RecordItem | null;
+    video?: VideoItem | null;
+    mode?: "legacy" | "company_deal";
+  }): void {
+    const archive = options.archive ?? null;
+    const video = options.video ?? null;
+    if (!archive && !video) {
+      alert("无法打开分析页：未找到对应录播或视频。");
+      return;
+    }
+    analysisNavigationLock = true;
+    analysisArchive = archive;
+    analysisVideo = video;
+    analysisMode = options.mode ?? "legacy";
+    analysisRefreshToken += 1;
+    active = "录播分析";
+    queueMicrotask(() => {
+      analysisNavigationLock = false;
+    });
+  }
 
   async function ensureActiveEnterpriseMaster(): Promise<void> {
     try {
@@ -102,39 +150,65 @@
 
   onMount(() => {
     const openArchiveAnalysis = (event: Event) => {
-      analysisArchive = (event as CustomEvent<RecordItem>).detail;
-      analysisVideo = null;
-      analysisRefreshToken += 1;
-      active = "录播分析";
+      openAnalysisPage({
+        archive: (event as CustomEvent<RecordItem>).detail,
+        video: null,
+        mode: "legacy",
+      });
     };
     const openVideoAnalysis = (event: Event) => {
-      analysisVideo = (event as CustomEvent<VideoItem>).detail;
-      analysisArchive = null;
-      analysisRefreshToken += 1;
-      active = "录播分析";
+      const { video, mode } = resolveVideoAnalysisDetail(
+        (event as CustomEvent<unknown>).detail,
+      );
+      openAnalysisPage({ archive: null, video, mode });
     };
     const openArchiveTranscription = () => {
       active = "助手";
     };
+    const openCompanyDealReview = (event: Event) => {
+      const archive = (event as CustomEvent<RecordItem>).detail;
+      if (!archive) {
+        alert("无法打开分析页：录播数据为空。");
+        return;
+      }
+      if (archive.archive_kind !== "company") {
+        alert("只有公司录播才能打开成交订单时间轴分析。");
+        return;
+      }
+      openAnalysisPage({
+        archive,
+        video: null,
+        mode: "company_deal",
+      });
+    };
     const openMasterBuilder = (event: Event) => {
       masterSourceVideo = (event as CustomEvent<VideoItem>).detail;
     };
+    const openLiveDashboard = (event: Event) => {
+      liveDashboardSessionId = (event as CustomEvent<{ sessionId: number }>).detail.sessionId;
+      active = "直播数据大屏";
+    };
+    const openClipReview = (event: Event) => {
+      clipReviewRequest = (event as CustomEvent<ClipReviewRequest>).detail;
+      active = "切片";
+    };
     window.addEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
+    window.addEventListener("bsr:open-company-deal-review", openCompanyDealReview);
     window.addEventListener("bsr:open-video-analysis", openVideoAnalysis);
     window.addEventListener("bsr:transcribe-archive", openArchiveTranscription);
     window.addEventListener("bsr:build-master", openMasterBuilder);
+    window.addEventListener("bsr:open-live-dashboard", openLiveDashboard);
+    window.addEventListener("bsr:open-clip-review", openClipReview);
     return () => {
       window.removeEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
+      window.removeEventListener("bsr:open-company-deal-review", openCompanyDealReview);
       window.removeEventListener("bsr:open-video-analysis", openVideoAnalysis);
       window.removeEventListener("bsr:transcribe-archive", openArchiveTranscription);
       window.removeEventListener("bsr:build-master", openMasterBuilder);
+      window.removeEventListener("bsr:open-live-dashboard", openLiveDashboard);
+      window.removeEventListener("bsr:open-clip-review", openClipReview);
     };
   });
-
-  // HMR can preserve this route while resetting the selected analysis source.
-  $: if (active === "录播分析" && !analysisArchive && !analysisVideo) {
-    active = "录播";
-  }
 
   log.info("App loaded");
 </script>
@@ -145,6 +219,12 @@
       <BSidebar
         bind:activeUrl={active}
         on:activeChange={(e) => {
+          // Leaving analysis via sidebar should clear stale source so it does not
+          // reopen an empty analysis page on the next click.
+          if (e.detail !== "录播分析") {
+            analysisArchive = null;
+            analysisVideo = null;
+          }
           active = e.detail;
         }}
       />
@@ -164,13 +244,17 @@
           archive={analysisArchive}
           video={analysisVideo}
           refreshToken={analysisRefreshToken}
+          analysisMode={analysisMode}
           on:back={() => {
             active = analysisVideo ? "切片" : "录播";
           }}
         />
       </div>
       <div class="page" class:visible={active == "切片"}>
-        <Clip />
+        <Clip
+          reviewRequest={clipReviewRequest}
+          on:closeReview={() => { clipReviewRequest = null; }}
+        />
       </div>
       <div class="page" class:visible={active == "任务"}>
         <Task />
@@ -179,7 +263,7 @@
         <TrainingDashboard />
       </div>
       <div class="page" class:visible={active == "直播数据大屏"}>
-        <LiveDataDashboard />
+        <LiveDataDashboard initialSessionId={liveDashboardSessionId} />
       </div>
       <div class="page" class:visible={active == "助手"}>
         <AI />
@@ -222,14 +306,16 @@
     height: 100vh;
     overflow: hidden;
     background:
-      radial-gradient(circle at 82% -10%, rgba(164, 210, 255, .35), transparent 34%),
-      linear-gradient(135deg, #f3f4f7 0%, #e9ebf0 100%);
+      radial-gradient(circle at 82% -10%, rgba(164, 210, 255, 0.32), transparent 34%),
+      linear-gradient(135deg, var(--mac-bg-window) 0%, var(--mac-bg) 100%);
   }
 
   .visible {
     opacity: 1 !important;
     height: 100% !important;
     transform: translateX(0) !important;
+    min-height: 0;
+    pointer-events: auto !important;
   }
 
   .page {
@@ -237,11 +323,19 @@
     height: 0;
     transform: translateX(100%);
     overflow: hidden;
+    pointer-events: none;
     transition:
       opacity 0.5s ease-in-out,
       transform 0.3s ease-in-out;
     display: flex;
     flex-direction: column;
+    min-height: 0;
+  }
+
+  .page.visible :global(> *) {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
   }
 
   .content {
@@ -249,13 +343,21 @@
     height: calc(100vh - 20px);
     margin: 10px 10px 10px 0;
     overflow: hidden;
-    border: 1px solid rgba(255,255,255,.82);
-    border-radius: 20px;
-    background: rgba(255,255,255,.88);
-    box-shadow: 0 18px 50px rgba(47, 53, 66, .12), 0 2px 6px rgba(47, 53, 66, .05);
+    border: 1px solid rgba(255, 255, 255, 0.82);
+    border-radius: var(--mac-radius-xl);
+    background: var(--mac-bg-elevated);
+    box-shadow: var(--mac-shadow-lg);
     backdrop-filter: blur(24px) saturate(150%);
   }
 
-  :global(.dark) .wrap { background: radial-gradient(circle at 82% -10%, rgba(28,91,148,.28), transparent 34%), #18181a; }
-  :global(.dark) .content { border-color: rgba(255,255,255,.08); background: rgba(37,37,40,.9); box-shadow: 0 18px 50px rgba(0,0,0,.32); }
+  :global(.dark) .wrap {
+    background:
+      radial-gradient(circle at 82% -10%, rgba(28, 91, 148, 0.28), transparent 34%),
+      var(--mac-bg);
+  }
+  :global(.dark) .content {
+    border-color: rgba(255, 255, 255, 0.08);
+    background: var(--mac-bg-elevated);
+    box-shadow: var(--mac-shadow-lg);
+  }
 </style>

@@ -61,7 +61,7 @@ base64 = "0.21"
 mime_guess = "2.0"
 open = "5"
 async-trait = "0.1.87"
-whisper-cpp-rs = { path = "crates/whisper-cpp-rs" }
+whisper-cpp-rs = { path = "crates/whisper-cpp-rs", optional = true }
 hound = "3.5.1"
 uuid = { workspace = true }
 axum = { version = "0.7", features = ["macros", "multipart"] }
@@ -80,14 +80,17 @@ socketioxide = "0.17.2"
 scraper = "0.24.0"
 sentry = { version = "0.46.0", features = ["log", "logs"] }
 calamine = "0.26"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+webview2-com = { version = "0.38", optional = true }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
-cuda = ["whisper-cpp-rs/cuda"]
+local-whisper = ["dep:whisper-cpp-rs"]
+cuda = ["local-whisper", "whisper-cpp-rs/cuda"]
 headless = []
-default = ["gui"]
+default = ["gui", "local-whisper"]
 gui = [
     "tauri",
     "tauri-plugin-single-instance",
@@ -101,6 +104,7 @@ gui = [
     "tauri-plugin-notification",
     "tauri-plugin-deep-link",
     "fix-path-env",
+    "webview2-com",
     "tauri-build",
 ]
 

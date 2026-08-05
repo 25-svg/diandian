@@ -44,4 +44,14 @@ docs/.vitepress/dist
 .funasr-venv/
 build/
 src-tauri/resources/funasr-runtime/
+src-tauri/resources/macos/universal/
 src-tauri/target-funasr-check*/
+
+# Local build/test artifacts (recreated by the build and test commands)
+.codex-test-logs/
+release-package-target/
+src-tauri/target/
+src-tauri/target-dev-vs2022/
+scripts/__pycache__/
+asr-benchmarks/__pycache__/
+cargo-check-native.txt

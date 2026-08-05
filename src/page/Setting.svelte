@@ -3,6 +3,8 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { clickOutside } from "../lib/actions/clickOutside";
   import KnowledgeVaultSettings from "../lib/components/settings/KnowledgeVaultSettings.svelte";
+  import NasVideoStorageSettings from "../lib/components/settings/NasVideoStorageSettings.svelte";
+  import PageShell from "../lib/components/PageShell.svelte";
 
   import type { Config } from "../lib/interface";
   import {
@@ -45,6 +47,13 @@
       enabled: false,
       encode_danmu: false,
     },
+    nas_video_storage: {
+      enabled: false,
+      root_path: "",
+      archive_recordings: true,
+      archive_imports: true,
+      delete_local_after_archive: true,
+    },
     status_check_interval: 30, // 默认30秒
     whisper_language: "",
 
@@ -58,6 +67,10 @@
 
   let showModal = false;
   let show_clip_name_help = false;
+  let cacheChanging = false;
+  let outputChanging = false;
+  let storageMessage = "";
+  let storageError = "";
   let endpoint = localStorage.getItem("endpoint") || "";
   let endpointValue = endpoint;
 
@@ -73,9 +86,41 @@
     setting_model = config;
   }
 
-  async function browse_folder() {
-    const selected = await open({ directory: true });
+  async function browse_folder(defaultPath?: string) {
+    const selected = await open({
+      directory: true,
+      defaultPath: defaultPath?.trim() || undefined,
+    });
     return Array.isArray(selected) ? selected[0] : selected;
+  }
+
+  function formatStorageError(reason: unknown): string {
+    return String(reason)
+      .replace(/^Error:\s*/i, "")
+      .replace(/^Failed to invoke [^:]+:\s*/i, "");
+  }
+
+  function validateStorageFolder(path: string, label: string): string | null {
+    if (!path.trim()) {
+      return `${label}不能为空`;
+    }
+    if (path.includes("#recycle")) {
+      return `${label}不能选择 NAS 回收站 (#recycle)，请先新建正常文件夹`;
+    }
+    return null;
+  }
+
+  async function syncStorageMigrationStatus() {
+    try {
+      const status = await invoke<{ cache: boolean; output: boolean }>(
+        "get_storage_migration_status",
+      );
+      cacheChanging = status.cache;
+      outputChanging = status.output;
+    } catch {
+      cacheChanging = false;
+      outputChanging = false;
+    }
   }
 
   async function update_notify() {
@@ -92,16 +137,31 @@
   }
 
   async function handleOutputChange() {
-    const new_folder = await browse_folder();
-    if (new_folder) {
-      try {
-        await invoke("set_output_path", {
-          outputPath: new_folder,
-        });
-        setting_model.output = new_folder;
-      } catch (e) {
-        alert(e);
-      }
+    if (outputChanging || cacheChanging) {
+      return;
+    }
+    storageMessage = "";
+    storageError = "";
+    const new_folder = await browse_folder(setting_model.output);
+    if (!new_folder) {
+      return;
+    }
+    const validationError = validateStorageFolder(new_folder, "切片保存路径");
+    if (validationError) {
+      storageError = validationError;
+      return;
+    }
+    outputChanging = true;
+    try {
+      await invoke("set_output_path", {
+        outputPath: new_folder,
+      });
+      setting_model.output = new_folder;
+      storageMessage = "切片保存路径已更新";
+    } catch (e) {
+      storageError = formatStorageError(e);
+    } finally {
+      outputChanging = false;
     }
   }
 
@@ -110,17 +170,32 @@
   }
 
   async function confirmChange() {
+    if (cacheChanging || outputChanging) {
+      return;
+    }
     showModal = false;
-    const new_folder = await browse_folder();
-    if (new_folder) {
-      try {
-        await invoke("set_cache_path", {
-          cachePath: new_folder,
-        });
-        setting_model.cache = new_folder;
-      } catch (e) {
-        alert(e);
-      }
+    storageMessage = "";
+    storageError = "";
+    const new_folder = await browse_folder(setting_model.cache);
+    if (!new_folder) {
+      return;
+    }
+    const validationError = validateStorageFolder(new_folder, "缓存路径");
+    if (validationError) {
+      storageError = validationError;
+      return;
+    }
+    cacheChanging = true;
+    try {
+      await invoke("set_cache_path", {
+        cachePath: new_folder,
+      });
+      setting_model.cache = new_folder;
+      storageMessage = "缓存路径已更新";
+    } catch (e) {
+      storageError = formatStorageError(e);
+    } finally {
+      cacheChanging = false;
     }
   }
 
@@ -165,32 +240,22 @@
 
   onMount(async () => {
     await get_config();
+    await syncStorageMigrationStatus();
   });
 </script>
 
-<div class="flex-1 overflow-auto custom-scrollbar-light bg-gray-50">
-  <div class="h-screen">
-    <div class="p-6 space-y-6">
-      <!-- Header -->
-      <div
-        class="flex items-center justify-between dark:bg-[#1c1c1e] py-2 -mt-2 z-10"
-      >
-        <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">
-          Settings
-        </h1>
-      </div>
-
+<PageShell title="设置" subtitle="管理系统偏好、通知、存储与字幕相关选项。">
       <!-- Settings Sections -->
       <div class="space-y-6 pb-6">
         <div class="space-y-4">
           <h2
-            class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+            class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
           >
             <FileText class="w-5 h-5 dark:icon-white" />
             <span>基础设置</span>
           </h2>
           <div
-            class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+            class="mac-card divide-y divide-[color:var(--mac-separator)]"
           >
             <div class="p-4">
               <div class="flex items-center justify-between">
@@ -243,13 +308,13 @@
         {#if !TAURI_ENV}
           <div class="space-y-4">
             <h2
-              class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
             >
               <FileText class="w-5 h-5 dark:icon-white" />
               <span>API 服务器配置</span>
             </h2>
             <div
-              class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              class="mac-card divide-y divide-[color:var(--mac-separator)]"
             >
               <div class="p-4">
                 <div class="flex items-center justify-between">
@@ -283,14 +348,35 @@
           {#if TAURI_ENV}
             <div class="space-y-4">
               <h2
-                class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+                class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
               >
                 <HardDrive class="w-5 h-5 dark:icon-white" />
                 <span>存储设置</span>
               </h2>
               <div
-                class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+                class="mac-card divide-y divide-[color:var(--mac-separator)]"
               >
+                {#if cacheChanging || outputChanging}
+                  <div class="p-4 text-sm text-blue-700 bg-blue-50">
+                    {#if cacheChanging && outputChanging}
+                      缓存与切片目录正在迁移，请勿关闭程序。
+                    {:else if cacheChanging}
+                      缓存目录正在迁移，请勿关闭程序。
+                    {:else}
+                      切片目录正在迁移（D 盘 → NAS 可能较慢），请勿关闭程序。
+                    {/if}
+                  </div>
+                {/if}
+                {#if storageMessage}
+                  <div class="p-4 text-sm text-emerald-700 bg-emerald-50">
+                    {storageMessage}
+                  </div>
+                {/if}
+                {#if storageError}
+                  <div class="p-4 text-sm text-red-700 bg-red-50">
+                    {storageError}
+                  </div>
+                {/if}
                 <!-- Cache Location -->
                 <div class="p-4">
                   <div class="flex items-center justify-between">
@@ -305,10 +391,11 @@
                       </p>
                     </div>
                     <button
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors disabled:opacity-50"
+                      disabled={cacheChanging || outputChanging}
                       on:click={handleCacheChange}
                     >
-                      变更
+                      {cacheChanging ? "迁移中..." : "变更"}
                     </button>
                   </div>
                 </div>
@@ -325,10 +412,11 @@
                       </p>
                     </div>
                     <button
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors disabled:opacity-50"
+                      disabled={cacheChanging || outputChanging}
                       on:click={handleOutputChange}
                     >
-                      变更
+                      {outputChanging ? "迁移中..." : "变更"}
                     </button>
                   </div>
                 </div>
@@ -354,19 +442,20 @@
                 </div>
               </div>
             </div>
+            <NasVideoStorageSettings settings={setting_model.nas_video_storage} />
             <KnowledgeVaultSettings />
           {/if}
 
           <!-- Notification Settings -->
           <div class="space-y-4">
             <h2
-              class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
             >
               <Bell class="w-5 h-5 dark:icon-white" />
               <span>通知设置</span>
             </h2>
             <div
-              class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              class="mac-card divide-y divide-[color:var(--mac-separator)]"
             >
               <!-- Stream Start -->
               <div class="p-4">
@@ -389,7 +478,7 @@
                       on:change={update_notify}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -414,7 +503,7 @@
                       on:change={update_notify}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -439,7 +528,7 @@
                       on:change={update_notify}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -464,7 +553,7 @@
                       on:change={update_notify}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -475,13 +564,13 @@
           <!-- Subtitle Generation Settings -->
           <div class="space-y-4">
             <h2
-              class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
             >
               <Captions class="w-5 h-5 dark:icon-white" />
               <span>字幕生成</span>
             </h2>
             <div
-              class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              class="mac-card divide-y divide-[color:var(--mac-separator)]"
             >
               <!-- Auto Subtitle Generation -->
               <div class="p-4">
@@ -504,7 +593,7 @@
                       on:change={update_subtitle_setting}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -543,15 +632,15 @@
                         }
                       }}
                     >
-                      <option value="funasr">中文直播识别（推荐）</option>
-                      <option value="volcengine">火山录音文件识别 2.0（推荐）</option>
+                      <option value="funasr">本地 FunASR（推荐，Whisper 自动兜底）</option>
                       <option value="whisper">本地 Whisper（备用）</option>
+                      <option value="volcengine">火山录音文件识别 2.0（推荐）</option>
                       <option value="whisper_online">在线 Whisper API</option>
                       <option value="powerlive">PowerLive</option>
                     </select>
                     {:else}
                       <span class="px-3 py-2 rounded-lg bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-300 text-sm">
-                        中文直播识别（自动）
+                        本地 FunASR 优先（Whisper 自动兜底）
                       </span>
                     {/if}
                   </div>
@@ -757,13 +846,13 @@
           <!-- Clip Name Format Settings -->
           <div class="space-y-4">
             <h2
-              class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
             >
               <DiscAlbum class="w-5 h-5 dark:icon-white" />
               <span>切片文件名格式</span>
             </h2>
             <div
-              class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              class="mac-card divide-y divide-[color:var(--mac-separator)]"
             >
               <div class="p-4">
                 <div class="flex items-center justify-between">
@@ -839,13 +928,13 @@
           <!-- Danmu Style Settings -->
           <div class="space-y-4">
             <h2
-              class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
             >
               <Captions class="w-5 h-5 dark:icon-white" />
               <span>弹幕压制样式</span>
             </h2>
             <div
-              class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              class="mac-card divide-y divide-[color:var(--mac-separator)]"
             >
               <!-- Font Size -->
               <div class="p-4">
@@ -906,13 +995,13 @@
           <!-- Auto Clip Settings -->
           <div class="space-y-4">
             <h2
-              class="text-lg font-medium text-gray-900 dark:text-white flex items-center space-x-2"
+              class="text-[15px] font-semibold tracking-tight text-[color:var(--mac-label)] flex items-center space-x-2"
             >
               <SquareBottomDashedScissors class="w-5 h-5 dark:icon-white" />
               <span>自动切片</span>
             </h2>
             <div
-              class="bg-white dark:bg-[#3c3c3e] rounded-xl border border-gray-200 dark:border-gray-700 divide-y divide-gray-200 dark:divide-gray-700"
+              class="mac-card divide-y divide-[color:var(--mac-separator)]"
             >
               <!-- Auto Clip Generation -->
               <div class="p-4">
@@ -940,7 +1029,7 @@
                       }}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -972,7 +1061,7 @@
                       }}
                     />
                     <span
-                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-blue-500 peer-checked:before:translate-x-5"
+                      class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
                     ></span>
                   </label>
                 </div>
@@ -981,9 +1070,7 @@
           </div>
         {/if}
       </div>
-    </div>
-  </div>
-</div>
+</PageShell>
 
 <!-- Modal -->
 {#if showModal}
@@ -1006,20 +1093,26 @@
           <p class="text-gray-600 dark:text-gray-400 mt-2">
             确认要进行变更吗？
           </p>
+          <p class="text-amber-700 dark:text-amber-300 mt-2 text-sm">
+            请选择 NAS 上的正常文件夹（例如 Z:\bsr-cache），不要选择 #recycle 回收站目录。
+          </p>
         </div>
       </div>
       <div class="flex justify-end space-x-4">
         <button
-          class="px-4 py-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+          type="button"
+          class="mac-btn"
           on:click={() => (showModal = false)}
         >
           取消
         </button>
         <button
-          class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+          type="button"
+          class="mac-btn mac-btn-primary"
+          disabled={cacheChanging || outputChanging}
           on:click={confirmChange}
         >
-          确认
+          {cacheChanging ? "迁移中..." : "确认"}
         </button>
       </div>
     </div>

@@ -19,6 +19,7 @@ const REQUIRED_DIRS: &[&str] = &[
     "08-产品参数库",
     "10-企业母稿",
     "11-场景应对",
+    "12-公司成交基准",
 ];
 const REVIEW_DIR_ALIASES: &[&str] = &["99-待审核", "09-审核逐字稿"];
 const EXCLUDED_DIRS: &[&str] = &[".obsidian", "90-模板", "99-待处理冲突"];

@@ -352,7 +352,7 @@ fn mcp_tool_manifest() -> Vec<McpToolManifest> {
             false,
         ),
         mcp_tool(
-            "delete_background_task",
+            "delete_task",
             "Delete a background task",
             serde_json::json!({"type":"object","required":["id","idempotency_key","confirmation_token"],"properties":{"id":{"type":"string","minLength":1,"maxLength":128},"idempotency_key":{"type":"string","minLength":8,"maxLength":128},"confirmation_token":{"type":"string","minLength":8,"maxLength":160}},"additionalProperties":false}),
             "admin",
@@ -453,7 +453,7 @@ mod mcp_contract_tests {
             "remove_account",
             "delete_archive",
             "delete_archives",
-            "delete_background_task",
+            "delete_task",
             "delete_video",
             "post_video_to_bilibili",
         ] {
@@ -1469,6 +1469,9 @@ async fn handler_import_external_video(
         param.file_path.clone(),
         param.title,
         param.room_id,
+        None,
+        None,
+        None,
     )
     .await?;
     Ok(Json(ApiResponse::success(param.event_id)))
@@ -1674,7 +1677,9 @@ async fn handler_upload_files(
                 .to_lowercase();
 
             // 使用与后端相同的格式验证逻辑
-            let supported_extensions = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm", "ts"];
+            let supported_extensions = [
+                "mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm", "ts",
+            ];
             if !supported_extensions.iter().any(|&ext| ext == extension) {
                 return Err(ApiError(format!(
                     "不支持的文件格式: {}。支持的格式: {}",
@@ -1753,8 +1758,9 @@ async fn handler_upload_and_import_files(
                             .unwrap_or("")
                             .to_lowercase();
 
-                        let supported_extensions =
-                            ["mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm", "ts"];
+                        let supported_extensions = [
+                            "mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "webm", "ts",
+                        ];
                         if !supported_extensions.iter().any(|&ext| ext == extension) {
                             return Err(ApiError(format!(
                                 "不支持的文件格式: {}。支持的格式: {}",

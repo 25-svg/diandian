@@ -34,7 +34,7 @@ const get_accounts = tool(
 // @ts-ignore
 const remove_account = tool(
   async ({ platform, uid }: { platform: string; uid: number }) => {
-    const result = await invoke("remove_account", {
+    const result = await invokeSensitive("remove_account", {
       platform,
       uid,
     });
@@ -94,7 +94,7 @@ const add_recorder = tool(
 // @ts-ignore
 const remove_recorder = tool(
   async ({ platform, room_id }: { platform: string; room_id: string }) => {
-    const result = await invoke("remove_recorder", {
+    const result = await invokeSensitive("remove_recorder", {
       platform,
       roomId: room_id,
     });
@@ -294,7 +294,7 @@ const get_background_tasks = tool(
 // @ts-ignore
 const delete_background_task = tool(
   async ({ id }: { id: string }) => {
-    const result = await invoke("delete_task", { id });
+    const result = await invokeSensitive("delete_task", { id });
     return result;
   },
   {

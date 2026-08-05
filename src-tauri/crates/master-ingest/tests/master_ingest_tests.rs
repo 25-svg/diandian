@@ -7,7 +7,10 @@ use master_ingest::{
     Transcriber,
 };
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Barrier;
 
 fn card(id: &str, version: &str, name: &str, aliases: &[&str]) -> ParameterCard {
     ParameterCard {
@@ -354,6 +357,196 @@ impl ArtifactSink for MemoryArtifacts {
     }
 }
 
+#[derive(Clone)]
+struct ConcurrentTranscriber {
+    barrier: Arc<Barrier>,
+    active: Arc<AtomicUsize>,
+    peak_active: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Transcriber for ConcurrentTranscriber {
+    async fn transcribe(
+        &self,
+        _chunk_index: usize,
+        _start_ms: u64,
+        _end_ms: u64,
+        _cards: &[ParameterCard],
+    ) -> Result<Vec<SrtCue>, String> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_active.fetch_max(active, Ordering::SeqCst);
+        self.barrier.wait().await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(vec![SrtCue::new(0, 1_000, "parallel chunk")])
+    }
+}
+
+#[tokio::test]
+async fn transcribes_three_pending_chunks_in_parallel() {
+    let transcriber = ConcurrentTranscriber {
+        barrier: Arc::new(Barrier::new(3)),
+        active: Arc::new(AtomicUsize::new(0)),
+        peak_active: Arc::new(AtomicUsize::new(0)),
+    };
+    let ingestor = MasterIngestor::new(
+        MemoryStore::default(),
+        transcriber.clone(),
+        MemoryArtifacts::default(),
+    );
+    let request = IngestRequest {
+        source_id: 11,
+        source_key: "video:11".into(),
+        source_hash: "source-hash".into(),
+        duration_ms: 1_800_000,
+        chunk_duration_ms: 600_000,
+        selected_cards: vec![],
+    };
+
+    let status = tokio::time::timeout(Duration::from_millis(250), ingestor.run(request))
+        .await
+        .expect("three pending chunks should begin together")
+        .unwrap();
+
+    assert_eq!(
+        status,
+        IngestStatus::Complete {
+            completed: 3,
+            total: 3
+        }
+    );
+    assert_eq!(transcriber.peak_active.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn marks_only_in_flight_chunks_as_running() {
+    let store = MemoryStore::default();
+    let ingestor = MasterIngestor::new(
+        store.clone(),
+        ConcurrentTranscriber {
+            barrier: Arc::new(Barrier::new(6)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak_active: Arc::new(AtomicUsize::new(0)),
+        },
+        MemoryArtifacts::default(),
+    );
+    let request = IngestRequest {
+        source_id: 12,
+        source_key: "video:12".into(),
+        source_hash: "source-hash".into(),
+        duration_ms: 3_000_000,
+        chunk_duration_ms: 600_000,
+        selected_cards: vec![],
+    };
+    let task = tokio::spawn(async move { ingestor.run(request).await });
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if store
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|checkpoint| checkpoint.status == ChunkStatus::Running)
+                .count()
+                >= 3
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("in-flight chunks should be checkpointed promptly");
+
+    assert_eq!(
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|checkpoint| checkpoint.status == ChunkStatus::Running)
+            .count(),
+        3
+    );
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn restart_resets_stale_running_chunks_before_resuming_three_at_once() {
+    let store = MemoryStore::default();
+    for chunk_index in 0..5 {
+        store.rows.lock().unwrap().insert(
+            chunk_index,
+            Checkpoint {
+                source_id: 13,
+                chunk_index,
+                start_ms: chunk_index as u64 * 600_000,
+                end_ms: (chunk_index as u64 + 1) * 600_000,
+                status: ChunkStatus::Running,
+                input_hash: chunk_input_hash(
+                    "video:13",
+                    "source-hash",
+                    chunk_index as u64 * 600_000,
+                    (chunk_index as u64 + 1) * 600_000,
+                    &[],
+                ),
+                raw_srt: String::new(),
+                reviewed_srt: String::new(),
+                error: None,
+            },
+        );
+    }
+    let ingestor = MasterIngestor::new(
+        store.clone(),
+        ConcurrentTranscriber {
+            barrier: Arc::new(Barrier::new(6)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak_active: Arc::new(AtomicUsize::new(0)),
+        },
+        MemoryArtifacts::default(),
+    );
+    let task = tokio::spawn(async move {
+        ingestor
+            .run(IngestRequest {
+                source_id: 13,
+                source_key: "video:13".into(),
+                source_hash: "source-hash".into(),
+                duration_ms: 3_000_000,
+                chunk_duration_ms: 600_000,
+                selected_cards: vec![],
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let running = store
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|checkpoint| checkpoint.status == ChunkStatus::Running)
+                .count();
+            let normalized = store
+                .transitions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, status)| *status == ChunkStatus::Pending)
+                .count();
+            if running == 3 && normalized == 5 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stale running checkpoints should be reset before resuming");
+    task.abort();
+    let _ = task.await;
+}
+
 #[tokio::test]
 async fn failed_second_chunk_resumes_only_remaining_chunks_and_preserves_first() {
     let store = MemoryStore::default();
@@ -400,14 +593,21 @@ async fn failed_second_chunk_resumes_only_remaining_chunks_and_preserves_first()
             total: 3
         }
     );
-    assert_eq!(*transcriber.calls.lock().unwrap(), vec![0, 1, 1, 2]);
+    let calls = transcriber.calls.lock().unwrap().clone();
+    assert_eq!(calls.iter().filter(|&&chunk| chunk == 0).count(), 1);
+    assert_eq!(calls.iter().filter(|&&chunk| chunk == 1).count(), 2);
+    assert_eq!(calls.iter().filter(|&&chunk| chunk == 2).count(), 1);
     assert_eq!(store.rows.lock().unwrap().get(&0).unwrap(), &first_before);
-    assert!(store
-        .transitions
-        .lock()
-        .unwrap()
-        .windows(2)
-        .any(|pair| pair[0] == (1, ChunkStatus::Running) && pair[1] == (1, ChunkStatus::Failed)));
+    let transitions = store.transitions.lock().unwrap();
+    let running_index = transitions
+        .iter()
+        .position(|transition| *transition == (1, ChunkStatus::Running))
+        .unwrap();
+    let failed_index = transitions
+        .iter()
+        .position(|transition| *transition == (1, ChunkStatus::Failed))
+        .unwrap();
+    assert!(running_index < failed_index);
 
     let calls_before_retry = transcriber.calls.lock().unwrap().len();
     let complete_again = ingestor.run(request).await.unwrap();

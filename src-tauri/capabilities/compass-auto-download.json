@@ -1,0 +1,24 @@
+{
+  "identifier": "compass-auto-download-remote",
+  "description": "Allow the compass automation webview to emit progress events from remote login and shop pages",
+  "windows": ["compass-auto-download"],
+  "local": false,
+  "remote": {
+    "urls": [
+      "https://compass.jinritemai.com",
+      "https://compass.jinritemai.com/*",
+      "https://*.jinritemai.com",
+      "https://*.jinritemai.com/*",
+      "https://ecom.douyin.com",
+      "https://ecom.douyin.com/*",
+      "https://www.douyin.com",
+      "https://www.douyin.com/*",
+      "https://sso.douyin.com",
+      "https://sso.douyin.com/*"
+    ]
+  },
+  "permissions": [
+    "core:event:default",
+    "core:event:allow-emit"
+  ]
+}
