@@ -12,12 +12,55 @@ WORK_DIR="${TMPDIR:-/tmp}/bili-shadowreplay-portable-macos"
 FFMPEG_VERSION="7.1.1"
 FFMPEG_ARCHIVE="$WORK_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz"
 FFMPEG_SOURCE="$WORK_DIR/ffmpeg-$FFMPEG_VERSION"
+NPM_BIN=""
+NPX_BIN=""
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
     exit 1
   }
+}
+
+ensure_npm() {
+  if command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+    NPM_BIN="$(command -v npm)"
+    NPX_BIN="$(command -v npx)"
+    return
+  fi
+
+  local node_arch
+  case "$(uname -m)" in
+    arm64) node_arch="arm64" ;;
+    x86_64) node_arch="x64" ;;
+    *)
+      echo "Unsupported macOS CPU architecture: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "npm not found. Downloading a temporary Node.js LTS runtime for this build..."
+  local node_version
+  node_version="$(curl --fail --location --silent --show-error https://nodejs.org/dist/index.json \
+    | sed -n 's/.*"version":"v\\([^"]*\\)".*"lts":"[^"]*".*/\\1/p' \
+    | head -n 1)"
+  [[ -n "$node_version" ]] || {
+    echo "Could not determine the current Node.js LTS version." >&2
+    exit 1
+  }
+
+  local node_dir="$WORK_DIR/node-v$node_version-darwin-$node_arch"
+  local node_archive="$WORK_DIR/node-v$node_version-darwin-$node_arch.tar.gz"
+  if [[ ! -x "$node_dir/bin/npm" ]]; then
+    curl --fail --location --output "$node_archive" \
+      "https://nodejs.org/dist/v$node_version/node-v$node_version-darwin-$node_arch.tar.gz"
+    tar -C "$WORK_DIR" -xzf "$node_archive"
+  fi
+
+  export PATH="$node_dir/bin:$PATH"
+  NPM_BIN="$node_dir/bin/npm"
+  NPX_BIN="$node_dir/bin/npx"
+  "$NPM_BIN" --version >/dev/null
 }
 
 [[ "$(uname -s)" == "Darwin" ]] || {
@@ -30,14 +73,13 @@ require_command xcrun
 require_command curl
 require_command tar
 require_command lipo
-require_command npm
 require_command rustup
 require_command make
 
 xcodebuild -version >/dev/null
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
 mkdir -p "$WORK_DIR"
+ensure_npm
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 if [[ ! -d "$FFMPEG_SOURCE" ]]; then
   curl --fail --location --output "$FFMPEG_ARCHIVE" \
     "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
@@ -84,8 +126,8 @@ lipo -create "$WORK_DIR/install-arm64/bin/ffprobe" "$WORK_DIR/install-x86_64/bin
 chmod 755 "$PACKAGE_DIR/bin/ffmpeg" "$PACKAGE_DIR/bin/ffprobe"
 
 pushd "$ROOT" >/dev/null
-npm ci
-npx tauri build --bundles none --config src-tauri/tauri.macos.conf.json \
+"$NPM_BIN" ci
+"$NPX_BIN" tauri build --bundles none --config src-tauri/tauri.macos.conf.json \
   --target universal-apple-darwin
 popd >/dev/null
 
