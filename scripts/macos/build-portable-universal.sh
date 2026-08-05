@@ -10,10 +10,13 @@ OUTPUT_DIR="${OUTPUT_DIR:-$SRC_TAURI/target/portable-macos}"
 PACKAGE_DIR="$OUTPUT_DIR/典典直播切片-mac"
 WORK_DIR="${TMPDIR:-/tmp}/bili-shadowreplay-portable-macos"
 FFMPEG_VERSION="7.1.1"
+CMAKE_VERSION="4.4.0"
 FFMPEG_ARCHIVE="$WORK_DIR/ffmpeg-$FFMPEG_VERSION.tar.xz"
 FFMPEG_SOURCE="$WORK_DIR/ffmpeg-$FFMPEG_VERSION"
 NPM_BIN=""
 NPX_BIN=""
+RUSTUP_BIN=""
+CMAKE_BIN=""
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -63,23 +66,66 @@ ensure_npm() {
   "$NPM_BIN" --version >/dev/null
 }
 
+ensure_rustup() {
+  if command -v rustup >/dev/null 2>&1; then
+    RUSTUP_BIN="$(command -v rustup)"
+    return
+  fi
+
+  echo "rustup not found. Downloading a temporary Rust toolchain for this build..."
+  export RUSTUP_HOME="$WORK_DIR/rustup-home"
+  export CARGO_HOME="$WORK_DIR/cargo-home"
+  mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+  curl --fail --location --proto '=https' --tlsv1.2 https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --no-modify-path
+  export PATH="$CARGO_HOME/bin:$PATH"
+  RUSTUP_BIN="$CARGO_HOME/bin/rustup"
+  "$RUSTUP_BIN" --version >/dev/null
+}
+
+ensure_cmake() {
+  if command -v cmake >/dev/null 2>&1; then
+    CMAKE_BIN="$(command -v cmake)"
+    return
+  fi
+
+  echo "cmake not found. Downloading a temporary CMake runtime for this build..."
+  local cmake_dir="$WORK_DIR/cmake-$CMAKE_VERSION-macos-universal"
+  local cmake_archive="$WORK_DIR/cmake-$CMAKE_VERSION-macos-universal.tar.gz"
+  if [[ ! -x "$cmake_dir/CMake.app/Contents/bin/cmake" ]]; then
+    curl --fail --location --output "$cmake_archive" \
+      "https://cmake.org/files/v${CMAKE_VERSION%.*}/cmake-$CMAKE_VERSION-macos-universal.tar.gz"
+    tar -C "$WORK_DIR" -xzf "$cmake_archive"
+  fi
+  CMAKE_BIN="$cmake_dir/CMake.app/Contents/bin/cmake"
+  [[ -x "$CMAKE_BIN" ]] || {
+    echo "CMake was downloaded but its executable was not found: $CMAKE_BIN" >&2
+    exit 1
+  }
+  export PATH="$(dirname "$CMAKE_BIN"):$PATH"
+  "$CMAKE_BIN" --version >/dev/null
+}
+
 [[ "$(uname -s)" == "Darwin" ]] || {
   echo "Run this script on macOS." >&2
   exit 1
 }
 
-require_command xcodebuild
-require_command xcrun
+if ! command -v xcodebuild >/dev/null 2>&1 || ! command -v xcrun >/dev/null 2>&1; then
+  echo "Xcode Command Line Tools are required once. Run: xcode-select --install" >&2
+  exit 1
+fi
 require_command curl
 require_command tar
 require_command lipo
-require_command rustup
 require_command make
 
 xcodebuild -version >/dev/null
 mkdir -p "$WORK_DIR"
 ensure_npm
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+ensure_rustup
+ensure_cmake
+"$RUSTUP_BIN" target add aarch64-apple-darwin x86_64-apple-darwin
 if [[ ! -d "$FFMPEG_SOURCE" ]]; then
   curl --fail --location --output "$FFMPEG_ARCHIVE" \
     "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
