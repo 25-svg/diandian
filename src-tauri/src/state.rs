@@ -55,7 +55,10 @@ impl State {
     pub async fn stop_all_video_previews(&self) {
         let sessions = {
             let mut active = self.video_preview_sessions.lock().await;
-            active.drain().map(|(_, session)| session).collect::<Vec<_>>()
+            active
+                .drain()
+                .map(|(_, session)| session)
+                .collect::<Vec<_>>()
         };
         for mut session in sessions {
             let _ = session.child.kill().await;

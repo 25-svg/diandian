@@ -432,7 +432,10 @@ mod tests {
         let dirty_sanitized =
             "{analysisPurpose___enterprise_review_,_competitorName____,_masterScriptKey___MS-BATCH-4_}";
         assert!(looks_like_analysis_metadata_anchor(dirty_sanitized));
-        assert_eq!(choose_nas_anchor(dirty_sanitized, "bsr:import"), "bsr:import");
+        assert_eq!(
+            choose_nas_anchor(dirty_sanitized, "bsr:import"),
+            "bsr:import"
+        );
 
         let root = std::path::Path::new(r"Z:\");
         let path = plan_nas_destination(
@@ -449,7 +452,9 @@ mod tests {
         );
         assert_eq!(
             path,
-            root.join("bsr_import").join("2026-07-30").join("imported-live.ts")
+            root.join("bsr_import")
+                .join("2026-07-30")
+                .join("imported-live.ts")
         );
     }
 

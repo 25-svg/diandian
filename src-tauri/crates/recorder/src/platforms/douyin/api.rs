@@ -176,9 +176,7 @@ pub async fn get_room_info(
     // log::debug!("params: {params}");
     // log::debug!("user_agent: {user_agent}");
     // log::debug!("a_bogus: {a_bogus}");
-    let url = format!(
-            "https://live.douyin.com/webcast/room/web/enter/?{params}&a_bogus={a_bogus}"
-        );
+    let url = format!("https://live.douyin.com/webcast/room/web/enter/?{params}&a_bogus={a_bogus}");
 
     let resp = client.get(&url).headers(headers).send().await?;
 
@@ -187,7 +185,8 @@ pub async fn get_room_info(
 
     if text.is_empty() {
         log::debug!("Empty room info response, trying H5 API");
-        return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await;
+        return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id)
+            .await;
     }
 
     if status.is_success() {
@@ -196,12 +195,19 @@ pub async fn get_room_info(
                 Ok(info) => return Ok(info),
                 Err(e) => {
                     log::warn!("Invalid douyin room info response: {e}; trying H5 API");
-                    return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await;
+                    return get_room_info_h5_with_identity_recovery(
+                        client,
+                        account,
+                        room_id,
+                        sec_user_id,
+                    )
+                    .await;
                 }
             }
         }
         log::error!("Failed to parse room info response: {text}");
-        return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id).await;
+        return get_room_info_h5_with_identity_recovery(client, account, room_id, sec_user_id)
+            .await;
     }
 
     log::error!("Failed to get room info: {status}");
@@ -538,10 +544,8 @@ mod tests {
 
     #[test]
     fn h5_identity_recovery_refreshes_once() {
-        let attempts = h5_recovery_attempts(&[
-            H5Failure::InvalidRequest,
-            H5Failure::InvalidRequest,
-        ]);
+        let attempts =
+            h5_recovery_attempts(&[H5Failure::InvalidRequest, H5Failure::InvalidRequest]);
 
         assert_eq!(attempts.request_count, 2);
         assert_eq!(attempts.sec_uid_refresh_count, 1);
