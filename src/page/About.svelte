@@ -1,6 +1,7 @@
 <script type="ts">
   import { open } from "../lib/invoker";
   import { BookOpen, MessageCircle, Video, Heart } from "lucide-svelte";
+  import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
   import { hasNewVersion, latestVersion } from "../lib/stores/version";
   let version = `v${__APP_VERSION__}`;
@@ -47,13 +48,6 @@
 
   function toggleDonateModal() {
     showDonateModal = !showDonateModal;
-  }
-
-  function handleModalClickOutside(event) {
-    const modal = document.querySelector(".mac-modal");
-    if (modal && !modal.contains(event.target)) {
-      showDonateModal = false;
-    }
   }
 </script>
 
@@ -167,36 +161,22 @@
 </PageShell>
 
 {#if showDonateModal}
-  <div
-    class="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center"
-    style="position: absolute; min-height: 100%; width: 100%; top: 0; left: 0;"
+  <MacModal
+    title="打赏支持"
+    panelClass="w-full max-w-md"
+    closeOnBackdrop
+    showClose
+    on:close={toggleDonateModal}
   >
-    <div
-      class="bg-white dark:bg-[#3c3c3e] rounded-lg p-6 max-w-md w-full mx-4 mac-modal"
-    >
-      <div class="flex justify-between items-center mb-4">
-        <h3 class="text-lg font-medium text-gray-900 dark:text-white">
-          打赏支持
-        </h3>
-        <button
-          class="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-          on:click={toggleDonateModal}
-        >
-          ✕
-        </button>
-      </div>
-      <div class="flex justify-center">
-        <img
-          src="/imgs/donate.png"
-          class="max-w-full h-auto rounded-lg"
-          alt="打赏二维码"
-        />
-      </div>
-      <p class="mt-4 text-center text-sm text-gray-600 dark:text-gray-300">
-        感谢您的支持！
-      </p>
+    <div class="flex justify-center">
+      <img
+        src="/imgs/donate.png"
+        class="max-w-full h-auto rounded-lg"
+        alt="打赏二维码"
+      />
     </div>
-  </div>
+    <p class="mt-4 text-center text-sm text-[color:var(--mac-secondary)]">
+      感谢您的支持！
+    </p>
+  </MacModal>
 {/if}
-
-<svelte:window on:mousedown={handleModalClickOutside} />

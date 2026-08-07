@@ -4,6 +4,7 @@
   import { clickOutside } from "../lib/actions/clickOutside";
   import KnowledgeVaultSettings from "../lib/components/settings/KnowledgeVaultSettings.svelte";
   import NasVideoStorageSettings from "../lib/components/settings/NasVideoStorageSettings.svelte";
+  import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
 
   import type { Config } from "../lib/interface";
@@ -270,7 +271,7 @@
                 <div class="flex items-center space-x-2">
                   <input
                     type="number"
-                    class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-24"
+                    class="mac-field w-24"
                     bind:value={setting_model.status_check_interval}
                     on:blur={update_status_check_interval}
                   />
@@ -286,7 +287,7 @@
                   <p class="text-sm text-gray-500 dark:text-gray-400">
                     设置 Webhook URL，用于接收事件通知，见<a
                       href="https://bsr.xinrea.cn/usage/features/webhook.html"
-                      class="text-blue-500 hover:text-blue-700"
+                      class="text-[color:var(--mac-blue)] hover:opacity-80"
                       target="_blank">Webhook 文档</a
                     >
                   </p>
@@ -294,7 +295,7 @@
                 <div class="flex items-center space-x-2">
                   <input
                     type="text"
-                    class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                    class="mac-field w-96"
                     bind:value={setting_model.webhook_url}
                     on:change={update_webhook_url}
                     placeholder="https://example.com/webhook"
@@ -331,7 +332,7 @@
                   <div class="flex items-center space-x-2">
                     <input
                       type="text"
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                      class="mac-field w-96"
                       bind:value={endpointValue}
                       on:blur={handleEndpointChange}
                       placeholder="http://localhost:3000"
@@ -391,7 +392,7 @@
                       </p>
                     </div>
                     <button
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors disabled:opacity-50"
+                      class="mac-btn"
                       disabled={cacheChanging || outputChanging}
                       on:click={handleCacheChange}
                     >
@@ -412,7 +413,7 @@
                       </p>
                     </div>
                     <button
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors disabled:opacity-50"
+                      class="mac-btn"
                       disabled={cacheChanging || outputChanging}
                       on:click={handleOutputChange}
                     >
@@ -433,7 +434,7 @@
                       </p>
                     </div>
                     <button
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      class="mac-btn"
                       on:click={handleLogFolder}
                     >
                       打开
@@ -610,7 +611,7 @@
                     <p class="text-sm text-gray-500 dark:text-gray-400">
                       选择字幕生成的方式：本地模型，OpenAI 服务或 <a
                         href="https://www.powerlive.io/"
-                        class="text-blue-500 hover:underline"
+                        class="text-[color:var(--mac-blue)] hover:underline"
                         target="_blank"
                         rel="noopener noreferrer">PowerLive</a
                       > 服务（按量付费）
@@ -619,7 +620,7 @@
                   <div class="flex items-center space-x-2">
                     {#if setting_model.admin_mode}
                     <select
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white"
+                      class="mac-field"
                       bind:value={setting_model.subtitle_generator_type}
                       on:change={async () => {
                         try {
@@ -657,15 +658,15 @@
                     </p>
                   </div>
                   <div class="grid grid-cols-1 gap-3 max-w-2xl">
-                    <input type="password" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_api_key} placeholder="API Key（新控制台，可选）" />
-                    <input type="text" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_app_id} placeholder="App ID（旧控制台）" />
-                    <input type="password" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_access_token} placeholder="Access Token（旧控制台）" />
-                    <div class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border text-sm text-gray-700 dark:text-gray-200">
+                    <input type="password" class="mac-field" bind:value={setting_model.volcengine_api_key} placeholder="API Key（新控制台，可选）" />
+                    <input type="text" class="mac-field" bind:value={setting_model.volcengine_app_id} placeholder="App ID（旧控制台）" />
+                    <input type="password" class="mac-field" bind:value={setting_model.volcengine_access_token} placeholder="Access Token（旧控制台）" />
+                    <div class="mac-field flex items-center text-sm text-[color:var(--mac-secondary)]">
                       模型版本：录音文件识别 2.0（volc.seedasr.auc）
                     </div>
-                    <input type="text" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_boosting_table_id} placeholder="热词表 ID（boosting_table_id）" />
-                    <input type="text" class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border" bind:value={setting_model.volcengine_correct_table_id} placeholder="替换词表 ID（correct_table_id）" />
-                    <button class="w-fit px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                    <input type="text" class="mac-field" bind:value={setting_model.volcengine_boosting_table_id} placeholder="热词表 ID（boosting_table_id）" />
+                    <input type="text" class="mac-field" bind:value={setting_model.volcengine_correct_table_id} placeholder="替换词表 ID（correct_table_id）" />
+                    <button class="mac-btn mac-btn-primary w-fit"
                       on:click={async () => {
                         await invoke("update_volcengine_asr_config", {
                           apiKey: setting_model.volcengine_api_key,
@@ -698,7 +699,7 @@
                     <div class="flex items-center space-x-2">
                       <input
                         type="password"
-                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                        class="mac-field w-96"
                         bind:value={setting_model.powerlive_key}
                         on:change={async () => {
                           await invoke("update_powerlive_key", {
@@ -718,10 +719,10 @@
                         <h3 class="text-sm font-medium text-gray-900 dark:text-white">Whisper 模型路径</h3>
                         <p class="text-sm text-gray-500 dark:text-gray-400">
                           {setting_model.whisper_model || "未设置"}
-                          <span class="block mt-1 text-xs">可前往 <a href="https://huggingface.co/ggerganov/whisper.cpp/tree/main" class="text-blue-500 hover:underline" target="_blank" rel="noopener noreferrer">ggerganov/whisper.cpp</a> 下载模型文件</span>
+                          <span class="block mt-1 text-xs">可前往 <a href="https://huggingface.co/ggerganov/whisper.cpp/tree/main" class="text-[color:var(--mac-blue)] hover:underline" target="_blank" rel="noopener noreferrer">ggerganov/whisper.cpp</a> 下载模型文件</span>
                         </p>
                       </div>
-                      <button class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors" on:click={handleWhisperModelPathChange}>变更</button>
+                      <button class="mac-btn" on:click={handleWhisperModelPathChange}>变更</button>
                     </div>
                   </div>
                 {/if}
@@ -742,7 +743,7 @@
                       <div class="flex items-center space-x-2">
                         <input
                           type="text"
-                          class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                          class="mac-field w-96"
                           bind:value={setting_model.openai_api_endpoint}
                           on:change={async () => {
                             await invoke("update_openai_api_endpoint", {
@@ -770,7 +771,7 @@
                       <div class="flex items-center space-x-2">
                         <input
                           type="password"
-                          class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                          class="mac-field w-96"
                           bind:value={setting_model.openai_api_key}
                           on:change={async () => {
                             await invoke("update_openai_api_key", {
@@ -799,7 +800,7 @@
                       <div class="flex items-center space-x-2">
                         <input
                           type="text"
-                          class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                          class="mac-field w-96"
                           bind:value={setting_model.whisper_prompt}
                           on:change={async () => {
                             await invoke("update_whisper_prompt", {
@@ -827,7 +828,7 @@
                     <div class="flex items-center space-x-2">
                       <input
                         type="text"
-                        class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                        class="mac-field w-96"
                         bind:value={setting_model.whisper_language}
                         on:change={async () => {
                           await invoke("update_whisper_language", {
@@ -911,7 +912,7 @@
                   <div class="flex items-center space-x-2">
                     <input
                       type="text"
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-96"
+                      class="mac-field w-96"
                       bind:value={setting_model.clip_name_format}
                       on:change={async () => {
                         await invoke("update_clip_name_format", {
@@ -952,7 +953,7 @@
                   <div class="flex items-center space-x-2">
                     <input
                       type="number"
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-24"
+                      class="mac-field w-24"
                       bind:value={setting_model.danmu_ass_options.font_size}
                       on:blur={update_danmu_ass_options}
                       min="12"
@@ -979,7 +980,7 @@
                   <div class="flex items-center space-x-2">
                     <input
                       type="number"
-                      class="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-900 dark:text-white w-24"
+                      class="mac-field w-24"
                       bind:value={setting_model.danmu_ass_options.opacity}
                       on:blur={update_danmu_ass_options}
                       min="0.0"
@@ -1074,47 +1075,34 @@
 
 <!-- Modal -->
 {#if showModal}
-  <div
-    class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
-  >
-    <div class="bg-white dark:bg-[#2c2c2e] rounded-xl p-6 max-w-md w-full mx-4">
-      <div class="flex items-start space-x-3 mb-4">
-        <AlertTriangle class="w-6 h-6 text-yellow-500 flex-shrink-0" />
-        <div>
-          <h3 class="text-lg font-medium text-gray-900 dark:text-white">
-            确认变更
-          </h3>
-          <p class="text-gray-600 dark:text-gray-400 mt-2">
-            根据文件大小，可能需要耗时较长时间，迁移期间直播间会暂时移除，迁移完成后直播间会自动恢复。
-          </p>
-          <p class="text-gray-600 dark:text-gray-400 mt-2 font-bold">
-            迁移期间请不要关闭程序，且不要在迁移期间再次更改目录！
-          </p>
-          <p class="text-gray-600 dark:text-gray-400 mt-2">
-            确认要进行变更吗？
-          </p>
-          <p class="text-amber-700 dark:text-amber-300 mt-2 text-sm">
-            请选择 NAS 上的正常文件夹（例如 Z:\bsr-cache），不要选择 #recycle 回收站目录。
-          </p>
-        </div>
-      </div>
-      <div class="flex justify-end space-x-4">
-        <button
-          type="button"
-          class="mac-btn"
-          on:click={() => (showModal = false)}
-        >
-          取消
-        </button>
-        <button
-          type="button"
-          class="mac-btn mac-btn-primary"
-          disabled={cacheChanging || outputChanging}
-          on:click={confirmChange}
-        >
-          {cacheChanging ? "迁移中..." : "确认"}
-        </button>
+  <MacModal title="确认变更" panelClass="w-full max-w-md" closeOnBackdrop on:close={() => (showModal = false)}>
+    <div class="flex items-start gap-3">
+      <AlertTriangle class="w-6 h-6 text-[color:var(--mac-orange)] flex-shrink-0" />
+      <div class="space-y-2 text-sm text-[color:var(--mac-secondary)]">
+        <p>
+          根据文件大小，可能需要耗时较长时间，迁移期间直播间会暂时移除，迁移完成后直播间会自动恢复。
+        </p>
+        <p class="font-semibold text-[color:var(--mac-label)]">
+          迁移期间请不要关闭程序，且不要在迁移期间再次更改目录！
+        </p>
+        <p>确认要进行变更吗？</p>
+        <p class="text-[color:var(--mac-orange)]">
+          请选择 NAS 上的正常文件夹（例如 Z:\bsr-cache），不要选择 #recycle 回收站目录。
+        </p>
       </div>
     </div>
-  </div>
+    <svelte:fragment slot="actions">
+      <button type="button" class="mac-btn" on:click={() => (showModal = false)}>
+        取消
+      </button>
+      <button
+        type="button"
+        class="mac-btn mac-btn-primary"
+        disabled={cacheChanging || outputChanging}
+        on:click={confirmChange}
+      >
+        {cacheChanging ? "迁移中..." : "确认"}
+      </button>
+    </svelte:fragment>
+  </MacModal>
 {/if}

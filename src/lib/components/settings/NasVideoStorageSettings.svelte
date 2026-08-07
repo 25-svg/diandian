@@ -58,7 +58,7 @@
     </div>
   </div>
 
-  <div class="divide-y divide-gray-200 rounded-lg border border-gray-200 bg-white">
+  <div class="mac-card divide-y divide-[color:var(--mac-separator)]">
     <div class="flex items-center justify-between gap-6 p-4">
       <div>
         <strong class="text-sm font-medium text-gray-900">自动存入 NAS</strong>
@@ -80,12 +80,13 @@
         <input
           id="nas-root"
           type="text"
-          class="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm"
+          class="mac-field min-w-0 flex-1"
           placeholder="\\绿联设备名\直播录像"
           bind:value={settings.root_path}
         />
         <button
-          class="inline-flex items-center gap-2 rounded-lg border border-gray-300 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+          type="button"
+          class="mac-btn"
           disabled={testing || !settings.root_path.trim()}
           on:click={testConnection}
         >
@@ -125,7 +126,8 @@
 
     <div class="flex justify-end p-4">
       <button
-        class="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+        type="button"
+        class="mac-btn mac-btn-primary"
         disabled={saving}
         on:click={saveSettings}
       >

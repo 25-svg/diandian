@@ -12,6 +12,7 @@
   } from "../lib/nasStorage";
   import { parseImportedVideoNote } from "../lib/importedArchive";
   import ImportVideoDialog from "../lib/components/ImportVideoDialog.svelte";
+  import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
   import {
     createMasterSampleBatch,
@@ -1993,66 +1994,62 @@
 
 <!-- Delete Confirmation Modal -->
 {#if showDeleteConfirm}
-  <div
-    class="fixed inset-0 bg-black/20 dark:bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center"
-  >
-    <div
-      class="mac-modal w-[400px] bg-white dark:bg-[#323234] rounded-xl shadow-xl overflow-hidden"
-    >
-      <div class="p-6 space-y-4">
-        <div class="text-center space-y-2">
-          <h3 class="text-base font-medium text-gray-900 dark:text-white">
-            确认删除
-          </h3>
-          <p class="text-sm text-gray-500 dark:text-gray-400">
-            {#if videoToDelete}
-              确定要删除视频 "{videoToDelete.title || videoToDelete.file}" 吗？
-            {:else}
-              确定要删除选中的 {selectedVideos.size} 个视频吗？
-            {/if}
-          </p>
-          <p class="text-xs text-red-600 dark:text-red-500">此操作无法撤销。</p>
-          {#if selectedVideosIncludeNasArchive()}
-            <label class="mt-3 flex items-start gap-3 rounded-lg bg-amber-50 p-3 text-left text-sm text-amber-900">
-              <input
-                type="checkbox"
-                class="mt-0.5 h-4 w-4 rounded border-amber-300"
-                bind:checked={deleteArchivedFile}
-              />
-              <span>
-                <strong class="block font-medium">同时删除 NAS 上的视频文件</strong>
-                不勾选时只移除系统记录，NAS 文件会保留。
-              </span>
-            </label>
+  <MacModal bare panelClass="w-[400px]">
+    <div class="p-6 space-y-4">
+      <div class="text-center space-y-2">
+        <h3 class="text-[15px] font-semibold text-[color:var(--mac-label)]">
+          确认删除
+        </h3>
+        <p class="text-sm text-[color:var(--mac-tertiary)]">
+          {#if videoToDelete}
+            确定要删除视频 "{videoToDelete.title || videoToDelete.file}" 吗？
+          {:else}
+            确定要删除选中的 {selectedVideos.size} 个视频吗？
           {/if}
-        </div>
-        <div class="flex justify-center space-x-3">
-          <button
-            class="w-24 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-600 rounded-lg transition-colors"
-            on:click={() => {
-              showDeleteConfirm = false;
-              videoToDelete = null;
-              deleteArchivedFile = false;
-            }}
-          >
-            取消
-          </button>
-          <button
-            class="w-24 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
-            on:click={() => {
-              if (videoToDelete) {
-                deleteVideo(videoToDelete);
-              } else {
-                deleteSelectedVideos();
-              }
-            }}
-          >
-            删除
-          </button>
-        </div>
+        </p>
+        <p class="text-xs text-[color:var(--mac-red)]">此操作无法撤销。</p>
+        {#if selectedVideosIncludeNasArchive()}
+          <label class="mt-3 flex items-start gap-3 rounded-lg bg-amber-50 p-3 text-left text-sm text-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
+            <input
+              type="checkbox"
+              class="mt-0.5 h-4 w-4 rounded border-amber-300"
+              bind:checked={deleteArchivedFile}
+            />
+            <span>
+              <strong class="block font-medium">同时删除 NAS 上的视频文件</strong>
+              不勾选时只移除系统记录，NAS 文件会保留。
+            </span>
+          </label>
+        {/if}
+      </div>
+      <div class="flex justify-center gap-3">
+        <button
+          type="button"
+          class="mac-btn w-24"
+          on:click={() => {
+            showDeleteConfirm = false;
+            videoToDelete = null;
+            deleteArchivedFile = false;
+          }}
+        >
+          取消
+        </button>
+        <button
+          type="button"
+          class="mac-btn mac-btn-danger w-24"
+          on:click={() => {
+            if (videoToDelete) {
+              deleteVideo(videoToDelete);
+            } else {
+              deleteSelectedVideos();
+            }
+          }}
+        >
+          删除
+        </button>
       </div>
     </div>
-  </div>
+  </MacModal>
 {/if}
 
 <!-- Edit Note Dialog -->

@@ -251,6 +251,102 @@ textarea,
     background: var(--mac-bg-card);
     box-shadow: 0 0 0 3px var(--mac-blue-soft);
   }
+  textarea.mac-field {
+    height: auto;
+    min-height: 88px;
+    padding: 8px 12px;
+    resize: vertical;
+    line-height: 1.45;
+  }
+  select.mac-field {
+    padding-right: 28px;
+  }
+
+  .mac-btn-danger {
+    border-color: transparent;
+    background: var(--mac-red);
+    color: #fff;
+  }
+  .mac-btn-danger:hover {
+    filter: brightness(1.06);
+  }
+  .mac-btn-icon {
+    width: 32px;
+    padding: 0;
+  }
+
+  .mac-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: rgba(0, 0, 0, 0.22);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+  .dark .mac-modal-backdrop {
+    background: rgba(0, 0, 0, 0.45);
+  }
+
+  .mac-modal {
+    max-height: min(90vh, 920px);
+    overflow: hidden;
+    border: 1px solid var(--mac-separator);
+    border-radius: var(--mac-radius-xl);
+    background: var(--mac-bg-card);
+    box-shadow: var(--mac-shadow-lg);
+    color: var(--mac-label);
+  }
+
+  .mac-modal-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--mac-separator);
+  }
+  .mac-modal-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.2px;
+    color: var(--mac-label);
+  }
+  .mac-modal-close {
+    display: inline-grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--mac-secondary);
+    cursor: pointer;
+  }
+  .mac-modal-close:hover {
+    background: var(--mac-fill);
+    color: var(--mac-label);
+  }
+
+  .mac-modal-body {
+    padding: 20px;
+  }
+  .mac-modal-body-flush {
+    padding: 0;
+  }
+
+  .mac-modal-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 20px 16px;
+    border-top: 1px solid var(--mac-separator);
+  }
 
   .mac-table-wrap {
     overflow-x: auto;

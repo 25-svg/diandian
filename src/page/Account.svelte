@@ -1,10 +1,10 @@
 <script lang="ts">
   import { get, invoke, invokeSensitive } from "../lib/invoker";
-  import { scale, fade } from "svelte/transition";
-  import { Textarea } from "flowbite-svelte";
+  import { scale } from "svelte/transition";
   import QRCode from "qrcode";
   import type { AccountItem, AccountInfo } from "../lib/db";
   import { Ellipsis, Plus } from "lucide-svelte";
+  import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
 
   let account_info: AccountInfo = {
@@ -77,17 +77,6 @@
       !event.target.closest(".dropdown-container")
     ) {
       activeDropdown = null;
-    }
-  }
-
-  function handleModalClickOutside(event) {
-    const modal = document.querySelector(".mac-modal");
-    if (
-      modal &&
-      !modal.contains(event.target) &&
-      !event.target.closest("button")
-    ) {
-      addModal = false;
     }
   }
 
@@ -202,10 +191,7 @@
   }
 </script>
 
-<svelte:window
-  on:click={handleClickOutside}
-  on:mousedown={handleModalClickOutside}
-/>
+<svelte:window on:click={handleClickOutside} />
 
 <PageShell title="账号" subtitle={`共 ${account_info.accounts.length} 个账号`}>
   <div slot="actions">
@@ -337,191 +323,180 @@
 </PageShell>
 
 {#if addModal}
-  <div
-    class="fixed inset-0 bg-black/20 dark:bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center"
-    transition:fade={{ duration: 200 }}
+  <MacModal
+    title="添加账号"
+    panelClass="w-[400px]"
+    closeOnBackdrop
+    showClose
+    on:close={() => (addModal = false)}
   >
-    <div
-      class="mac-modal w-[400px] bg-white dark:bg-[#323234] rounded-xl shadow-xl overflow-hidden"
-      transition:scale={{ duration: 150, start: 0.95 }}
-    >
-      <!-- Header -->
-      <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700/50">
-        <h2 class="text-base font-medium text-gray-900 dark:text-white">
-          添加账号
-        </h2>
+    <div class="space-y-6">
+      <!-- Platform Selection -->
+      <div class="hidden">
+        <label
+          for="platform"
+          class="block text-sm font-medium text-[color:var(--mac-secondary)]"
+        >
+          平台
+        </label>
+        <div class="mac-segmented overflow-x-auto custom-scrollbar-light">
+          <button
+            type="button"
+            class="flex-none"
+            class:mac-segment-active={selectedPlatform === "bilibili"}
+            aria-selected={selectedPlatform === "bilibili"}
+            on:click={() => {
+              selectedPlatform = "bilibili";
+              activeTab = "qr";
+              requestAnimationFrame(handle_qr);
+            }}
+          >
+            哔哩哔哩
+          </button>
+          <button
+            type="button"
+            class="flex-none"
+            class:mac-segment-active={selectedPlatform === "douyin"}
+            aria-selected={selectedPlatform === "douyin"}
+            on:click={() => {
+              selectedPlatform = "douyin";
+              activeTab = "qr";
+            }}
+          >
+            抖音
+          </button>
+          <button
+            type="button"
+            class="flex-none"
+            class:mac-segment-active={selectedPlatform === "huya"}
+            aria-selected={selectedPlatform === "huya"}
+            on:click={() => {
+              selectedPlatform = "huya";
+              activeTab = "manual";
+            }}
+          >
+            虎牙
+          </button>
+          <button
+            type="button"
+            class="flex-none"
+            class:mac-segment-active={selectedPlatform === "kuaishou"}
+            aria-selected={selectedPlatform === "kuaishou"}
+            on:click={() => {
+              selectedPlatform = "kuaishou";
+              activeTab = "manual";
+            }}
+          >
+            快手
+          </button>
+          <button
+            type="button"
+            class="flex-none"
+            class:mac-segment-active={selectedPlatform === "tiktok"}
+            aria-selected={selectedPlatform === "tiktok"}
+            on:click={() => {
+              selectedPlatform = "tiktok";
+              activeTab = "manual";
+            }}
+          >
+            TikTok
+          </button>
+        </div>
       </div>
 
-      <div class="p-6 space-y-6">
-        <!-- Platform Selection -->
-        <div class="hidden">
-          <label
-            for="platform"
-            class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+      <!-- Login Methods (Only show for Bilibili) -->
+      {#if selectedPlatform === "bilibili"}
+        <div class="mac-segmented w-full">
+          <button
+            type="button"
+            class="flex-1"
+            class:mac-segment-active={activeTab === "qr"}
+            aria-selected={activeTab === "qr"}
+            on:click={() => {
+              activeTab = "qr";
+              requestAnimationFrame(handle_qr);
+            }}
           >
-            平台
-          </label>
-          <div
-            class="flex items-center gap-2 p-0.5 bg-[#f5f5f7] dark:bg-[#1c1c1e] rounded-lg overflow-x-auto custom-scrollbar-light"
+            扫码登录
+          </button>
+          <button
+            type="button"
+            class="flex-1"
+            class:mac-segment-active={activeTab === "manual"}
+            aria-selected={activeTab === "manual"}
+            on:click={() => {
+              activeTab = "manual";
+            }}
           >
-            <button
-              class="flex-none px-3 py-2 text-sm font-medium whitespace-nowrap rounded-md transition-colors {selectedPlatform ===
-              'bilibili'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm text-gray-900 dark:text-white'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}"
-              on:click={() => {
-                selectedPlatform = "bilibili";
-                activeTab = "qr";
-                requestAnimationFrame(handle_qr);
-              }}
-            >
-              哔哩哔哩
-            </button>
-            <button
-              class="flex-none px-3 py-2 text-sm font-medium whitespace-nowrap rounded-md transition-colors {selectedPlatform ===
-              'douyin'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm text-gray-900 dark:text-white'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}"
-              on:click={() => {
-                selectedPlatform = "douyin";
-                activeTab = "qr";
-              }}
-            >
-              抖音
-            </button>
-            <button
-              class="flex-none px-3 py-2 text-sm font-medium whitespace-nowrap rounded-md transition-colors {selectedPlatform ===
-              'huya'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm text-gray-900 dark:text-white'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}"
-              on:click={() => {
-                selectedPlatform = "huya";
-                activeTab = "manual";
-              }}
-            >
-              虎牙
-            </button>
-            <button
-              class="flex-none px-3 py-2 text-sm font-medium whitespace-nowrap rounded-md transition-colors {selectedPlatform ===
-              'kuaishou'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm text-gray-900 dark:text-white'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}"
-              on:click={() => {
-                selectedPlatform = "kuaishou";
-                activeTab = "manual";
-              }}
-            >
-              快手
-            </button>
-            <button
-              class="flex-none px-3 py-2 text-sm font-medium whitespace-nowrap rounded-md transition-colors {selectedPlatform ===
-              'tiktok'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm text-gray-900 dark:text-white'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}"
-              on:click={() => {
-                selectedPlatform = "tiktok";
-                activeTab = "manual";
-              }}
-            >
-              TikTok
-            </button>
-          </div>
+            手动输入
+          </button>
         </div>
+      {/if}
 
-        <!-- Login Methods (Only show for Bilibili) -->
-        {#if selectedPlatform === "bilibili"}
-          <div class="flex rounded-lg bg-[#f5f5f7] dark:bg-[#1c1c1e] p-1">
-            <button
-              class="flex-1 px-4 py-1.5 text-sm rounded-md transition-colors {activeTab ===
-              'qr'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm font-medium'
-                : 'text-gray-600 dark:text-gray-400'}"
-              on:click={() => {
-                activeTab = "qr";
-                requestAnimationFrame(handle_qr);
-              }}
+      <!-- Tab Content -->
+      <div class="space-y-4">
+        {#if selectedPlatform === "bilibili" && activeTab === "qr"}
+          <div class="flex flex-col items-center space-y-4">
+            <div class="bg-white p-4 rounded-lg">
+              <canvas id="qr" />
+            </div>
+            <p class="text-sm text-center text-[color:var(--mac-tertiary)]">
+              请使用 BiliBili App 扫描二维码登录
+            </p>
+          </div>
+        {:else if selectedPlatform === "douyin" && activeTab === "qr"}
+          <div class="flex flex-col items-center space-y-4 py-2">
+            <div
+              class="w-16 h-16 rounded-2xl bg-black flex items-center justify-center"
             >
-              扫码登录
-            </button>
+              <img src="/imgs/douyin.png" alt="抖音" class="w-10 h-10" />
+            </div>
+            <p class="text-sm text-center text-[color:var(--mac-tertiary)]">
+              {douyinLoginStatus}
+            </p>
             <button
-              class="flex-1 px-4 py-1.5 text-sm rounded-md transition-colors {activeTab ===
-              'manual'
-                ? 'bg-white dark:bg-[#3c3c3e] shadow-sm font-medium'
-                : 'text-gray-600 dark:text-gray-400'}"
-              on:click={() => {
-                activeTab = "manual";
-              }}
+              type="button"
+              class="mac-btn mac-btn-primary w-full"
+              on:click={handle_douyin_login}
             >
-              手动输入
+              打开抖音扫码登录
             </button>
+            <p class="text-xs text-[color:var(--mac-quaternary)] text-center">
+              登录信息只保存在本机，无需复制或查看 Cookie
+            </p>
+          </div>
+        {:else}
+          <div class="space-y-4">
+            <textarea
+              class="mac-field w-full"
+              rows="4"
+              bind:value={cookie_str}
+              placeholder={`请粘贴 ${selectedPlatform} 账号的 Cookie`}
+            ></textarea>
+            <div class="flex justify-end items-center gap-3">
+              {#if selectedPlatform !== "bilibili"}
+                <a
+                  href="https://bsr.xinrea.cn/getting-started/config/account.html"
+                  class="text-sm text-[color:var(--mac-blue)] hover:underline"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Cookie 获取教程</a
+                >
+              {/if}
+              <button
+                type="button"
+                class="mac-btn mac-btn-primary"
+                on:click={() => {
+                  add_cookie();
+                }}
+              >
+                添加账号
+              </button>
+            </div>
           </div>
         {/if}
-
-        <!-- Tab Content -->
-        <div class="space-y-4">
-          {#if selectedPlatform === "bilibili" && activeTab === "qr"}
-            <div class="flex flex-col items-center space-y-4">
-              <div class="bg-white p-4 rounded-lg">
-                <canvas id="qr" />
-              </div>
-              <p class="text-sm text-center text-gray-600 dark:text-gray-400">
-                请使用 BiliBili App 扫描二维码登录
-              </p>
-            </div>
-          {:else if selectedPlatform === "douyin" && activeTab === "qr"}
-            <div class="flex flex-col items-center space-y-4 py-2">
-              <div
-                class="w-16 h-16 rounded-2xl bg-black flex items-center justify-center"
-              >
-                <img src="/imgs/douyin.png" alt="抖音" class="w-10 h-10" />
-              </div>
-              <p class="text-sm text-center text-gray-600 dark:text-gray-400">
-                {douyinLoginStatus}
-              </p>
-              <button
-                class="w-full px-4 py-2.5 bg-black hover:bg-gray-800 text-white text-sm font-medium rounded-lg transition-colors"
-                on:click={handle_douyin_login}
-              >
-                打开抖音扫码登录
-              </button>
-              <p class="text-xs text-gray-400 text-center">
-                登录信息只保存在本机，无需复制或查看 Cookie
-              </p>
-            </div>
-          {:else}
-            <div class="space-y-4">
-              <p class="text-sm text-gray-600 dark:text-gray-400">
-                <Textarea
-                  bind:value={cookie_str}
-                  rows={4}
-                  class="w-full px-3 py-2 bg-[#f5f5f7] dark:bg-[#1c1c1e] border-0 rounded-lg resize-none focus:ring-2 focus:ring-blue-500"
-                  placeholder={`请粘贴 ${selectedPlatform} 账号的 Cookie`}
-                />
-              </p>
-              <div class="flex justify-end items-center space-x-2">
-                {#if selectedPlatform !== "bilibili"}
-                  <a
-                    href="https://bsr.xinrea.cn/getting-started/config/account.html"
-                    class="text-blue-500 hover:underline text-sm"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Cookie 获取教程</a
-                  >
-                {/if}
-                <button
-                  class="px-4 py-2 bg-[#0A84FF] hover:bg-[#0A84FF]/90 text-white text-sm font-medium rounded-lg transition-colors"
-                  on:click={() => {
-                    add_cookie();
-                  }}
-                >
-                  添加账号
-                </button>
-              </div>
-            </div>
-          {/if}
-        </div>
       </div>
     </div>
-  </div>
+  </MacModal>
 {/if}

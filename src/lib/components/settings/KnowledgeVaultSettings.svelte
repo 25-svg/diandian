@@ -104,7 +104,7 @@
     <span>Obsidian 知识库</span>
   </h2>
 
-  <div class="min-h-[148px] rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-[#3c3c3e]">
+  <div class="mac-card min-h-[148px] p-4">
     {#if loading}
       <div class="flex min-h-[116px] items-center gap-3 text-sm text-gray-500 dark:text-gray-400">
         <Loader2 class="h-5 w-5 animate-spin" />
@@ -131,15 +131,15 @@
 
         <div class="flex shrink-0 items-center gap-2">
           {#if status.connected}
-            <button class="inline-flex h-9 items-center gap-2 rounded-lg border border-gray-200 px-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-100 dark:hover:bg-gray-700" on:click={syncVault} disabled={running}>
+            <button type="button" class="mac-btn" on:click={syncVault} disabled={running}>
               <RefreshCw class={running ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
               <span>重新同步</span>
             </button>
-            <button class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-gray-200 text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-100 dark:hover:bg-gray-700" on:click={openVault} disabled={running} title="打开文件夹" aria-label="打开文件夹">
+            <button type="button" class="mac-btn mac-btn-icon" on:click={openVault} disabled={running} title="打开文件夹" aria-label="打开文件夹">
               <FolderOpen class="h-4 w-4" />
             </button>
           {:else}
-            <button class="inline-flex h-9 items-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50" on:click={chooseVault} disabled={running}>
+            <button type="button" class="mac-btn mac-btn-primary" on:click={chooseVault} disabled={running}>
               {#if running}<Loader2 class="h-4 w-4 animate-spin" />{:else}<FolderOpen class="h-4 w-4" />{/if}
               <span>选择知识库</span>
             </button>

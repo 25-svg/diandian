@@ -24,6 +24,7 @@
   import TikTokIcon from "../lib/components/TikTokIcon.svelte";
   import AutoRecordIcon from "../lib/components/AutoRecordIcon.svelte";
   import GenerateWholeClipModal from "../lib/components/GenerateWholeClipModal.svelte";
+  import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
   import { onMount } from "svelte";
 
@@ -704,53 +705,47 @@
     </div>
 </PageShell>
 {#if deleteModal}
-  <div
-    class="fixed inset-0 bg-black/20 dark:bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center"
-    transition:fade={{ duration: 200 }}
-  >
-    <div
-      class="mac-modal delete-modal w-[320px] bg-white dark:bg-[#323234] rounded-xl shadow-xl overflow-hidden"
-      transition:scale={{ duration: 150, start: 0.95 }}
-    >
-      <div class="p-6 space-y-4">
-        <div class="text-center space-y-2">
-          <h3 class="text-base font-medium text-gray-900 dark:text-white">
-            移除直播间
-          </h3>
-          <p class="text-sm text-gray-500 dark:text-gray-400">
-            此操作将移除所有相关的录制记录
-          </p>
-        </div>
-        <div class="flex justify-center space-x-3">
-          <button
-            class="w-24 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-600 rounded-lg transition-colors"
-            on:click={() => {
+  <MacModal bare panelClass="w-[320px] delete-modal">
+    <div class="p-6 space-y-4">
+      <div class="text-center space-y-2">
+        <h3 class="text-[15px] font-semibold text-[color:var(--mac-label)]">
+          移除直播间
+        </h3>
+        <p class="text-sm text-[color:var(--mac-tertiary)]">
+          此操作将移除所有相关的录制记录
+        </p>
+      </div>
+      <div class="flex justify-center gap-3">
+        <button
+          type="button"
+          class="mac-btn w-24"
+          on:click={() => {
+            deleteModal = false;
+          }}
+        >
+          取消
+        </button>
+        <button
+          type="button"
+          class="mac-btn mac-btn-danger w-24"
+          on:click={async () => {
+            try {
+              await invokeSensitive("remove_recorder", {
+                roomId: deleteRoom.room_info.room_id,
+                platform: deleteRoom.room_info.platform,
+              });
               deleteModal = false;
-            }}
-          >
-            取消
-          </button>
-          <button
-            class="w-24 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
-            on:click={async () => {
-              try {
-                await invokeSensitive("remove_recorder", {
-                  roomId: deleteRoom.room_info.room_id,
-                  platform: deleteRoom.room_info.platform,
-                });
-                deleteModal = false;
-                await update_summary();
-              } catch (error) {
-                alert(`移除直播间失败：${error}`);
-              }
-            }}
-          >
-            移除
-          </button>
-        </div>
+              await update_summary();
+            } catch (error) {
+              alert(`移除直播间失败：${error}`);
+            }
+          }}
+        >
+          移除
+        </button>
       </div>
     </div>
-  </div>
+  </MacModal>
 {/if}
 
 {#if addModal}

@@ -31,7 +31,7 @@
   .mac-page-stack {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: 20px;
   }
   .mac-page-actions {
     display: flex;

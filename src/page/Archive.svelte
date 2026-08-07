@@ -59,6 +59,7 @@
   import TikTokIcon from "../lib/components/TikTokIcon.svelte";
   import GenerateWholeClipModal from "../lib/components/GenerateWholeClipModal.svelte";
   import ImportVideoDialog from "../lib/components/ImportVideoDialog.svelte";
+  import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
   import type { RecorderInfo, RecorderList } from "src/lib/interface";
   import type { VideoItem } from "../lib/interface";
@@ -1835,7 +1836,7 @@
       <label class="mt-4 block text-sm font-medium text-gray-700 dark:text-gray-200">
         主播姓名
         <input
-          class="mt-2 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 dark:border-gray-600 dark:bg-[#252527] dark:text-white"
+          class="mac-field mt-2 w-full"
           bind:value={editingAnchorName}
           maxlength="12"
           placeholder="例如：小鱼"
@@ -1846,13 +1847,15 @@
       {/if}
       <div class="mt-5 flex justify-end gap-3">
         <button
-          class="rounded-lg px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
+          type="button"
+          class="mac-btn"
           on:click={closeArchiveAnchorDialog}
         >
           取消
         </button>
         <button
-          class="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+          type="button"
+          class="mac-btn mac-btn-primary"
           disabled={!editingAnchorName.trim()}
           on:click={saveArchiveAnchorName}
         >
@@ -1865,57 +1868,53 @@
 
 <!-- Delete Confirmation Modal -->
 {#if showDeleteConfirm}
-  <div
-    class="fixed inset-0 bg-black/20 dark:bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center"
-  >
-    <div
-      class="mac-modal w-[400px] bg-white dark:bg-[#323234] rounded-xl shadow-xl overflow-hidden"
-    >
-      <div class="p-6 space-y-4">
-        <div class="text-center space-y-2">
-          <h3 class="text-base font-medium text-gray-900 dark:text-white">
-            确认删除
-          </h3>
-          <p class="text-sm text-gray-500 dark:text-gray-400">
-            {#if archiveToDelete}
-              确定要删除录播 "{archiveToDelete.title}" 吗？
-            {:else}
-              确定要删除选中的 {selectedArchives.size} 个录播吗？
-            {/if}
-          </p>
-          <p class="text-xs text-red-600 dark:text-red-500">此操作无法撤销。</p>
-        </div>
-        <div class="flex justify-center space-x-3">
-          <button
-            class="w-24 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-600 rounded-lg transition-colors disabled:opacity-50"
-            disabled={isDeletingArchives}
-            on:click={() => {
-              showDeleteConfirm = false;
-              archiveToDelete = null;
-            }}
-          >
-            取消
-          </button>
-          <button
-            class="w-24 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-60 inline-flex items-center justify-center gap-2"
-            disabled={isDeletingArchives}
-            on:click={() => {
-              if (archiveToDelete) {
-                deleteArchive(archiveToDelete);
-              } else {
-                deleteSelectedArchives();
-              }
-            }}
-          >
-            {#if isDeletingArchives}
-              <Loader2 class="w-4 h-4 animate-spin" />
-            {/if}
-            删除
-          </button>
-        </div>
+  <MacModal bare panelClass="w-[400px]">
+    <div class="p-6 space-y-4">
+      <div class="text-center space-y-2">
+        <h3 class="text-[15px] font-semibold text-[color:var(--mac-label)]">
+          确认删除
+        </h3>
+        <p class="text-sm text-[color:var(--mac-tertiary)]">
+          {#if archiveToDelete}
+            确定要删除录播 "{archiveToDelete.title}" 吗？
+          {:else}
+            确定要删除选中的 {selectedArchives.size} 个录播吗？
+          {/if}
+        </p>
+        <p class="text-xs text-[color:var(--mac-red)]">此操作无法撤销。</p>
+      </div>
+      <div class="flex justify-center gap-3">
+        <button
+          type="button"
+          class="mac-btn w-24"
+          disabled={isDeletingArchives}
+          on:click={() => {
+            showDeleteConfirm = false;
+            archiveToDelete = null;
+          }}
+        >
+          取消
+        </button>
+        <button
+          type="button"
+          class="mac-btn mac-btn-danger w-24 inline-flex items-center justify-center gap-2"
+          disabled={isDeletingArchives}
+          on:click={() => {
+            if (archiveToDelete) {
+              deleteArchive(archiveToDelete);
+            } else {
+              deleteSelectedArchives();
+            }
+          }}
+        >
+          {#if isDeletingArchives}
+            <Loader2 class="w-4 h-4 animate-spin" />
+          {/if}
+          删除
+        </button>
       </div>
     </div>
-  </div>
+  </MacModal>
 {/if}
 
 {#if showFactCardModal && factCardArchive}
@@ -1986,19 +1985,6 @@
 />
 
 <style>
-  /* macOS style modal */
-  .mac-modal {
-    box-shadow:
-      0 20px 25px -5px rgba(0, 0, 0, 0.1),
-      0 10px 10px -5px rgba(0, 0, 0, 0.04);
-  }
-
-  :global(.dark) .mac-modal {
-    box-shadow:
-      0 20px 25px -5px rgba(0, 0, 0, 0.3),
-      0 10px 10px -5px rgba(0, 0, 0, 0.1);
-  }
-
   /* fixed icon size in tables */
   :global(.table-icon) {
     width: 1rem; /* 16px, same as Tailwind w-4 */

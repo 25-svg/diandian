@@ -380,7 +380,7 @@
                 {#if taskNavigationTarget(task)}
                   <button
                     type="button"
-                    class="flex items-center gap-1 rounded-lg px-3 py-2 text-xs font-medium text-blue-600 hover:bg-blue-50 hover:text-blue-700 dark:text-blue-400 dark:hover:bg-blue-900/20"
+                    class="mac-btn"
                     title="进入对应片段分析页面"
                     on:click={() => openTask(task)}
                   >
