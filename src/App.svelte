@@ -8,10 +8,8 @@
   import { log, onOpenUrl, set_title } from "./lib/invoker";
   import Clip from "./page/Clip.svelte";
   import Task from "./page/Task.svelte";
-  import AI from "./page/AI.svelte";
   import Archive from "./page/Archive.svelte";
   import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
-  import TrainingDashboard from "./page/TrainingDashboard.svelte";
   import LiveDataDashboard from "./page/LiveDataDashboard.svelte";
   import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
   import type { RecordItem } from "./lib/db";
@@ -162,9 +160,6 @@
       );
       openAnalysisPage({ archive: null, video, mode });
     };
-    const openArchiveTranscription = () => {
-      active = "助手";
-    };
     const openCompanyDealReview = (event: Event) => {
       const archive = (event as CustomEvent<RecordItem>).detail;
       if (!archive) {
@@ -195,7 +190,6 @@
     window.addEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
     window.addEventListener("bsr:open-company-deal-review", openCompanyDealReview);
     window.addEventListener("bsr:open-video-analysis", openVideoAnalysis);
-    window.addEventListener("bsr:transcribe-archive", openArchiveTranscription);
     window.addEventListener("bsr:build-master", openMasterBuilder);
     window.addEventListener("bsr:open-live-dashboard", openLiveDashboard);
     window.addEventListener("bsr:open-clip-review", openClipReview);
@@ -203,7 +197,6 @@
       window.removeEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
       window.removeEventListener("bsr:open-company-deal-review", openCompanyDealReview);
       window.removeEventListener("bsr:open-video-analysis", openVideoAnalysis);
-      window.removeEventListener("bsr:transcribe-archive", openArchiveTranscription);
       window.removeEventListener("bsr:build-master", openMasterBuilder);
       window.removeEventListener("bsr:open-live-dashboard", openLiveDashboard);
       window.removeEventListener("bsr:open-clip-review", openClipReview);
@@ -259,14 +252,8 @@
       <div class="page" class:visible={active == "任务"}>
         <Task />
       </div>
-      <div class="page" class:visible={active == "培养看板"}>
-        <TrainingDashboard />
-      </div>
       <div class="page" class:visible={active == "直播数据大屏"}>
         <LiveDataDashboard initialSessionId={liveDashboardSessionId} />
-      </div>
-      <div class="page" class:visible={active == "助手"}>
-        <AI />
       </div>
       <div class="page" class:visible={active == "账号"}>
         <Account />
