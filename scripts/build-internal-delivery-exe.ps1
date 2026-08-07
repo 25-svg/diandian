@@ -22,6 +22,15 @@ $resolvedSfxModule = (Resolve-Path -LiteralPath $SfxModulePath).Path
 $resolvedOutput = [System.IO.Path]::GetFullPath($OutputPath)
 $resolvedWorkingRoot = [System.IO.Path]::GetFullPath($WorkingRoot)
 
+# The SFX stub contains its own decoder. Mixing a newer archive writer with an
+# older stub can pass external `7z t` checks but fail on double-click with
+# "Unsupported Method". Keep both binaries from the same extracted release.
+$sevenZipDirectory = Split-Path -Parent $resolvedSevenZip
+$sfxDirectory = Split-Path -Parent $resolvedSfxModule
+if (-not $sevenZipDirectory.Equals($sfxDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "7-Zip 压缩器和 SFX 模块必须来自同一版本目录。当前分别为：$sevenZipDirectory；$sfxDirectory"
+}
+
 foreach ($path in @($resolvedOutput, ($resolvedOutput + "-SHA256.txt"))) {
     if (Test-Path -LiteralPath $path) {
         throw "输出已存在，请更换 OutputPath，避免覆盖已有交付物：$path"

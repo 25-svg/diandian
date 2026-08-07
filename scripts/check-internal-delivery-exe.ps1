@@ -20,7 +20,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "单 EXE 安装包的内嵌压缩数据校验失败，退出码：$LASTEXITCODE"
 }
 
-$runId = [System.IO.Path]::GetFileNameWithoutExtension($resolvedInstaller) + "-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+$runId = "single-exe-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 $extractPath = Join-Path $extractBase $runId
 if (Test-Path -LiteralPath $extractPath) {
     throw "验证目录已存在：$extractPath"
@@ -39,6 +39,10 @@ try {
         (Join-Path $extractPath "app\典典直播切片.exe"),
         (Join-Path $extractPath "app\ffmpeg.exe"),
         (Join-Path $extractPath "app\ffprobe.exe"),
+        (Join-Path $extractPath "app\msvcp140.dll"),
+        (Join-Path $extractPath "app\VCOMP140.DLL"),
+        (Join-Path $extractPath "app\vcruntime140.dll"),
+        (Join-Path $extractPath "app\vcruntime140_1.dll"),
         (Join-Path $extractPath "app\funasr-runtime\funasr-service.exe"),
         (Join-Path $extractPath "runtime\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"),
         (Join-Path $extractPath "seed\data_v2.db"),
@@ -62,6 +66,8 @@ try {
     }
     foreach ($installedFile in @(
         (Join-Path $testInstallRoot "storage\应用\funasr-runtime\funasr-service.exe"),
+        (Join-Path $testInstallRoot "storage\应用\vcruntime140.dll"),
+        (Join-Path $testInstallRoot "storage\应用\vcruntime140_1.dll"),
         (Join-Path $testInstallRoot "appdata\cn.vjoi.bili-shadowreplay\models\whisper\ggml-small-q5_1.bin")
     )) {
         if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) {
