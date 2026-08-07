@@ -42,7 +42,10 @@ export default defineConfig(async ({ mode }) => {
       port: 8054,
       strictPort: true,
       watch: {
-        ignored: ["**/src-tauri/target/**"],
+        // `dist` is the packaged app output. The running Tauri executable can
+        // lock its assets on Windows, which otherwise makes Vite crash while
+        // trying to watch them.
+        ignored: ["**/src-tauri/target/**", "**/dist/**"],
       },
     },
     // to make use of `TAURI_DEBUG` and other env variables
