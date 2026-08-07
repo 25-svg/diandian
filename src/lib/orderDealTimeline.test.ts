@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   analyzeSegmentDealSignals,
   buildDealMinuteBuckets,
+  buildDealWaves,
   buildPeakDealMinuteLabel,
   dealReviewSeekOffset,
   parsePaymentEventsPayload,
@@ -46,6 +47,17 @@ assert.match(hotSegment.label, /段后2分钟 3 单/);
 
 const peak = buildPeakDealMinuteLabel(buckets);
 assert.match(peak || "", /2分 成交 2 单/);
+
+const waves = buildDealWaves([
+  { offsetSec: 100, payAmountFen: 10000, productName: "索尼 A7M4" },
+  { offsetSec: 150, payAmountFen: 20000, productName: "索尼 A7M4" },
+  { offsetSec: 500, payAmountFen: 30000, productName: "索尼 A7M4" },
+  { offsetSec: 1300, payAmountFen: 40000, productName: "佳能 R5" },
+]);
+assert.equal(waves.length, 2);
+assert.equal(waves[0]?.eventCount, 3);
+assert.equal(waves[0]?.totalPayAmountFen, 60000);
+assert.equal(waves[1]?.productName, "佳能 R5");
 
 const empty = analyzeSegmentDealSignals([], 10, 20);
 assert.match(empty.label, /段内 0 单/);

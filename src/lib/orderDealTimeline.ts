@@ -24,6 +24,17 @@ export type DealMinuteBucket = {
   totalPayAmountFen: number;
 };
 
+export type DealWave = {
+  id: string;
+  startOffsetSec: number;
+  endOffsetSec: number;
+  anchorOffsetSec: number;
+  eventCount: number;
+  totalPayAmountFen: number;
+  productName: string;
+  events: PaymentEvent[];
+};
+
 export type SegmentDealSignals = {
   inSegmentOrderCount: number;
   inSegmentPayAmountFen: number;
@@ -140,6 +151,69 @@ export function buildDealMinuteBuckets(events: readonly PaymentEvent[]): DealMin
     buckets.set(minuteIndex, existing);
   }
   return [...buckets.values()].sort((left, right) => left.minuteIndex - right.minuteIndex);
+}
+
+function normalizedProductName(event: PaymentEvent): string {
+  return (event.productName || "").replace(/\s+/g, "").toLowerCase();
+}
+
+/**
+ * Turn scattered SKU payment rows into beginner-friendly deal waves.
+ * Nearby payments belong together; repeat purchases of the same product may
+ * span a longer explanation window.
+ */
+export function buildDealWaves(
+  events: readonly PaymentEvent[],
+  nearbyGapSec = 120,
+  sameProductGapSec = 600,
+): DealWave[] {
+  const sorted = [...events].sort((left, right) => left.offsetSec - right.offsetSec);
+  const groups: PaymentEvent[][] = [];
+  for (const event of sorted) {
+    const current = groups[groups.length - 1];
+    const previous = current?.[current.length - 1];
+    if (!current || !previous) {
+      groups.push([event]);
+      continue;
+    }
+    const gap = event.offsetSec - previous.offsetSec;
+    const sameProduct = Boolean(
+      normalizedProductName(event)
+        && normalizedProductName(event) === normalizedProductName(previous),
+    );
+    if (gap <= nearbyGapSec || (sameProduct && gap <= sameProductGapSec)) {
+      current.push(event);
+    } else {
+      groups.push([event]);
+    }
+  }
+
+  return groups.map((group, index) => {
+    const productCounts = new Map<string, { label: string; count: number }>();
+    for (const event of group) {
+      const label = event.productName?.trim() || "未命名商品";
+      const key = label.replace(/\s+/g, "").toLowerCase();
+      const current = productCounts.get(key) ?? { label, count: 0 };
+      current.count += 1;
+      productCounts.set(key, current);
+    }
+    const products = [...productCounts.values()].sort((left, right) => right.count - left.count);
+    const productName = products.length > 1
+      ? `${products[0]?.label || "多个商品"} 等 ${products.length} 个商品`
+      : products[0]?.label || "未命名商品";
+    const startOffsetSec = group[0]?.offsetSec ?? 0;
+    const endOffsetSec = group[group.length - 1]?.offsetSec ?? startOffsetSec;
+    return {
+      id: `${Math.round(startOffsetSec)}:${index}`,
+      startOffsetSec,
+      endOffsetSec,
+      anchorOffsetSec: startOffsetSec,
+      eventCount: group.length,
+      totalPayAmountFen: group.reduce((total, event) => total + (event.payAmountFen ?? 0), 0),
+      productName,
+      events: group,
+    };
+  });
 }
 
 function eventsInWindow(

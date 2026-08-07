@@ -3,6 +3,7 @@ import {
   applyCompassProgress,
   buildCompassQueue,
   canStartCompassDownload,
+  COMPASS_TARGET_SHOPS,
   compassStatusLabel,
   compassSessionKey,
   markCompassSessionImported,
@@ -12,6 +13,10 @@ import {
 
 assert.equal(canStartCompassDownload(false), true, "one-click download must work before querying");
 assert.equal(canStartCompassDownload(true), false, "a running batch must not be started twice");
+assert.deepEqual(COMPASS_TARGET_SHOPS.map((shop) => shop.value), [
+  "金典拍拍科创专卖店",
+  "金典拍拍相机专卖店",
+]);
 
 assert.equal(normalizeCompassDate("2026-7-28"), "2026-07-28");
 assert.equal(normalizeCompassDate("2026/07/28"), "2026-07-28");
@@ -61,5 +66,6 @@ assert.equal(imported[0]?.status, "imported");
 assert.equal(imported[1]?.status, "skipped");
 assert.equal(compassStatusLabel("waiting"), "等待处理");
 assert.equal(compassStatusLabel("manual-filter-needed"), "需要手动选择日期");
+assert.equal(compassStatusLabel("shop-mismatch"), "店铺不一致");
 
 console.log("compass auto-download tests passed");

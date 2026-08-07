@@ -1,10 +1,16 @@
 export type CompassSession = {
   shopName: string;
+  title?: string;
   startedAt: string;
   endedAt: string;
   orderCount?: number | null;
   paymentAmountText?: string;
 };
+
+export const COMPASS_TARGET_SHOPS = [
+  { value: "金典拍拍科创专卖店", label: "科创店" },
+  { value: "金典拍拍相机专卖店", label: "相机店" },
+] as const;
 
 export type CompassQueueStatus =
   | "waiting"
@@ -106,6 +112,9 @@ export function compassStatusLabel(status: string): string {
     "sessions-found": "已找到场次",
     "waiting-for-download-button": "等待下载按钮",
     "login-required": "等待扫码登录",
+    "switching-shop": "正在切换店铺",
+    "shop-unavailable": "无店铺权限",
+    "shop-mismatch": "店铺不一致",
     "batch-finished": "当天场次已处理完成",
   } as Record<string, string>)[status] ?? status;
 }
