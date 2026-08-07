@@ -89,6 +89,42 @@ async fn remove_archive_cache_dir(path: &Path) -> Result<(), RecorderManagerErro
     })
 }
 
+/// Make a large archive disappear from the active cache immediately. Renaming
+/// inside the same parent directory is normally atomic, while recursively
+/// removing thousands of TS segments can take a long time. If staging is not
+/// supported by the filesystem, keep the previous synchronous fallback.
+async fn stage_archive_cache_dir(path: &Path) -> Result<Option<PathBuf>, RecorderManagerError> {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let Some(parent) = path.parent() else {
+        remove_archive_cache_dir(path).await?;
+        return Ok(None);
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("archive");
+    let staged = parent.join(format!(
+        ".{name}.deleting-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    match tokio::fs::rename(path, &staged).await {
+        Ok(()) => Ok(Some(staged)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            log::warn!(
+                "Unable to stage archive cache for fast deletion ({}): {error}; using direct deletion",
+                path.display()
+            );
+            remove_archive_cache_dir(path).await?;
+            Ok(None)
+        }
+    }
+}
+
 async fn measure_recording_cache(work_dir: &Path) -> Result<(f64, u64), std::io::Error> {
     let mut total_length = 0.0;
     let mut total_size = 0u64;
@@ -151,7 +187,7 @@ mod recording_cache_measure_tests {
 
 #[cfg(test)]
 mod archive_delete_tests {
-    use super::remove_archive_cache_dir;
+    use super::{remove_archive_cache_dir, stage_archive_cache_dir};
 
     #[tokio::test]
     async fn missing_archive_cache_is_already_deleted() {
@@ -164,17 +200,38 @@ mod archive_delete_tests {
     }
 
     #[tokio::test]
-    async fn archive_cache_delete_failure_is_returned() {
+    async fn archive_cache_file_target_is_also_removed() {
         let path = std::env::temp_dir().join(format!(
             "shadowreplay-archive-file-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"not a directory").unwrap();
 
-        let error = remove_archive_cache_dir(&path).await.unwrap_err();
+        remove_archive_cache_dir(&path).await.unwrap();
 
-        assert!(error.to_string().contains("无法删除录播缓存"));
-        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn archive_cache_is_staged_before_slow_recursive_deletion() {
+        let path = std::env::temp_dir().join(format!(
+            "shadowreplay-stage-archive-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        for index in 0..32 {
+            std::fs::write(path.join(format!("segment-{index}.ts")), b"data").unwrap();
+        }
+
+        let staged = stage_archive_cache_dir(&path)
+            .await
+            .unwrap()
+            .expect("existing cache should be staged");
+
+        assert!(!path.exists());
+        assert!(staged.exists());
+        remove_archive_cache_dir(&staged).await.unwrap();
+        assert!(!staged.exists());
     }
 }
 
@@ -2217,17 +2274,51 @@ impl RecorderManager {
             .join(platform.as_str())
             .join(room_id)
             .join(live_id);
-        remove_archive_cache_dir(&cache_folder).await?;
-        let deleted_task_count = self
-            .db
-            .delete_archive_tasks(platform.as_str(), room_id, live_id)
-            .await?;
-        if deleted_task_count > 0 {
-            log::info!(
-                "Deleted {deleted_task_count} task(s) linked to archive {room_id}:{live_id}"
-            );
+        let staged_cache = stage_archive_cache_dir(&cache_folder).await?;
+        let index_result: Result<Option<RecordRow>, RecorderManagerError> = async {
+            let deleted_task_count = self
+                .db
+                .delete_archive_tasks(platform.as_str(), room_id, live_id)
+                .await?;
+            if deleted_task_count > 0 {
+                log::info!(
+                    "Deleted {deleted_task_count} task(s) linked to archive {room_id}:{live_id}"
+                );
+            }
+            self.db
+                .try_remove_record(room_id, live_id)
+                .await
+                .map_err(RecorderManagerError::from)
         }
-        if let Some(to_delete) = self.db.try_remove_record(room_id, live_id).await? {
+        .await;
+
+        let to_delete = match index_result {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(staged) = staged_cache.as_ref() {
+                    if let Err(restore_error) = tokio::fs::rename(staged, &cache_folder).await {
+                        log::error!(
+                            "Failed to restore staged archive cache {} -> {}: {restore_error}",
+                            staged.display(),
+                            cache_folder.display()
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        if let Some(staged) = staged_cache {
+            tokio::spawn(async move {
+                if let Err(error) = remove_archive_cache_dir(&staged).await {
+                    log::error!(
+                        "Background archive cache cleanup failed for {}: {error}",
+                        staged.display()
+                    );
+                }
+            });
+        }
+        if let Some(to_delete) = to_delete {
             return Ok(to_delete);
         }
         log::warn!(
