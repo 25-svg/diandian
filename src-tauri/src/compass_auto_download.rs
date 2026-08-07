@@ -1,6 +1,8 @@
-const COMPASS_LIVE_OVERVIEW_URL: &str = "https://compass.jinritemai.com/shop/live-overview?from_page=%2Fshop";
+const COMPASS_LIVE_OVERVIEW_URL: &str =
+    "https://compass.jinritemai.com/shop/live-overview?from_page=%2Fshop";
 const COMPASS_EVENT_URL_PREFIX: &str =
     "https://compass.jinritemai.com/__bsr_compass_event__?payload=";
+const COMPASS_TARGET_SHOPS: [&str; 2] = ["金典拍拍科创专卖店", "金典拍拍相机专卖店"];
 
 #[cfg(feature = "gui")]
 use crate::state::State;
@@ -40,10 +42,26 @@ pub fn compass_event_payload_from_url(value: &str) -> Option<&str> {
         .filter(|payload| !payload.is_empty())
 }
 
-pub fn build_compass_automation_script(target_date: &str) -> Result<String, String> {
+pub fn validate_compass_shop(value: &str) -> Result<String, String> {
+    if COMPASS_TARGET_SHOPS.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err("下载店铺无效，请选择科创店或相机店".to_string())
+    }
+}
+
+pub fn build_compass_automation_script(
+    target_date: &str,
+    target_shop_name: &str,
+) -> Result<String, String> {
     let target_date = validate_compass_date(target_date)?;
+    let target_shop_name = validate_compass_shop(target_shop_name)?;
     let target_json = format!("\"{target_date}\"");
-    Ok(COMPASS_AUTOMATION_SCRIPT.replace("__TARGET_DATE_JSON__", &target_json))
+    let shop_json = serde_json::to_string(&target_shop_name)
+        .map_err(|error| format!("店铺名称编码失败：{error}"))?;
+    Ok(COMPASS_AUTOMATION_SCRIPT
+        .replace("__TARGET_DATE_JSON__", &target_json)
+        .replace("__TARGET_SHOP_JSON__", &shop_json))
 }
 
 pub fn build_compass_import_notification_script(started_at: &str) -> Result<String, String> {
@@ -54,7 +72,9 @@ pub fn build_compass_import_notification_script(started_at: &str) -> Result<Stri
     {
         return Err("直播开始时间格式无效".to_string());
     }
-    Ok(format!("window.__BSR_COMPASS_IMPORTED__?.({started_at:?});"))
+    Ok(format!(
+        "window.__BSR_COMPASS_IMPORTED__?.({started_at:?});"
+    ))
 }
 
 #[cfg(feature = "gui")]
@@ -71,10 +91,12 @@ pub fn notify_compass_imported(app: &tauri::AppHandle, started_at: &str) {
 const COMPASS_AUTOMATION_SCRIPT: &str = r#"
 (() => {
   const targetDate = __TARGET_DATE_JSON__;
-  const storageKey = 'bsr:compass-auto-download:v2';
+  const targetShopName = __TARGET_SHOP_JSON__;
+  const allowedShopNames = ['金典拍拍科创专卖店', '金典拍拍相机专卖店'];
+  const storageKey = 'bsr:compass-auto-download:v3';
   const autoStart = new URLSearchParams(location.hash.slice(1)).get('bsrAutoStart') === '1';
   const emit = (payload) => {
-    const enriched = { targetDate, ...payload };
+    const enriched = { targetDate, targetShopName, ...payload };
     document.title = `BSR_COMPASS:${encodeURIComponent(JSON.stringify(enriched))}`;
     try {
       window.__TAURI_INTERNALS__?.invoke?.('plugin:event|emit', {
@@ -87,13 +109,56 @@ const COMPASS_AUTOMATION_SCRIPT: &str = r#"
   };
   const visible = (node) => node && node.getClientRects().length > 0;
   const text = (node) => (node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
-  const exactText = (label, root = document) => Array.from(root.querySelectorAll('button,a,label,[role="button"],span,div'))
-    .find((node) => visible(node) && text(node) === label);
+  const exactTextNodes = (label, root = document) => Array.from(root.querySelectorAll('button,a,label,[role="button"],span,div'))
+    .filter((node) => visible(node) && text(node) === label);
+  const exactText = (label, root = document) => exactTextNodes(label, root)[0];
   const clickTarget = (node) => {
     const target = node?.closest?.('button,a,label,[role="button"]') || node;
     if (!target) return false;
+    const eventInit = { bubbles: true, cancelable: true, view: window };
+    try { target.dispatchEvent(new PointerEvent('pointerdown', eventInit)); } catch (_) {}
+    target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+    try { target.dispatchEvent(new PointerEvent('pointerup', eventInit)); } catch (_) {}
+    target.dispatchEvent(new MouseEvent('mouseup', eventInit));
     target.click();
     return true;
+  };
+  const findHeaderShopTrigger = () => {
+    const candidates = allowedShopNames.flatMap((shopName) => exactTextNodes(shopName));
+    candidates.sort((left, right) => {
+      const a = left.getBoundingClientRect();
+      const b = right.getBoundingClientRect();
+      return a.top - b.top || b.right - a.right || (a.width * a.height) - (b.width * b.height);
+    });
+    const label = candidates[0];
+    if (!label) return null;
+    let node = label;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const role = node.getAttribute?.('role') || '';
+      const cursor = getComputedStyle(node).cursor;
+      if (node.matches?.('button,a,label,[role="button"]') || role === 'button' || cursor === 'pointer') return node;
+    }
+    return label;
+  };
+  const findShopChoiceCard = (shopName) => {
+    const labels = exactTextNodes(shopName);
+    for (const label of labels) {
+      let node = label;
+      for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+        const rect = node.getBoundingClientRect();
+        if (rect.width >= 250 && rect.height >= 55 && rect.height <= 150) return node;
+      }
+    }
+    return labels[0] || null;
+  };
+  const headerShowsShop = (shopName) => exactTextNodes(shopName)
+    .some((node) => node.getBoundingClientRect().top < 120);
+  const findTopNavigation = (label) => {
+    const nodes = exactTextNodes(label)
+      .filter((node) => node.getBoundingClientRect().top < 120)
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+    const node = nodes[0];
+    return node?.closest?.('button,a,label,[role="button"]') || node || null;
   };
   const hoverTarget = (node) => {
     const target = node?.closest?.('label,button,a,[role="button"]') || node;
@@ -120,12 +185,12 @@ const COMPASS_AUTOMATION_SCRIPT: &str = r#"
       const startedAt = normalizeTime(match[1]);
       const endedAt = normalizeTime(match[2]);
       const firstLine = (row.innerText || '').split('\n').map((part) => part.trim()).find(Boolean) || '抖音直播间';
-      const key = `${firstLine}|${startedAt}|${endedAt}`;
+      const key = `${targetShopName}|${startedAt}|${endedAt}`;
       if (unique.has(key)) continue;
       const orderMatch = value.match(/(?:成交订单数)?\s*(\d+)\s*(?:净成交订单数|诊断|详情)/);
       const amountMatch = value.match(/¥[\d,.]+(?:万)?/g);
       unique.set(key, {
-        key, row, shopName: firstLine, startedAt, endedAt,
+        key, row, shopName: targetShopName, title: firstLine, startedAt, endedAt,
         orderCount: orderMatch ? Number(orderMatch[1]) : null,
         paymentAmountText: amountMatch?.at(-1) || ''
       });
@@ -135,9 +200,9 @@ const COMPASS_AUTOMATION_SCRIPT: &str = r#"
   const state = (() => {
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
-      if (saved.targetDate === targetDate) return saved;
+      if (saved.targetDate === targetDate && saved.targetShopName === targetShopName) return saved;
     } catch (_) {}
-    return { targetDate, completed: [], activeKey: null };
+    return { targetDate, targetShopName, completed: [], activeKey: null, shopConfirmed: false };
   })();
   const save = () => localStorage.setItem(storageKey, JSON.stringify(state));
   window.__BSR_COMPASS_IMPORTED__ = (startedAt) => {
@@ -154,6 +219,9 @@ const COMPASS_AUTOMATION_SCRIPT: &str = r#"
   let selectionPending = false;
   let navigationPending = false;
   let detailDownloadTriggered = false;
+  let shopSelectionPending = false;
+  let shopChoicePending = false;
+  let liveNavigationPending = false;
   let currentPageKind = '';
   const setInputValue = (input, value) => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
@@ -279,12 +347,13 @@ const COMPASS_AUTOMATION_SCRIPT: &str = r#"
       requestDateFilter();
       return;
     }
-    emit({ status: 'sessions-found', message: `找到 ${sessions.length} 场直播`, sessions: sessions.map(({ row, ...session }) => session) });
+    const matchingSessions = sessions;
+    emit({ status: 'sessions-found', message: `${targetShopName}：找到 ${matchingSessions.length} 场直播`, sessions: matchingSessions.map(({ row, ...session }) => session) });
     if (!autoStart) return;
     if (navigationPending) return;
-    const next = sessions.find((session) => !state.completed.includes(session.key));
+    const next = matchingSessions.find((session) => !state.completed.includes(session.key));
     if (!next) {
-      emit({ status: 'batch-finished', message: `当天 ${sessions.length} 场直播已全部触发下载`, sessions: sessions.map(({ row, ...session }) => session) });
+      emit({ status: 'batch-finished', message: `${targetShopName} 当天 ${matchingSessions.length} 场直播已全部触发下载`, sessions: matchingSessions.map(({ row, ...session }) => session) });
       return;
     }
     state.activeKey = next.key;
@@ -325,7 +394,85 @@ const COMPASS_AUTOMATION_SCRIPT: &str = r#"
   const run = () => {
     if (!location.hostname.endsWith('jinritemai.com')) return;
     const pageText = text(document.body);
+    if (pageText.includes('请选择店铺')) {
+      shopSelectionPending = false;
+      const targetShop = findShopChoiceCard(targetShopName);
+      if (!targetShop) {
+        emit({ status: 'shop-unavailable', message: `当前账号无“${targetShopName}”店铺权限` });
+        return;
+      }
+      if (!shopChoicePending) {
+        shopChoicePending = true;
+        state.shopConfirmed = true;
+        save();
+        clickTarget(targetShop);
+        emit({ status: 'switching-shop', message: `正在进入${targetShopName}` });
+        setTimeout(() => {
+          shopChoicePending = false;
+          run();
+        }, 1000);
+      }
+      return;
+    }
     const pageKind = pageText.includes('直播间详情') ? 'detail' : pageText.includes('直播间列表') ? 'list' : 'other';
+    if (pageKind === 'other' && headerShowsShop(targetShopName)) {
+      if (!state.shopConfirmed) {
+        state.shopConfirmed = true;
+        save();
+      }
+      if (liveNavigationPending) return;
+      const liveList = exactText('直播间列表');
+      const liveNavigation = findTopNavigation('直播');
+      liveNavigationPending = true;
+      if (liveList && clickTarget(liveList)) {
+        emit({ status: 'opening', message: '正在进入直播间列表' });
+      } else if (liveNavigation) {
+        hoverTarget(liveNavigation);
+        clickTarget(liveNavigation);
+        emit({ status: 'opening', message: '正在打开顶部“直播”菜单' });
+      } else {
+        liveNavigationPending = false;
+        emit({ status: 'shop-mismatch', message: '店铺已切换，但未找到顶部“直播”入口' });
+        return;
+      }
+      setTimeout(() => {
+        liveNavigationPending = false;
+        run();
+      }, 900);
+      return;
+    }
+    if (pageKind === 'list' || pageKind === 'detail') {
+      const visibleTargetShop = exactText(targetShopName);
+      const visibleOtherShop = allowedShopNames
+        .filter((shopName) => shopName !== targetShopName)
+        .map((shopName) => ({ shopName, node: exactText(shopName) }))
+        .find((item) => item.node);
+      if (visibleTargetShop && !state.shopConfirmed) {
+        state.shopConfirmed = true;
+        save();
+      }
+      if (visibleOtherShop || !state.shopConfirmed) {
+        const currentShop = visibleOtherShop?.shopName || '上次使用的店铺';
+        if (shopSelectionPending) return;
+        const switchDataView = exactText('切换数据视角');
+        shopSelectionPending = true;
+        if (switchDataView) {
+          clickTarget(switchDataView);
+          emit({ status: 'switching-shop', message: `正在从${currentShop}切换到${targetShopName}` });
+          setTimeout(() => { shopSelectionPending = false; }, 1200);
+          return;
+        }
+        const currentShopEntry = findHeaderShopTrigger();
+        if (clickTarget(currentShopEntry)) {
+          emit({ status: 'switching-shop', message: '正在打开“切换数据视角”菜单' });
+          setTimeout(() => { shopSelectionPending = false; }, 500);
+          return;
+        }
+        shopSelectionPending = false;
+        emit({ status: 'shop-mismatch', message: `未找到“切换数据视角”，请确认右上角店铺菜单可用` });
+        return;
+      }
+    }
     if (pageKind !== currentPageKind) {
       const previousPageKind = currentPageKind;
       currentPageKind = pageKind;
@@ -394,6 +541,7 @@ fn allow_compass_multiple_downloads(window: &tauri::WebviewWindow) {
 fn open_compass_window(
     app: &tauri::AppHandle,
     target_date: &str,
+    target_shop_name: &str,
     auto_start: bool,
 ) -> Result<(), String> {
     use tauri::{Emitter, Manager};
@@ -402,8 +550,13 @@ fn open_compass_window(
     if let Some(existing) = app.get_webview_window(LABEL) {
         existing.close().map_err(|error| error.to_string())?;
     }
-    let script = build_compass_automation_script(target_date)?;
-    let suffix = if auto_start { "#bsrAutoStart=1" } else { "#bsrAutoStart=0" };
+    let target_shop_name = validate_compass_shop(target_shop_name)?;
+    let script = build_compass_automation_script(target_date, &target_shop_name)?;
+    let suffix = if auto_start {
+        "#bsrAutoStart=1"
+    } else {
+        "#bsrAutoStart=0"
+    };
     let url = format!("{COMPASS_LIVE_OVERVIEW_URL}{suffix}");
     if !is_allowed_compass_url(&url) {
         return Err("罗盘地址不在允许范围内".to_string());
@@ -412,12 +565,19 @@ fn open_compass_window(
     let window = tauri::WebviewWindowBuilder::new(
         app,
         LABEL,
-        tauri::WebviewUrl::External(url.parse().map_err(|error| format!("罗盘地址无效：{error}"))?),
+        tauri::WebviewUrl::External(
+            url.parse()
+                .map_err(|error| format!("罗盘地址无效：{error}"))?,
+        ),
     )
-    .title("抖音罗盘 · 直播大屏自动下载")
+    .title(format!("抖音罗盘 · {target_shop_name} · 自动下载"))
     .inner_size(1380.0, 900.0)
     .center()
     .initialization_script(&script)
+    .on_download(|_, _| {
+        // 接管 WebView2 下载，保留后台下载但不显示浏览器下载侧栏。
+        true
+    })
     .on_navigation(move |navigation_url| {
         if let Some(encoded) = compass_event_payload_from_url(navigation_url.as_str()) {
             if let Ok(decoded) = urlencoding::decode(encoded) {
@@ -440,14 +600,24 @@ fn open_compass_window(
         let mut last_title = String::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let Some(window) = app_handle.get_webview_window(LABEL) else { break };
+            let Some(window) = app_handle.get_webview_window(LABEL) else {
+                break;
+            };
             let Ok(title) = window.title() else { continue };
-            if title == last_title { continue }
-            let Some(encoded) = title.strip_prefix("BSR_COMPASS:") else { continue };
+            if title == last_title {
+                continue;
+            }
+            let Some(encoded) = title.strip_prefix("BSR_COMPASS:") else {
+                continue;
+            };
             let encoded = encoded.to_string();
             last_title = title;
-            let Ok(decoded) = urlencoding::decode(&encoded) else { continue };
-            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&decoded) else { continue };
+            let Ok(decoded) = urlencoding::decode(&encoded) else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&decoded) else {
+                continue;
+            };
             let _ = app_handle.emit("compass-auto-download-progress", payload);
         }
     });
@@ -459,8 +629,9 @@ fn open_compass_window(
 pub async fn query_compass_live_sessions(
     state: crate::state_type!(),
     target_date: String,
+    target_shop_name: String,
 ) -> Result<(), String> {
-    open_compass_window(&state.app_handle, &target_date, false)
+    open_compass_window(&state.app_handle, &target_date, &target_shop_name, false)
 }
 
 #[cfg(feature = "gui")]
@@ -468,8 +639,9 @@ pub async fn query_compass_live_sessions(
 pub async fn start_compass_live_downloads(
     state: crate::state_type!(),
     target_date: String,
+    target_shop_name: String,
 ) -> Result<(), String> {
-    open_compass_window(&state.app_handle, &target_date, true)
+    open_compass_window(&state.app_handle, &target_date, &target_shop_name, true)
 }
 
 #[cfg(feature = "gui")]
@@ -502,14 +674,17 @@ mod tests {
         assert!(is_allowed_compass_url(
             "https://compass.jinritemai.com/shop/live-overview?from_page=%2Fshop"
         ));
-        assert!(!is_allowed_compass_url("https://example.com/shop/live-overview"));
+        assert!(!is_allowed_compass_url(
+            "https://example.com/shop/live-overview"
+        ));
         assert!(!is_allowed_compass_url("javascript:alert(1)"));
     }
 
     #[test]
     fn generated_script_contains_only_json_encoded_date() {
-        let script = build_compass_automation_script("2026-07-28").unwrap();
+        let script = build_compass_automation_script("2026-07-28", "金典拍拍相机专卖店").unwrap();
         assert!(script.contains("2026-07-28"));
+        assert!(script.contains("金典拍拍相机专卖店"));
         assert!(script.contains("compass-auto-download-progress"));
         assert!(script.contains("if (!document.documentElement)"));
         assert!(script.contains("findMonthPanel"));
@@ -517,18 +692,33 @@ mod tests {
         assert!(script.contains("filterApplied"));
         assert!(script.contains("navigationPending"));
         assert!(script.contains("detailDownloadTriggered"));
+        assert!(script.contains("切换数据视角"));
+        assert!(script.contains("正在打开“切换数据视角”菜单"));
+        assert!(script.contains("findHeaderShopTrigger"));
+        assert!(script.contains("findShopChoiceCard"));
+        assert!(script.contains("headerShowsShop"));
+        assert!(script.contains("正在打开顶部“直播”菜单"));
+        assert!(script.contains("PointerEvent('pointerdown'"));
+        assert!(script.contains("shopConfirmed"));
         assert!(!script.contains("{{TARGET_DATE}}"));
     }
 
     #[test]
+    fn accepts_only_the_two_configured_download_shops() {
+        assert!(validate_compass_shop("金典拍拍科创专卖店").is_ok());
+        assert!(validate_compass_shop("金典拍拍相机专卖店").is_ok());
+        assert!(validate_compass_shop("其他店铺").is_err());
+    }
+
+    #[test]
     fn generated_script_uses_hover_and_exact_date_cells() {
-        let script = build_compass_automation_script("2026-07-29").unwrap();
+        let script = build_compass_automation_script("2026-07-29", "金典拍拍科创专卖店").unwrap();
         assert!(script.contains("mouseenter"));
         assert!(script.contains("td[title=\"${targetDate}\"]"));
         assert!(script.contains("setTimeout(selectEndDate, 700)"));
         assert!(script.contains("data-subway-href"));
         assert!(script.contains("setTimeout(() => location.assign(detailUrl.href), 120)"));
-        assert!(script.contains("bsr:compass-auto-download:v2"));
+        assert!(script.contains("bsr:compass-auto-download:v3"));
         assert!(script.contains("window.__BSR_COMPASS_IMPORTED__"));
         assert!(!script.contains("setTimeout(() => history.back(), 4500)"));
     }

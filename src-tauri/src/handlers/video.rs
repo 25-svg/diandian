@@ -2321,6 +2321,679 @@ pub async fn generate_video_subtitle(
     generate_video_subtitle_inner(&state, event_id, id).await
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DealTranscriptWindowRequest {
+    pub start_sec: f64,
+    pub end_sec: f64,
+}
+
+fn deal_window_subtitle_path(context: &CanonicalVideoTranscriptContext) -> PathBuf {
+    context.artifact_dir.join("deal-windows.srt")
+}
+
+fn validate_deal_transcript_windows(ranges: &[DealTranscriptWindowRequest]) -> Result<f64, String> {
+    if ranges.is_empty() {
+        return Err("没有可转写的成交时间窗口，请先导入成交订单。".to_string());
+    }
+    if ranges.len() > 100 {
+        return Err("一次最多识别 100 个成交时间窗口。".to_string());
+    }
+    let mut total_duration = 0.0;
+    let mut previous_end = 0.0;
+    for (index, range) in ranges.iter().enumerate() {
+        if !(range.start_sec.is_finite()
+            && range.end_sec.is_finite()
+            && range.start_sec >= 0.0
+            && range.end_sec > range.start_sec)
+        {
+            return Err(format!("第 {} 个成交时间窗口无效。", index + 1));
+        }
+        if index > 0 && range.start_sec < previous_end {
+            return Err("成交时间窗口必须按时间排序且不能重叠。".to_string());
+        }
+        total_duration += range.end_sec - range.start_sec;
+        previous_end = range.end_sec;
+    }
+    Ok(total_duration)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_video_deal_window_subtitle(
+    state: state_type!(),
+    id: i64,
+) -> Result<String, String> {
+    let context = resolve_video_transcript_context(&state, id).await?;
+    let path = deal_window_subtitle_path(&context);
+    if !path.is_file() {
+        return Ok(String::new());
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("读取成交窗口逐字稿失败: {error}"))
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_video_deal_window_partial_subtitle(
+    state: state_type!(),
+    id: i64,
+) -> Result<String, String> {
+    let context = resolve_video_transcript_context(&state, id).await?;
+    let complete = deal_window_subtitle_path(&context);
+    let path = if complete.is_file() {
+        complete
+    } else {
+        context.artifact_dir.join("deal-windows.partial.srt")
+    };
+    if !path.is_file() {
+        return Ok(String::new());
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("读取部分成交窗口逐字稿失败: {error}"))
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveProductScanProduct {
+    pub id: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveProductMentionScanItem {
+    pub id: String,
+    pub name: String,
+    pub mention_count: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveProductMentionScanSnapshot {
+    pub version: u32,
+    pub video_id: i64,
+    pub catalog_signature: String,
+    pub status: String,
+    pub processed_duration_sec: f64,
+    pub total_duration_sec: f64,
+    pub products: Vec<LiveProductMentionScanItem>,
+    pub error: Option<String>,
+}
+
+fn live_product_scan_path(context: &CanonicalVideoTranscriptContext) -> PathBuf {
+    context.artifact_dir.join("full-live-product-mentions.json")
+}
+
+fn normalize_product_scan_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn validate_live_product_scan_catalog(
+    products: &[LiveProductScanProduct],
+) -> Result<Vec<LiveProductScanProduct>, String> {
+    if products.is_empty() {
+        return Err("本场没有可用于识别的订单商品。".to_string());
+    }
+    if products.len() > 200 {
+        return Err("单场最多扫描 200 个订单商品。".to_string());
+    }
+    let mut validated = Vec::with_capacity(products.len());
+    for product in products {
+        let id = product.id.trim().to_string();
+        let name = product.name.trim().to_string();
+        let mut aliases = product
+            .aliases
+            .iter()
+            .map(|alias| normalize_product_scan_text(alias))
+            .filter(|alias| alias.len() >= 2)
+            .collect::<Vec<_>>();
+        aliases.sort();
+        aliases.dedup();
+        if id.is_empty() || name.is_empty() || aliases.is_empty() {
+            continue;
+        }
+        validated.push(LiveProductScanProduct { id, name, aliases });
+    }
+    if validated.is_empty() {
+        return Err("订单商品名称清洗后没有可识别的型号。".to_string());
+    }
+    Ok(validated)
+}
+
+fn sorted_live_product_scan_items(
+    catalog: &[LiveProductScanProduct],
+    counts: &[u64],
+) -> Vec<LiveProductMentionScanItem> {
+    let mut items = catalog
+        .iter()
+        .zip(counts.iter().copied())
+        .map(|(product, mention_count)| LiveProductMentionScanItem {
+            id: product.id.clone(),
+            name: product.name.clone(),
+            mention_count,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .mention_count
+            .cmp(&left.mention_count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    items
+}
+
+async fn read_live_product_scan_snapshot(
+    context: &CanonicalVideoTranscriptContext,
+) -> Result<Option<LiveProductMentionScanSnapshot>, String> {
+    let path = live_product_scan_path(context);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("读取整场商品统计失败: {error}"))?;
+    serde_json::from_slice(&content)
+        .map(Some)
+        .map_err(|error| format!("解析整场商品统计失败: {error}"))
+}
+
+async fn write_live_product_scan_snapshot(
+    context: &CanonicalVideoTranscriptContext,
+    snapshot: &LiveProductMentionScanSnapshot,
+) -> Result<(), String> {
+    tokio::fs::create_dir_all(&context.artifact_dir)
+        .await
+        .map_err(|error| format!("创建整场商品统计目录失败: {error}"))?;
+    let destination = live_product_scan_path(context);
+    let temporary = context
+        .artifact_dir
+        .join(".full-live-product-mentions.json.tmp");
+    let content = serde_json::to_vec_pretty(snapshot)
+        .map_err(|error| format!("序列化整场商品统计失败: {error}"))?;
+    tokio::fs::write(&temporary, content)
+        .await
+        .map_err(|error| format!("保存整场商品统计失败: {error}"))?;
+    if destination.is_file() {
+        tokio::fs::remove_file(&destination)
+            .await
+            .map_err(|error| format!("更新整场商品统计失败: {error}"))?;
+    }
+    tokio::fs::rename(&temporary, &destination)
+        .await
+        .map_err(|error| format!("提交整场商品统计失败: {error}"))
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_video_product_mention_scan(
+    state: state_type!(),
+    id: i64,
+    catalog_signature: String,
+) -> Result<LiveProductMentionScanSnapshot, String> {
+    let context = resolve_video_transcript_context(&state, id).await?;
+    if let Some(snapshot) = read_live_product_scan_snapshot(&context).await? {
+        if snapshot.catalog_signature == catalog_signature {
+            return Ok(snapshot);
+        }
+    }
+    let total_duration_sec =
+        ffmpeg::probe_media_duration_ms(&context.media_file).await? as f64 / 1000.0;
+    Ok(LiveProductMentionScanSnapshot {
+        version: 1,
+        video_id: context.video_id,
+        catalog_signature,
+        status: "idle".to_string(),
+        processed_duration_sec: 0.0,
+        total_duration_sec,
+        products: Vec::new(),
+        error: None,
+    })
+}
+
+/// Scan the complete original video in fixed audio chunks. Only per-product
+/// sentence counts are persisted; existing subtitles and order rows are never changed.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn generate_video_product_mention_scan(
+    state: state_type!(),
+    event_id: String,
+    id: i64,
+    catalog_signature: String,
+    products: Vec<LiveProductScanProduct>,
+    force: bool,
+) -> Result<LiveProductMentionScanSnapshot, String> {
+    let catalog = validate_live_product_scan_catalog(&products)?;
+    let context = resolve_video_transcript_context(&state, id).await?;
+    let total_duration_sec =
+        ffmpeg::probe_media_duration_ms(&context.media_file).await? as f64 / 1000.0;
+    if total_duration_sec <= 0.0 {
+        return Err("无法读取整场直播时长。".to_string());
+    }
+    let existing = read_live_product_scan_snapshot(&context).await?;
+    if !force {
+        if let Some(snapshot) = existing.as_ref() {
+            if snapshot.catalog_signature == catalog_signature && snapshot.status == "completed" {
+                return Ok(snapshot.clone());
+            }
+        }
+    }
+
+    let mut counts = vec![0_u64; catalog.len()];
+    let mut processed_duration_sec = 0.0;
+    if !force {
+        if let Some(snapshot) = existing.as_ref() {
+            if snapshot.catalog_signature == catalog_signature {
+                processed_duration_sec = snapshot
+                    .processed_duration_sec
+                    .clamp(0.0, total_duration_sec);
+                for (index, product) in catalog.iter().enumerate() {
+                    counts[index] = snapshot
+                        .products
+                        .iter()
+                        .find(|item| item.id == product.id)
+                        .map(|item| item.mention_count)
+                        .unwrap_or_default();
+                }
+            }
+        }
+    }
+
+    let task = TaskRow {
+        id: event_id.clone(),
+        task_type: "generate_video_product_mention_scan".to_string(),
+        status: "pending".to_string(),
+        message: "整场商品扫描正在排队".to_string(),
+        metadata: json!({
+            "video_id": id,
+            "catalog_signature": catalog_signature,
+            "product_count": catalog.len(),
+            "processed_duration_sec": processed_duration_sec,
+            "total_duration_sec": total_duration_sec,
+        })
+        .to_string(),
+        created_at: Utc::now().to_rfc3339(),
+    };
+    state.db.add_task(&task).await?;
+
+    #[cfg(feature = "gui")]
+    let emitter = EventEmitter::new(state.app_handle.clone());
+    #[cfg(feature = "headless")]
+    let emitter = EventEmitter::new(state.progress_manager.get_event_sender());
+    let reporter = ProgressReporter::new(state.db.clone(), &emitter, &event_id).await?;
+    reporter.update("整场商品扫描正在等待媒体任务").await;
+    let temp_dir = std::env::temp_dir().join(format!("bsr-product-scan-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|error| format!("创建整场商品扫描目录失败: {error}"))?;
+    let hotwords = catalog
+        .iter()
+        .flat_map(|product| {
+            std::iter::once(product.name.as_str()).chain(product.aliases.iter().map(String::as_str))
+        })
+        .take(500)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let generation_result: Result<LiveProductMentionScanSnapshot, String> = async {
+        let asr = crate::subtitle_generator::funasr::FunAsr::new().await?;
+        const CHUNK_DURATION_SEC: f64 = 300.0;
+        let total_chunks = (total_duration_sec / CHUNK_DURATION_SEC).ceil().max(1.0) as usize;
+        let mut chunk_index = (processed_duration_sec / CHUNK_DURATION_SEC).floor() as usize;
+        while processed_duration_sec < total_duration_sec {
+            let duration_sec = CHUNK_DURATION_SEC.min(total_duration_sec - processed_duration_sec);
+            reporter
+                .update(&format!(
+                    "正在扫描整场商品 {}/{}（已完成 {:.1}%）",
+                    chunk_index + 1,
+                    total_chunks,
+                    processed_duration_sec / total_duration_sec * 100.0
+                ))
+                .await;
+            let segment_path = temp_dir.join(format!("product-scan-{chunk_index:04}.wav"));
+            // Only FFmpeg extraction uses the shared media gate. Releasing it
+            // before ASR keeps cutting and playback preparation responsive.
+            let media_permit = state
+                .media_execution_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "media execution gate is closed".to_string())?;
+            ffmpeg::extract_audio_segment(
+                &context.media_file,
+                processed_duration_sec,
+                duration_sec,
+                &segment_path,
+            )
+            .await?;
+            drop(media_permit);
+            let response = asr
+                .transcribe_with_hotwords(&segment_path, None, &hotwords)
+                .await?;
+            let segments = if response.segments.is_empty() {
+                &response.raw_segments
+            } else {
+                &response.segments
+            };
+            for segment in segments {
+                let text = normalize_product_scan_text(&segment.text);
+                if text.is_empty() {
+                    continue;
+                }
+                for (index, product) in catalog.iter().enumerate() {
+                    if product.aliases.iter().any(|alias| text.contains(alias)) {
+                        counts[index] = counts[index].saturating_add(1);
+                    }
+                }
+            }
+            let _ = tokio::fs::remove_file(&segment_path).await;
+            processed_duration_sec =
+                (processed_duration_sec + duration_sec).min(total_duration_sec);
+            chunk_index += 1;
+            let snapshot = LiveProductMentionScanSnapshot {
+                version: 1,
+                video_id: context.video_id,
+                catalog_signature: catalog_signature.clone(),
+                status: "processing".to_string(),
+                processed_duration_sec,
+                total_duration_sec,
+                products: sorted_live_product_scan_items(&catalog, &counts),
+                error: None,
+            };
+            write_live_product_scan_snapshot(&context, &snapshot).await?;
+        }
+        let snapshot = LiveProductMentionScanSnapshot {
+            version: 1,
+            video_id: context.video_id,
+            catalog_signature: catalog_signature.clone(),
+            status: "completed".to_string(),
+            processed_duration_sec: total_duration_sec,
+            total_duration_sec,
+            products: sorted_live_product_scan_items(&catalog, &counts),
+            error: None,
+        };
+        write_live_product_scan_snapshot(&context, &snapshot).await?;
+        Ok(snapshot)
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    match generation_result {
+        Ok(snapshot) => {
+            reporter.finish(true, "整场高频商品 TOP5 统计完成").await;
+            state
+                .db
+                .update_task(
+                    &event_id,
+                    "success",
+                    "整场高频商品 TOP5 统计完成",
+                    Some(
+                        json!({
+                            "video_id": id,
+                            "catalog_signature": catalog_signature,
+                            "processed_duration_sec": total_duration_sec,
+                            "total_duration_sec": total_duration_sec,
+                        })
+                        .to_string()
+                        .as_str(),
+                    ),
+                )
+                .await?;
+            Ok(snapshot)
+        }
+        Err(error) => {
+            let snapshot = LiveProductMentionScanSnapshot {
+                version: 1,
+                video_id: context.video_id,
+                catalog_signature: catalog_signature.clone(),
+                status: "failed".to_string(),
+                processed_duration_sec,
+                total_duration_sec,
+                products: sorted_live_product_scan_items(&catalog, &counts),
+                error: Some(error.clone()),
+            };
+            let _ = write_live_product_scan_snapshot(&context, &snapshot).await;
+            reporter
+                .finish(false, &format!("整场商品扫描失败: {error}"))
+                .await;
+            state
+                .db
+                .update_task(
+                    &event_id,
+                    "failed",
+                    &format!("整场商品扫描失败: {error}"),
+                    None,
+                )
+                .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Transcribe only merged windows around paid orders. Returned SRT timestamps
+/// are shifted back to the original full-video clock so seeking and clipping
+/// keep using one timeline.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn generate_video_deal_window_subtitle(
+    state: state_type!(),
+    event_id: String,
+    id: i64,
+    ranges: Vec<DealTranscriptWindowRequest>,
+) -> Result<String, String> {
+    let total_duration = validate_deal_transcript_windows(&ranges)?;
+    let context = resolve_video_transcript_context(&state, id).await?;
+    let task = TaskRow {
+        id: event_id.clone(),
+        task_type: "generate_video_deal_window_subtitle".to_string(),
+        status: "pending".to_string(),
+        message: format!(
+            "等待转写 {} 个成交窗口，共 {:.1} 分钟",
+            ranges.len(),
+            total_duration / 60.0
+        ),
+        metadata: json!({
+            "video_id": id,
+            "range_count": ranges.len(),
+            "audio_duration_sec": total_duration,
+        })
+        .to_string(),
+        created_at: Utc::now().to_rfc3339(),
+    };
+    state.db.add_task(&task).await?;
+
+    #[cfg(feature = "gui")]
+    let emitter = EventEmitter::new(state.app_handle.clone());
+    #[cfg(feature = "headless")]
+    let emitter = EventEmitter::new(state.progress_manager.get_event_sender());
+    let reporter = ProgressReporter::new(state.db.clone(), &emitter, &event_id).await?;
+    reporter.update("成交窗口转写正在排队").await;
+    let _media_permit = state
+        .media_execution_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| "media execution gate is closed".to_string())?;
+
+    let (
+        generator_type,
+        whisper_model,
+        whisper_prompt,
+        openai_api_key,
+        openai_api_endpoint,
+        language_hint,
+    ) = {
+        let config = state.config.read().await;
+        (
+            config.subtitle_generator_type.clone(),
+            config.whisper_model.clone(),
+            config.whisper_prompt.clone(),
+            config.openai_api_key.clone(),
+            config.openai_api_endpoint.clone(),
+            config.whisper_language.clone(),
+        )
+    };
+    let temp_dir = std::env::temp_dir().join(format!("bsr-deal-asr-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|error| format!("创建成交窗口转写目录失败: {error}"))?;
+    let mut combined: Option<crate::subtitle_generator::GenerateResult> = None;
+    let mut work_chunks = Vec::new();
+    const MAX_ASR_CHUNK_SEC: f64 = 60.0;
+    for range in &ranges {
+        let mut start_sec = range.start_sec;
+        while start_sec < range.end_sec {
+            let end_sec = (start_sec + MAX_ASR_CHUNK_SEC).min(range.end_sec);
+            work_chunks.push((start_sec, end_sec));
+            start_sec = end_sec;
+        }
+    }
+    let partial_subtitle_path = context.artifact_dir.join("deal-windows.partial.srt");
+
+    let generation_result: Result<String, String> = async {
+        tokio::fs::create_dir_all(&context.artifact_dir)
+            .await
+            .map_err(|error| format!("创建成交逐字稿目录失败: {error}"))?;
+        let _ = tokio::fs::remove_file(&partial_subtitle_path).await;
+        for (index, (start_sec, end_sec)) in work_chunks.iter().copied().enumerate() {
+            reporter
+                .update(&format!(
+                    "正在转写成交音频 {}/{}（{:.0}-{:.0} 秒）",
+                    index + 1,
+                    work_chunks.len(),
+                    start_sec,
+                    end_sec
+                ))
+                .await;
+            let segment_path = temp_dir.join(format!("window-{index:03}.wav"));
+            ffmpeg::extract_audio_segment(
+                &context.media_file,
+                start_sec,
+                end_sec - start_sec,
+                &segment_path,
+            )
+            .await?;
+
+            // FunASR correction is deliberately skipped here. AI analysis runs
+            // after all windows are ready; per-window correction only adds wait.
+            let asr_api_key = if generator_type == "funasr" {
+                ""
+            } else {
+                openai_api_key.as_str()
+            };
+            let result = ffmpeg::generate_video_subtitle(
+                None,
+                &segment_path,
+                &generator_type,
+                &whisper_model,
+                &whisper_prompt,
+                asr_api_key,
+                &openai_api_endpoint,
+                &language_hint,
+            )
+            .await?;
+            if let Some(output) = combined.as_mut() {
+                output.concat_with_offset_ms(&result, (start_sec * 1000.0).round() as u64);
+            } else {
+                let mut output = crate::subtitle_generator::GenerateResult {
+                    generator_type: result.generator_type.clone(),
+                    subtitle_id: result.subtitle_id.clone(),
+                    subtitle_content: Vec::new(),
+                };
+                output.concat_with_offset_ms(&result, (start_sec * 1000.0).round() as u64);
+                combined = Some(output);
+            }
+            let partial_subtitle = combined
+                .as_ref()
+                .map(|output| {
+                    output
+                        .subtitle_content
+                        .iter()
+                        .map(item_to_srt)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            if !partial_subtitle.trim().is_empty() {
+                tokio::fs::write(&partial_subtitle_path, partial_subtitle)
+                    .await
+                    .map_err(|error| format!("保存部分成交窗口逐字稿失败: {error}"))?;
+            }
+        }
+
+        let subtitle = combined
+            .as_ref()
+            .map(|result| {
+                result
+                    .subtitle_content
+                    .iter()
+                    .map(item_to_srt)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if subtitle.trim().is_empty() {
+            return Err("成交时间窗口中没有识别到可用人声。".to_string());
+        }
+        tokio::fs::write(deal_window_subtitle_path(&context), &subtitle)
+            .await
+            .map_err(|error| format!("保存成交窗口逐字稿失败: {error}"))?;
+        tokio::fs::write(
+            context.artifact_dir.join("deal-windows.json"),
+            serde_json::to_vec_pretty(&ranges)
+                .map_err(|error| format!("保存成交窗口索引失败: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("保存成交窗口索引失败: {error}"))?;
+        let _ = tokio::fs::remove_file(&partial_subtitle_path).await;
+        Ok(subtitle)
+    }
+    .await;
+    if let Err(error) = tokio::fs::remove_dir_all(&temp_dir).await {
+        log::warn!("清理成交窗口转写临时目录失败 {:?}: {error}", temp_dir);
+    }
+
+    match generation_result {
+        Ok(subtitle) => {
+            reporter.finish(true, "成交窗口逐字稿生成完成").await;
+            state
+                .db
+                .update_task(
+                    &event_id,
+                    "success",
+                    "成交窗口逐字稿生成完成",
+                    Some(
+                        json!({
+                            "video_id": id,
+                            "range_count": ranges.len(),
+                            "audio_duration_sec": total_duration,
+                            "service": generator_type,
+                        })
+                        .to_string()
+                        .as_str(),
+                    ),
+                )
+                .await?;
+            Ok(subtitle)
+        }
+        Err(error) => {
+            reporter
+                .finish(false, &format!("成交窗口逐字稿生成失败: {error}"))
+                .await;
+            state
+                .db
+                .update_task(
+                    &event_id,
+                    "failed",
+                    &format!("成交窗口逐字稿生成失败: {error}"),
+                    None,
+                )
+                .await?;
+            Err(error)
+        }
+    }
+}
+
 async fn generate_video_subtitle_inner(
     state: &State,
     event_id: String,
@@ -3279,10 +3952,22 @@ pub async fn import_external_video(
     } else {
         "enterprise_review"
     };
+    let source_file_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let inferred_live_started_at =
+        crate::live_dashboard_binding::infer_live_started_at_from_texts(&[
+            source_file_name,
+            &title,
+        ])
+        .unwrap_or_default();
     let note = json!({
         "analysisPurpose": analysis_purpose,
         "competitorName": competitor_name.unwrap_or_default().trim(),
         "masterScriptKey": master_script_key.unwrap_or_default().trim(),
+        "sourceFileName": source_file_name,
+        "inferredLiveStartedAt": inferred_live_started_at,
     })
     .to_string();
     let video = VideoRow {
@@ -3343,6 +4028,75 @@ pub struct DealAutoClipRangeRequest {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DealAutoClipFailure {
+    index: usize,
+    title: String,
+    start: f64,
+    end: f64,
+    error: String,
+}
+
+fn validate_clip_time_range(start: f64, end: f64, video_duration: i64) -> Result<(), String> {
+    if !(start.is_finite() && end.is_finite() && start >= 0.0 && end > start) {
+        return Err(format!("切片时间范围无效：{start:.3}s - {end:.3}s"));
+    }
+    // Imported media occasionally reports a duration one or two seconds shorter
+    // than the final decodable timestamp. Allow a small tail tolerance, but stop
+    // obviously mismatched timelines before FFmpeg starts.
+    if video_duration > 0 && start >= video_duration as f64 + 3.0 {
+        return Err(format!(
+            "切片起点 {start:.1}s 已超出原视频时长 {}s，请检查视频与订单时间轴是否匹配",
+            video_duration
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_clip_source_path(
+    state: &State,
+    parent_video: &VideoRow,
+) -> Result<PathBuf, String> {
+    let output = state.config.read().await.output.clone();
+    let input_path = resolve_external_playback_path(
+        state.db.as_ref(),
+        Path::new(&output),
+        parent_video.id,
+        &parent_video.file,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "无法定位切片原视频（视频 ID {}，记录路径 {}）：{error}。请确认原视频仍在本地，或重新连接 NAS 后重试",
+            parent_video.id, parent_video.file
+        )
+    })?;
+
+    let metadata = tokio::fs::metadata(&input_path).await.map_err(|error| {
+        format!(
+            "切片原视频当前无法读取：{}（{error}）。请检查文件是否被移动、删除或 NAS 是否断开",
+            input_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "切片源不是有效的视频文件：{}",
+            input_path.display()
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(format!("切片原视频是空文件：{}", input_path.display()));
+    }
+    tokio::fs::File::open(&input_path).await.map_err(|error| {
+        format!(
+            "切片原视频存在但无法打开：{}（{error}）。请关闭占用程序或检查共享目录权限",
+            input_path.display()
+        )
+    })?;
+    Ok(input_path)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DealAutoClipQueueResult {
     pub task_id: String,
     pub count: usize,
@@ -3364,17 +4118,15 @@ pub async fn queue_deal_auto_clips(
     if ranges.len() > 100 {
         return Err("单次自动切片最多支持 100 个区间。".to_string());
     }
-    for (index, range) in ranges.iter().enumerate() {
-        if !(range.start.is_finite()
-            && range.end.is_finite()
-            && range.start >= 0.0
-            && range.end > range.start)
-        {
-            return Err(format!("第 {} 个切片时间范围无效。", index + 1));
-        }
-    }
-
     let parent_video = state.db.get_video(parent_video_id).await?;
+    for (index, range) in ranges.iter().enumerate() {
+        validate_clip_time_range(range.start, range.end, parent_video.length)
+            .map_err(|error| format!("第 {} 个切片无效：{error}", index + 1))?;
+    }
+    // Preflight once before creating the background task. A moved local file or
+    // disconnected NAS must produce one actionable error, not dozens of failed
+    // clip records for the same missing source.
+    let source_path = resolve_clip_source_path(&state, &parent_video).await?;
     let task = TaskRow {
         id: event_id.clone(),
         task_type: "deal_auto_clip_batch".to_string(),
@@ -3383,6 +4135,7 @@ pub async fn queue_deal_auto_clips(
         metadata: json!({
             "parent_video_id": parent_video_id,
             "range_count": ranges.len(),
+            "source_path": source_path.to_string_lossy(),
         })
         .to_string(),
         created_at: Utc::now().to_rfc3339(),
@@ -3419,7 +4172,7 @@ pub async fn queue_deal_auto_clips(
                 // drivers are not asked to run two long sessions concurrently.
                 stop_video_playback_preview_inner(&state_clone, parent_video.id, false).await;
                 let mut succeeded = 0usize;
-                let mut failed_titles = Vec::new();
+                let mut failures = Vec::new();
                 let mut generated_clips = Vec::new();
                 for (index, range) in ranges.into_iter().enumerate() {
                     reporter
@@ -3452,29 +4205,47 @@ pub async fn queue_deal_auto_clips(
                         }
                         Err(error) => {
                             log::error!("Deal auto clip failed for {}: {error}", range.title);
-                            failed_titles.push(range.title);
+                            failures.push(DealAutoClipFailure {
+                                index,
+                                title: range.title,
+                                start: range.start,
+                                end: range.end,
+                                error,
+                            });
                         }
                     }
                 }
 
                 if succeeded == 0 {
+                    let first_error = failures
+                        .first()
+                        .map(|failure| failure.error.as_str())
+                        .unwrap_or("未知错误");
                     let message = format!(
-                        "完整成交链路视频全部生成失败（共 {} 条），请查看日志。",
-                        range_count
+                        "完整成交链路视频全部生成失败（共 {} 条）。首条原因：{}",
+                        range_count, first_error
                     );
                     reporter.finish(false, &message).await;
+                    let failed_metadata = json!({
+                        "parent_video_id": parent_video.id,
+                        "range_count": range_count,
+                        "generated_video_ids": Vec::<i64>::new(),
+                        "generated_clips": Vec::<serde_json::Value>::new(),
+                        "failed_clips": failures,
+                    })
+                    .to_string();
                     state_clone
                         .db
-                        .update_task(&worker_task_id, "failed", &message, None)
+                        .update_task(&worker_task_id, "failed", &message, Some(&failed_metadata))
                         .await?;
                     return Err(message);
                 }
-                let message = if failed_titles.is_empty() {
+                let message = if failures.is_empty() {
                     format!("完整成交链路视频生成完成：成功 {succeeded}/{range_count} 条")
                 } else {
                     format!(
                         "完整成交链路视频生成完成：成功 {succeeded}/{range_count} 条，失败 {} 条",
-                        failed_titles.len()
+                        failures.len()
                     )
                 };
                 reporter.finish(true, &message).await;
@@ -3486,6 +4257,7 @@ pub async fn queue_deal_auto_clips(
                         .filter_map(|clip| clip.get("video_id").and_then(|value| value.as_i64()))
                         .collect::<Vec<_>>(),
                     "generated_clips": generated_clips,
+                    "failed_clips": failures,
                 })
                 .to_string();
                 state_clone
@@ -3531,6 +4303,10 @@ pub async fn clip_video(
 ) -> Result<VideoRow, String> {
     // 获取父视频信息
     let parent_video = state.db.get_video(parent_video_id).await?;
+    validate_clip_time_range(start_time, end_time, parent_video.length)?;
+    // Return a clear error to the caller before creating a task record or
+    // waiting for the shared media execution gate.
+    resolve_clip_source_path(&state, &parent_video).await?;
 
     #[cfg(feature = "gui")]
     let emitter = EventEmitter::new(state.app_handle.clone());
@@ -3599,31 +4375,11 @@ async fn clip_video_inner(
     end_time: f64,
     clip_title: String,
 ) -> Result<VideoRow, String> {
-    let config = state.config.read().await;
-    let output = config.output.clone();
-    drop(config);
-
-    // Resolve local output-relative files and archived NAS absolute paths the same way external play does.
-    let input_path = resolve_external_playback_path(
-        state.db.as_ref(),
-        Path::new(&output),
-        parent_video.id,
-        &parent_video.file,
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "无法解析原视频路径（id={}, file={}）：{error}",
-            parent_video.id, parent_video.file
-        )
-    })?;
-
-    if !input_path.is_file() {
-        return Err(format!(
-            "原视频文件不存在或当前不可访问：{}",
-            input_path.display()
-        ));
-    }
+    validate_clip_time_range(start_time, end_time, parent_video.length)?;
+    let output = state.config.read().await.output.clone();
+    // Resolve local output-relative files and archived NAS paths through the
+    // same checked path used by queue preflight and single-clip calls.
+    let input_path = resolve_clip_source_path(state, &parent_video).await?;
 
     // 统一的输出目录：clips
     let output_dir = Path::new(&output).join("clips");
@@ -3937,7 +4693,10 @@ pub async fn generate_audio_sample(state: state_type!(), video_id: i64) -> Resul
 #[cfg(test)]
 mod delete_file_tests {
     use super::{
-        remove_required_media_file, should_delete_media_file, validate_video_transcript_coverage,
+        normalize_product_scan_text, remove_required_media_file, should_delete_media_file,
+        sorted_live_product_scan_items, validate_clip_time_range,
+        validate_live_product_scan_catalog, validate_video_transcript_coverage,
+        LiveProductScanProduct,
     };
 
     #[test]
@@ -3990,5 +4749,35 @@ mod delete_file_tests {
         let subtitle = "1\n01:13:41,000 --> 01:13:45,000\n感谢观看\n\n";
 
         assert!(validate_video_transcript_coverage(subtitle, 4_532_000).is_ok());
+    }
+
+    #[test]
+    fn clip_time_preflight_rejects_invalid_and_mismatched_ranges() {
+        assert!(validate_clip_time_range(10.0, 20.0, 120).is_ok());
+        assert!(validate_clip_time_range(10.0, 10.0, 120)
+            .unwrap_err()
+            .contains("时间范围无效"));
+        assert!(validate_clip_time_range(130.0, 140.0, 120)
+            .unwrap_err()
+            .contains("时间轴是否匹配"));
+    }
+
+    #[test]
+    fn normalizes_and_counts_product_scan_catalog_without_mutating_orders() {
+        assert_eq!(
+            normalize_product_scan_text("索尼 70-200 GM II"),
+            "索尼70200gmii"
+        );
+        let catalog = validate_live_product_scan_catalog(&[LiveProductScanProduct {
+            id: "sony-70200".to_string(),
+            name: "索尼 70-200 GM II".to_string(),
+            aliases: vec!["70-200".to_string(), " 70 200 ".to_string()],
+        }])
+        .unwrap();
+        assert_eq!(catalog[0].aliases, vec!["70200"]);
+
+        let ranked = sorted_live_product_scan_items(&catalog, &[12]);
+        assert_eq!(ranked[0].mention_count, 12);
+        assert_eq!(ranked[0].name, "索尼 70-200 GM II");
     }
 }

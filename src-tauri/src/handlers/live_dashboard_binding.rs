@@ -1,7 +1,8 @@
 use crate::database::live_dashboard::LiveDashboardSessionRow;
 use crate::live_dashboard_binding::{
-    candidate_sessions, match_dashboard_sessions, LiveDashboardMatchCandidate,
-    RecordForLiveDashboardBinding, CANDIDATE_WINDOW_SECS,
+    candidate_sessions, imported_video_candidate_sessions, infer_shop_name_from_texts,
+    match_dashboard_sessions, match_imported_video_sessions, session_matches_shop,
+    LiveDashboardMatchCandidate, RecordForLiveDashboardBinding, CANDIDATE_WINDOW_SECS,
 };
 use crate::state::State;
 use crate::state_type;
@@ -49,16 +50,88 @@ pub async fn resolve_live_dashboard_for_record_state(
         .await
         .map_err(|error| error.to_string())?
     {
-        let match_method = state
+        // A standardized imported filename is authoritative for shop identity.
+        // Ignore an old cross-shop manual binding so resolution can repair it.
+        let cross_shop_import_binding = if let Some(video_id) = live_id
+            .strip_prefix("import:")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            let video = state
+                .db
+                .get_video(video_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            infer_shop_name_from_texts(&[&video.title, &video.file, &video.note])
+                .is_some_and(|shop| !session_matches_shop(&session, shop))
+        } else {
+            false
+        };
+        if cross_shop_import_binding {
+            // Continue into imported-video matching below. A successful match
+            // overwrites the stale binding through the existing UPSERT.
+        } else {
+            let match_method = state
+                .db
+                .get_live_dashboard_binding(&live_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .map(|binding| binding.match_method);
+            return Ok(ResolveLiveDashboardResult {
+                session: Some(session),
+                candidates: Vec::new(),
+                match_method,
+            });
+        }
+    }
+
+    if platform.trim() == "imported" || live_id.starts_with("import:") {
+        let video_id = live_id
+            .strip_prefix("import:")
+            .and_then(|value| value.parse::<i64>().ok());
+        let Some(video_id) = video_id else {
+            return Ok(ResolveLiveDashboardResult {
+                session: None,
+                candidates: Vec::new(),
+                match_method: None,
+            });
+        };
+        let video = state
             .db
-            .get_live_dashboard_binding(&live_id)
+            .get_video(video_id)
             .await
-            .map_err(|error| error.to_string())?
-            .map(|binding| binding.match_method);
+            .map_err(|error| error.to_string())?;
+        let sessions = state
+            .db
+            .list_live_dashboard_sessions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let matched =
+            match_imported_video_sessions(&video.title, &video.file, &video.note, &sessions);
+        if let Some((session, method)) = matched.automatic {
+            state
+                .db
+                .bind_live_dashboard_session(&live_id, session.id, method.as_str())
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(ResolveLiveDashboardResult {
+                session: Some(session),
+                candidates: Vec::new(),
+                match_method: Some(method.as_str().to_string()),
+            });
+        }
         return Ok(ResolveLiveDashboardResult {
-            session: Some(session),
-            candidates: Vec::new(),
-            match_method,
+            session: None,
+            candidates: imported_video_candidate_sessions(
+                &video.title,
+                &video.file,
+                &video.note,
+                &sessions,
+                CANDIDATE_WINDOW_SECS,
+            )
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            match_method: None,
         });
     }
 
@@ -132,6 +205,24 @@ pub async fn bind_live_dashboard_session(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "直播数据场次不存在".to_string())?;
+    if let Some(video_id) = live_id
+        .strip_prefix("import:")
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        let video = state
+            .db
+            .get_video(video_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(shop) = infer_shop_name_from_texts(&[&video.title, &video.file, &video.note]) {
+            if !session_matches_shop(&session, shop) {
+                return Err(format!(
+                    "店铺不一致：该视频属于{shop}，不能绑定到{}",
+                    session.shop_name
+                ));
+            }
+        }
+    }
     state
         .db
         .bind_live_dashboard_session(&live_id, session_id, "manual")

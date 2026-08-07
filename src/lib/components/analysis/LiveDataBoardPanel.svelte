@@ -76,6 +76,35 @@
     </p>
   {/if}
 
+  {#if showDashboardBind && candidates.length}
+    <div class="bind-block bind-block-top">
+      {#if session}
+        <p class="hint">当前匹配不对时，在这里选择正确场次并覆盖原绑定。</p>
+      {:else}
+        <p class="hint">系统无法唯一判断，请选择与视频开播时间对应的场次。</p>
+      {/if}
+      <div class="bind-row">
+        <select bind:value={selectedSessionId} aria-label="选择直播数据场次">
+          <option value="">选择正确场次</option>
+          {#each candidates as candidate (candidate.session.id)}
+            <option value={String(candidate.session.id)}>
+              {formatDashboardSessionTime(candidate.session.startedAt)}
+              · {candidate.session.shopName || candidate.session.accountKey}
+            </option>
+          {/each}
+        </select>
+        <button
+          type="button"
+          class="bind-btn"
+          disabled={!selectedSessionId}
+          on:click={() => dispatch("bindSession")}
+        >
+          {session ? "确认换绑" : "绑定"}
+        </button>
+      </div>
+    </div>
+  {/if}
+
   {#if loading}
     <p class="status">
       <Loader2 size={13} class="is-spinning" />
@@ -121,36 +150,7 @@
       </div>
     {/if}
 
-    {#if showDashboardBind && candidates.length}
-      <div class="bind-block">
-        {#if !session}
-          <p class="hint">
-            外部导入视频请手动选择对应场次（例如 2026/07/28 08:15）后绑定。
-          </p>
-        {:else}
-          <p class="hint">可改绑到其他已导入的 XLSX 场次。</p>
-        {/if}
-        <div class="bind-row">
-          <select bind:value={selectedSessionId} aria-label="选择直播数据场次">
-            <option value="">选择场次</option>
-            {#each candidates as candidate (candidate.session.id)}
-              <option value={String(candidate.session.id)}>
-                {formatDashboardSessionTime(candidate.session.startedAt)}
-                · {candidate.session.shopName || candidate.session.accountKey}
-              </option>
-            {/each}
-          </select>
-          <button
-            type="button"
-            class="bind-btn"
-            disabled={!selectedSessionId}
-            on:click={() => dispatch("bindSession")}
-          >
-            绑定
-          </button>
-        </div>
-      </div>
-    {:else if !session && showDashboardBind}
+    {#if !session && showDashboardBind && !candidates.length}
       <p class="status muted">未找到可绑定场次。请先在「直播数据大屏」导入官方 XLSX。</p>
     {:else if !session && !orderSummary}
       <p class="status muted">暂无数据</p>

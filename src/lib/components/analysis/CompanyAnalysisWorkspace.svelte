@@ -5,6 +5,7 @@
   import AiScriptReviewPanel from "./AiScriptReviewPanel.svelte";
   import LiveDataBoardPanel from "./LiveDataBoardPanel.svelte";
   import LiveHighFrequencyWordsPanel from "./LiveHighFrequencyWordsPanel.svelte";
+  import LiveTopProductsPanel from "./LiveTopProductsPanel.svelte";
   import type { PaymentEvent } from "../../orderDealTimeline";
   import type {
     CompanyAnalysisTab,
@@ -20,6 +21,8 @@
 
   export let activeTab: CompanyAnalysisTab = "deal_speech";
   export let events: PaymentEvent[] = [];
+  export let videoId: number | null = null;
+  export let archiveSource = false;
   export let transcriptEntries: WorkspaceTranscriptEntry[] = [];
   export let selectedOffsetSec: number | null = null;
   export let transcriptReady = false;
@@ -188,6 +191,7 @@
           </div>
         {/if}
       </div>
+      <LiveTopProductsPanel {videoId} {archiveSource} {events} {transcriptEntries} />
       {#if dataBoardExpanded}
         <div id="company-data-board-body" class="data-board-body">
           {#if bottomBoardTab === "data"}
@@ -320,7 +324,7 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    gap: 0;
+    gap: 7px;
     padding: 0 2px;
     overflow: hidden;
   }

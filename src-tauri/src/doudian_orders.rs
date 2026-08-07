@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -75,6 +75,10 @@ pub fn resolve_live_window(
 
     let ended = if let Some(value) = live_ended_at.filter(|item| !item.trim().is_empty()) {
         parse_timestamp(&value)?
+    } else if let Some(session) =
+        dashboard_session.filter(|session| !session.ended_at.trim().is_empty())
+    {
+        parse_timestamp(&session.ended_at)?
     } else if record.length > 0.0 {
         started + Duration::seconds(record.length.round() as i64)
     } else {
@@ -221,7 +225,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_live_window_prefers_dashboard_start_and_record_length() {
+    fn resolve_live_window_prefers_dashboard_start_and_end() {
         let record = RecordRow {
             platform: "douyin".into(),
             parent_id: String::new(),
@@ -246,6 +250,7 @@ mod tests {
             account_key: "acc".into(),
             shop_name: "shop".into(),
             started_at: "2026-07-28T08:15:49+08:00".into(),
+            ended_at: "2026-07-28T15:44:39+08:00".into(),
             payment_amount_fen: 0,
             per_thousand_payment_amount_fen: None,
             viewer_count: None,
@@ -258,12 +263,12 @@ mod tests {
             exposure_viewer_rate: None,
             qianchuan_spend_fen: None,
             source_file: "xlsx".into(),
-            imported_at: Utc::now().to_rfc3339(),
+            imported_at: chrono::Utc::now().to_rfc3339(),
         };
 
         let (start, end) =
             resolve_live_window(&record, Some(&session), None, None).expect("window");
         assert_eq!(start, "2026/07/28 08:15:49");
-        assert_eq!(end, "2026/07/28 09:15:49");
+        assert_eq!(end, "2026/07/28 15:44:39");
     }
 }

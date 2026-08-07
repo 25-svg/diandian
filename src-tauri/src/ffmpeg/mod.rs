@@ -443,8 +443,7 @@ pub async fn extract_full_audio(file: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Extract a time segment from a video as a 16kHz stereo WAV file.
-/// (whisper_cpp.rs handles stereo→mono conversion internally.)
+/// Extract a time segment from a video as a 16kHz mono WAV file.
 pub async fn extract_audio_segment(
     file: &Path,
     start_sec: f64,
@@ -461,6 +460,7 @@ pub async fn extract_audio_segment(
         .arg(file)
         .args(["-t", &duration_sec.to_string()])
         .args(["-ar", "16000"])
+        .args(["-ac", "1"])
         .args(["-c:a", "pcm_s16le"])
         .args(["-vn"])
         .args(["-y"])
@@ -1210,7 +1210,14 @@ async fn generate_video_subtitle_once(
             if let Some(reporter) = reporter {
                 reporter.update("正在提取音频").await;
             }
-            let full_wav = extract_full_audio(file).await?;
+            // Windowed deal transcription already supplies a normalized WAV.
+            // Reuse it directly instead of making a second full-size copy.
+            let use_input_wav = file.extension().and_then(|value| value.to_str()) == Some("wav");
+            let full_wav = if use_input_wav {
+                file.to_path_buf()
+            } else {
+                extract_full_audio(file).await?
+            };
             let fact_card_path = file.with_extension("facts.json");
             let fact_card = if fact_card_path.is_file() {
                 match tokio::fs::read_to_string(&fact_card_path).await {
@@ -1247,7 +1254,9 @@ async fn generate_video_subtitle_once(
                 }
                 Err(error) => Err(error),
             };
-            let _ = tokio::fs::remove_file(&full_wav).await;
+            if !use_input_wav {
+                let _ = tokio::fs::remove_file(&full_wav).await;
+            }
             let mut response = response?;
 
             if let Some(reporter) = reporter {

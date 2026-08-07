@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy, onMount, tick } from "svelte";
-  import { save } from "@tauri-apps/plugin-dialog";
+  import { open, save } from "@tauri-apps/plugin-dialog";
   import {
     ArrowLeft,
     BarChart3,
@@ -63,6 +63,11 @@
     type PaymentEvent,
     type PaymentEventsSummary,
   } from "../lib/orderDealTimeline";
+  import {
+    buildDealTranscriptWindows,
+    totalDealTranscriptDuration,
+    type DealTranscriptWindow,
+  } from "../lib/dealTranscriptWindows";
   import { scanComplianceRisks } from "../lib/complianceRules";
   import {
     buildScriptQualityUserMessage,
@@ -200,6 +205,7 @@
     accountKey: string;
     shopName: string;
     startedAt: string;
+    endedAt: string;
     sourceFile: string;
   };
 
@@ -360,6 +366,9 @@
   let paymentEventsError = "";
   let paymentEventsInput: HTMLInputElement | null = null;
   let paymentEventsLoading = false;
+  let paymentEventsMatchMessage = "";
+  let videoStartOffsetSec = 0;
+  let videoCalibrationStatus: "unverified" | "full_session" | "manual" = "unverified";
   let dealRefinementInput: HTMLInputElement | null = null;
   let dealRefinementLoading = false;
   let isScriptQualityAnalyzing = false;
@@ -430,6 +439,19 @@
   $: peakDealMinuteLabel = paymentEvents.length
     ? buildPeakDealMinuteLabel(buildDealMinuteBuckets(paymentEvents))
     : null;
+  $: boundSessionDurationSec = liveDashboardBinding?.session?.endedAt
+    ? Math.max(0, (new Date(liveDashboardBinding.session.endedAt).getTime()
+      - new Date(liveDashboardBinding.session.startedAt).getTime()) / 1000)
+    : 0;
+  $: boundVideoDurationSec = Math.max(0, Number(video?.length || archive?.length || fullPlaybackDurationSec) || 0);
+  $: videoDurationDeltaSec = boundSessionDurationSec && boundVideoDurationSec
+    ? Math.abs(boundSessionDurationSec - boundVideoDurationSec)
+    : 0;
+  $: videoLikelyFullSession = Boolean(
+    boundSessionDurationSec
+      && boundVideoDurationSec
+      && videoDurationDeltaSec <= Math.max(120, boundSessionDurationSec * 0.03),
+  );
   /** Bottom KPI board only for full live sessions; clipped MP4s never show it. */
   $: showCompanyDataBoard = analysisMode === "company_deal" && !isClipVideo(video);
   /** Binding key: douyin live_id, or import:{videoId} for externally imported full sessions. */
@@ -617,7 +639,7 @@
         liveDashboardBinding = resolved;
         return;
       }
-      if (selectedArchive?.platform === "douyin" && (resolved?.candidates?.length ?? 0) > 0) {
+      if ((resolved?.candidates?.length ?? 0) > 0) {
         liveDashboardBinding = resolved;
         return;
       }
@@ -689,6 +711,9 @@
     paymentEventsSummary = null;
     paymentEventsSourceLabel = "";
     paymentEventsError = "";
+    paymentEventsMatchMessage = "";
+    videoStartOffsetSec = 0;
+    videoCalibrationStatus = "unverified";
     if (!sourceKey) return;
     try {
       const raw = localStorage.getItem(paymentEventsStorageKey(sourceKey));
@@ -697,11 +722,19 @@
         events?: PaymentEvent[];
         summary?: PaymentEventsSummary;
         sourceLabel?: string;
+        matchMessage?: string;
+        videoStartOffsetSec?: number;
+        videoCalibrationStatus?: "unverified" | "full_session" | "manual";
       };
       if (!Array.isArray(saved.events)) return;
       paymentEvents = saved.events;
       paymentEventsSummary = saved.summary ?? null;
       paymentEventsSourceLabel = saved.sourceLabel || "";
+      paymentEventsMatchMessage = saved.matchMessage || "";
+      videoStartOffsetSec = Number.isFinite(saved.videoStartOffsetSec)
+        ? Math.max(0, Number(saved.videoStartOffsetSec))
+        : 0;
+      videoCalibrationStatus = saved.videoCalibrationStatus || "unverified";
     } catch (error: any) {
       paymentEventsError = error?.message || String(error);
     }
@@ -714,6 +747,9 @@
         events: paymentEvents,
         summary: paymentEventsSummary,
         sourceLabel: paymentEventsSourceLabel,
+        matchMessage: paymentEventsMatchMessage,
+        videoStartOffsetSec,
+        videoCalibrationStatus,
         updatedAt: new Date().toISOString(),
       }));
     } catch (error: any) {
@@ -726,6 +762,9 @@
     paymentEventsSummary = null;
     paymentEventsSourceLabel = "";
     paymentEventsError = "";
+    paymentEventsMatchMessage = "";
+    videoStartOffsetSec = 0;
+    videoCalibrationStatus = "unverified";
     if (currentSourceKey) {
       try {
         localStorage.removeItem(paymentEventsStorageKey(currentSourceKey));
@@ -741,6 +780,23 @@
     stats?: unknown;
     fetchedAt?: string;
     sourceLabel?: string;
+  };
+
+  type RawOrderTimelineImportResult = {
+    summary: {
+      shopName: string;
+      roomId: string;
+      parentOrderCount: number;
+      eventCount: number;
+      totalPayAmountFen: number;
+      expectedEventCount?: number | null;
+      expectedPayAmountFen: number;
+      confidence: string;
+    };
+    events: unknown[];
+    sourceLabel: string;
+    rawOrderCount: number;
+    candidateCount: number;
   };
 
   function applyPaymentEventsBundle(bundle: ReturnType<typeof parsePaymentEventsPayload>): void {
@@ -779,6 +835,147 @@
     } finally {
       paymentEventsLoading = false;
     }
+  }
+
+  async function importRawPaymentEvents(): Promise<void> {
+    const liveId = dashboardBindLiveId || resolveDashboardBindLiveId(archive, video);
+    if (!liveDashboardBinding?.session || !liveId) {
+      paymentEventsError = "请先选择并绑定对应的直播 Excel 场次";
+      return;
+    }
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "抖店订单 JSON", extensions: ["json"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    paymentEventsLoading = true;
+    paymentEventsError = "";
+    paymentEventsMatchMessage = "";
+    try {
+      const result = await invoke<RawOrderTimelineImportResult>("import_raw_doudian_payment_events", {
+        liveId,
+        path: selected,
+      });
+      videoStartOffsetSec = 0;
+      videoCalibrationStatus = videoLikelyFullSession ? "full_session" : "unverified";
+      paymentEventsMatchMessage = `已自动找到本场：${result.summary.shopName} · ${result.summary.eventCount} 次成交 · ${(result.summary.totalPayAmountFen / 100).toLocaleString("zh-CN", { style: "currency", currency: "CNY" })}`;
+      applyPaymentEventsBundle(parsePaymentEventsPayload({
+        events: result.events,
+        summary: {
+          event_count: result.summary.eventCount,
+          total_pay_amount_yuan: result.summary.totalPayAmountFen / 100,
+          live_started_at: liveDashboardBinding.session.startedAt,
+        },
+        source_label: result.sourceLabel,
+      }));
+      if (currentSourceKey) savePaymentEvents(currentSourceKey);
+      if (!videoLikelyFullSession) {
+        stage = `成交数据已精确对账；视频与直播时长相差 ${Math.round(videoDurationDeltaSec / 60)} 分钟，请校准视频起点`;
+      }
+      if (analysisMode === "company_deal" && video) {
+        void smartRefreshTranscript(false, true);
+      }
+    } catch (error: any) {
+      paymentEventsError = error?.message || String(error);
+    } finally {
+      paymentEventsLoading = false;
+    }
+  }
+
+  async function importAndBindLiveDashboardXlsx(): Promise<boolean> {
+    const liveId = dashboardBindLiveId || resolveDashboardBindLiveId(archive, video);
+    if (!liveId) {
+      paymentEventsError = "当前视频缺少可绑定标识，请重新进入分析页后再试";
+      return false;
+    }
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "直播整场数据 Excel", extensions: ["xlsx", "xls"] }],
+    });
+    if (!selected || Array.isArray(selected)) return false;
+    paymentEventsLoading = true;
+    paymentEventsError = "";
+    paymentEventsMatchMessage = "";
+    try {
+      const session = await invoke<BoundLiveDashboardSession>("import_live_dashboard_xlsx", {
+        path: selected,
+      });
+      liveDashboardBinding = await invoke<LiveDashboardBindingResult>("bind_live_dashboard_session", {
+        liveId,
+        sessionId: session.id,
+      });
+      selectedLiveDashboardSessionId = "";
+      paymentEventsMatchMessage = `Excel 已导入并绑定：${session.shopName} · ${session.startedAt}。现在可以导入原始订单 JSON。`;
+      stage = "已绑定本场直播 Excel";
+      return true;
+    } catch (error: any) {
+      paymentEventsError = error?.message || String(error);
+      return false;
+    } finally {
+      paymentEventsLoading = false;
+    }
+  }
+
+  async function importAndCleanOrderTimeline(): Promise<void> {
+    const excelReady = await importAndBindLiveDashboardXlsx();
+    if (!excelReady) return;
+    await importRawPaymentEvents();
+  }
+
+  function applyVideoStartOffset(
+    nextOffsetSec: number,
+    status: "full_session" | "manual",
+  ): void {
+    const normalized = Math.max(0, Math.round(nextOffsetSec));
+    const shift = normalized - videoStartOffsetSec;
+    if (shift !== 0) {
+      paymentEvents = paymentEvents.map((event) => ({
+        ...event,
+        offsetSec: event.offsetSec - shift,
+      }));
+      if (selectedDealOffsetSec != null) selectedDealOffsetSec -= shift;
+      dealSpeechRefineCache = {};
+      activeDealSpeechRange = null;
+    }
+    videoStartOffsetSec = normalized;
+    videoCalibrationStatus = status;
+    if (currentSourceKey) savePaymentEvents(currentSourceKey);
+  }
+
+  function confirmVideoStartsWithLive(): void {
+    applyVideoStartOffset(0, "full_session");
+    stage = "已确认视频从开播开始，成交时间轴已对齐";
+  }
+
+  function currentVideoPositionSec(): number | null {
+    if (nativePlayerActive && Number.isFinite(nativePlaybackPositionSec)) {
+      return Math.max(0, nativePlaybackPositionSec);
+    }
+    if (videoElement && Number.isFinite(videoElement.currentTime)) {
+      return Math.max(0, videoElement.currentTime);
+    }
+    return null;
+  }
+
+  function calibrateSelectedDealAtCurrentFrame(): void {
+    if (selectedDealOffsetSec == null) {
+      paymentEventsError = "请先选择一个成交时间点";
+      return;
+    }
+    const currentPosition = currentVideoPositionSec();
+    if (currentPosition == null) {
+      paymentEventsError = "请先在左侧播放器中播放或暂停到对应成交画面";
+      return;
+    }
+    const absoluteDealOffset = selectedDealOffsetSec + videoStartOffsetSec;
+    const nextVideoStartOffset = absoluteDealOffset - currentPosition;
+    if (nextVideoStartOffset < 0) {
+      paymentEventsError = "当前画面晚于所选成交点，无法完成校准；请重新选择对应画面";
+      return;
+    }
+    paymentEventsError = "";
+    applyVideoStartOffset(nextVideoStartOffset, "manual");
+    stage = `视频起点已校准：开播后 ${Math.round(nextVideoStartOffset)} 秒开始`;
   }
 
   function openPaymentEventsPicker(): void {
@@ -2119,6 +2316,82 @@
     }
   }
 
+  function activeDealWindowTranscriptTask(tasks: BackgroundTask[], videoId: number): BackgroundTask | null {
+    return tasks.find((task) => {
+      if ((task.task_type || task.taskType) !== "generate_video_deal_window_subtitle") return false;
+      if (!['pending', 'processing'].includes(task.status)) return false;
+      try {
+        const metadata = JSON.parse(task.metadata || "{}") as { video_id?: number };
+        return Number(metadata.video_id) === videoId;
+      } catch {
+        return false;
+      }
+    }) || null;
+  }
+
+  async function waitForDealWindowTranscriptTask(
+    videoId: number,
+    onPartial?: (subtitle: string) => void,
+  ): Promise<string> {
+    let lastPartial = "";
+    for (let attempt = 0; attempt < TASK_POLL_MAX_ATTEMPTS; attempt += 1) {
+      const subtitle = await invoke<string>("get_video_deal_window_partial_subtitle", { id: videoId });
+      if (subtitle.trim() && subtitle !== lastPartial) {
+        lastPartial = subtitle;
+        onPartial?.(subtitle);
+      }
+      const tasks = await invoke<BackgroundTask[]>("get_tasks");
+      const task = activeDealWindowTranscriptTask(tasks, videoId);
+      if (!task) {
+        const completed = await invoke<string>("get_video_deal_window_subtitle", { id: videoId });
+        if (completed.trim()) return completed;
+        throw new Error("成交窗口转写任务已经结束，但没有生成可用文稿。");
+      }
+      stage = (task.message || "").trim() || "正在转写下单时间附近的话术…";
+      await waitForTaskPoll();
+    }
+    throw new Error("成交窗口仍在后台转写，请稍后刷新本页查看结果。");
+  }
+
+  async function resumeOrGenerateDealWindowTranscript(
+    videoId: number,
+    ranges: DealTranscriptWindow[],
+    onPartial?: (subtitle: string) => void,
+  ): Promise<string> {
+    const tasks = await invoke<BackgroundTask[]>("get_tasks");
+    const activeTask = activeDealWindowTranscriptTask(tasks, videoId);
+    if (activeTask) {
+      stage = (activeTask.message || "").trim() || "正在继续转写下单时间附近的话术…";
+      return waitForDealWindowTranscriptTask(videoId, onPartial);
+    }
+    let completedSubtitle = "";
+    let generationError: unknown = null;
+    let settled = false;
+    const generation = invoke<string>("generate_video_deal_window_subtitle", {
+      eventId: `deal_window_asr_${videoId}_${Date.now()}`,
+      id: videoId,
+      ranges,
+    }).then((subtitle) => {
+      completedSubtitle = subtitle;
+      settled = true;
+    }).catch((error) => {
+      generationError = error;
+      settled = true;
+    });
+    let lastPartial = "";
+    while (!settled) {
+      await waitForTaskPoll();
+      const partial = await invoke<string>("get_video_deal_window_partial_subtitle", { id: videoId });
+      if (partial.trim() && partial !== lastPartial) {
+        lastPartial = partial;
+        onPartial?.(partial);
+      }
+    }
+    await generation;
+    if (generationError) throw generationError;
+    return completedSubtitle;
+  }
+
   async function smartRefreshTranscript(hasSavedAnalysis: boolean, forceTranscriptRefresh = false): Promise<void> {
     if (!currentSource || isTranscribing) return;
     invalidateTranscriptBoundRequests();
@@ -2179,17 +2452,52 @@
               : "首次生成 · 已采用新稿";
         }
       } else if (selectedVideo) {
-        stage = forceTranscriptRefresh ? "正在重新识别视频逐字稿…" : "正在读取视频逐字稿…";
+        const useDealWindows = analysisMode === "company_deal" && !isClipVideo(selectedVideo);
+        stage = forceTranscriptRefresh
+          ? useDealWindows ? "正在重新识别下单时间附近的话术…" : "正在重新识别视频逐字稿…"
+          : useDealWindows ? "正在读取成交窗口逐字稿…" : "正在读取视频逐字稿…";
         if (!forceTranscriptRefresh) {
-          nextTranscript = await invoke<string>("get_video_subtitle", { id: selectedVideo.id });
+          try {
+            nextTranscript = await invoke<string>("get_video_subtitle", { id: selectedVideo.id });
+          } catch {
+            nextTranscript = "";
+          }
+          if (!nextTranscript.trim() && useDealWindows) {
+            nextTranscript = await invoke<string>("get_video_deal_window_subtitle", { id: selectedVideo.id });
+          }
           if (!isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, transcriptRequestSequence)) return;
         }
         if (!nextTranscript.trim()) {
-          nextTranscript = await resumeOrGenerateVideoTranscript(selectedVideo.id);
+          if (useDealWindows) {
+            if (!paymentEvents.length) {
+              stage = "请先导入 Excel + 订单 JSON；系统只转写下单时间附近的话术";
+              return;
+            }
+            const ranges = buildDealTranscriptWindows(paymentEvents, boundVideoDurationSec);
+            if (!ranges.length) throw new Error("成交时间不在当前视频范围内，请先校准视频起点。");
+            const windowMinutes = Math.max(1, Math.ceil(totalDealTranscriptDuration(ranges) / 60));
+            stage = `正在转写 ${ranges.length} 个成交窗口，共约 ${windowMinutes} 分钟音频…`;
+            nextTranscript = await resumeOrGenerateDealWindowTranscript(
+              selectedVideo.id,
+              ranges,
+              (partialSubtitle) => {
+                const partialEntries = parseSrt(partialSubtitle);
+                if (!partialEntries.length) return;
+                transcript = partialSubtitle;
+                transcriptEntries = partialEntries;
+                transcriptRefreshNotice = `已生成 ${partialEntries.length} 条文稿，后台继续补充`;
+                stage = `已显示部分逐字稿（${partialEntries.length} 条），后台继续转写…`;
+              },
+            );
+          } else {
+            nextTranscript = await resumeOrGenerateVideoTranscript(selectedVideo.id);
+          }
           if (!isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, transcriptRequestSequence)) return;
-          nextTranscriptRefreshNotice = forceTranscriptRefresh ? "已重新识别" : "已恢复逐字稿任务";
+          nextTranscriptRefreshNotice = useDealWindows
+            ? "已按下单时间窗口完成转写"
+            : forceTranscriptRefresh ? "已重新识别" : "已恢复逐字稿任务";
         } else {
-          nextTranscriptRefreshNotice = "已读取视频字幕";
+          nextTranscriptRefreshNotice = useDealWindows ? "已读取成交窗口逐字稿" : "已读取视频字幕";
         }
         transcriptChanged = Boolean(previousTranscript && previousTranscript !== nextTranscript);
       }
@@ -3382,11 +3690,15 @@
               已导入 {paymentEventsSummary.eventCount} 笔 · 合计 ¥{paymentEventsSummary.totalPayAmountYuan.toLocaleString("zh-CN")}
               {#if paymentEventsSourceLabel} · {paymentEventsSourceLabel}{/if}
             {:else}
-              导入 `doudian_order_events.py` 生成的 JSON，或点击「一键拉取成交」
+              一次操作依次选择本场 Excel 和未清洗订单 JSON；系统自动对账并生成下单时间轴
             {/if}
           </span>
         </div>
         <div class="payment-events-actions">
+          <button type="button" class="secondary-button" disabled={paymentEventsLoading} on:click={importAndCleanOrderTimeline}>
+            <Upload size={14} />
+            导入 Excel + JSON 并自动清洗
+          </button>
           <button
             type="button"
             class="secondary-button"
@@ -3400,10 +3712,8 @@
             {/if}
             一键拉取成交
           </button>
-          <button type="button" class="secondary-button" on:click={openPaymentEventsPicker}>
-            <Upload size={14} />
-            导入成交 JSON
-          </button>
+          <button type="button" class="text-button" disabled={paymentEventsLoading || !liveDashboardBinding?.session} on:click={importRawPaymentEvents}>仅重新导入订单 JSON</button>
+          <button type="button" class="text-button" on:click={openPaymentEventsPicker}>导入已清洗文件</button>
           <button type="button" class="secondary-button" disabled={dealRefinementLoading || !masterBaseline || !currentSource} on:click={openDealRefinementPicker} title="只导入 verified 商品讲解；仍需人工审批">
             <Upload size={14} />
             {dealRefinementLoading ? "导入订单候选中" : "导入订单锚定候选"}
@@ -3417,6 +3727,27 @@
         <button type="button" class="payment-events-peak" on:click={seekToDealPeak} title="跳到高峰前两分钟的逐字稿">
           成交高峰：{peakDealMinuteLabel} · 定位候选时段（±2 分钟）
         </button>
+      {/if}
+      {#if paymentEventsMatchMessage}
+        <div class="timeline-match-success">{paymentEventsMatchMessage}</div>
+      {/if}
+      {#if paymentEvents.length && liveDashboardBinding?.session}
+        <div class:warning={!videoLikelyFullSession && videoCalibrationStatus === "unverified"} class="video-calibration-card">
+          <div>
+            <strong>视频时间对齐</strong>
+            {#if videoCalibrationStatus === "manual"}
+              <span>已人工校准：视频从开播后 {Math.round(videoStartOffsetSec)} 秒开始</span>
+            {:else if videoLikelyFullSession || videoCalibrationStatus === "full_session"}
+              <span>视频时长与直播时长接近，可按整场视频直接对齐</span>
+            {:else}
+              <span>视频与直播时长相差约 {Math.round(videoDurationDeltaSec / 60)} 分钟，请校准一次</span>
+            {/if}
+          </div>
+          <div class="video-calibration-actions">
+            <button type="button" class="secondary-button" on:click={confirmVideoStartsWithLive}>视频从开播开始</button>
+            <button type="button" class="secondary-button" disabled={selectedDealOffsetSec == null} on:click={calibrateSelectedDealAtCurrentFrame}>当前位置就是所选成交点</button>
+          </div>
+        </div>
       {/if}
       {#if paymentEventsError}
         <small class="live-dashboard-error">{paymentEventsError}</small>
@@ -3448,15 +3779,17 @@
               已导入 {paymentEventsSummary.eventCount} 笔 · 合计 ¥{paymentEventsSummary.totalPayAmountYuan.toLocaleString("zh-CN")}
               {#if paymentEventsSourceLabel} · {paymentEventsSourceLabel}{/if}
             {:else}
-              导入 `payment-events` JSON，与录播时间对齐后在「成交话术」Tab 查看
+              一次操作依次选择本场 Excel 和未清洗订单 JSON，自动生成下单时间轴
             {/if}
           </span>
         </div>
         <div class="payment-events-actions">
-          <button type="button" class="secondary-button" on:click={openPaymentEventsPicker}>
+          <button type="button" class="secondary-button" disabled={paymentEventsLoading} on:click={importAndCleanOrderTimeline}>
             <Upload size={14} />
-            导入成交 JSON
+            导入 Excel + JSON 并自动清洗
           </button>
+          <button type="button" class="text-button" disabled={paymentEventsLoading || !liveDashboardBinding?.session} on:click={importRawPaymentEvents}>仅重新导入订单 JSON</button>
+          <button type="button" class="text-button" on:click={openPaymentEventsPicker}>导入已清洗文件</button>
           {#if paymentEvents.length}
             <button type="button" class="text-button" on:click={clearPaymentEvents}>清除</button>
           {/if}
@@ -3466,6 +3799,27 @@
         <button type="button" class="payment-events-peak" on:click={seekToDealPeak} title="跳到高峰前两分钟的逐字稿">
           成交高峰：{peakDealMinuteLabel} · 定位候选时段（±2 分钟）
         </button>
+      {/if}
+      {#if paymentEventsMatchMessage}
+        <div class="timeline-match-success">{paymentEventsMatchMessage}</div>
+      {/if}
+      {#if paymentEvents.length && liveDashboardBinding?.session}
+        <div class:warning={!videoLikelyFullSession && videoCalibrationStatus === "unverified"} class="video-calibration-card">
+          <div>
+            <strong>视频时间对齐</strong>
+            {#if videoCalibrationStatus === "manual"}
+              <span>已人工校准：视频从开播后 {Math.round(videoStartOffsetSec)} 秒开始</span>
+            {:else if videoLikelyFullSession || videoCalibrationStatus === "full_session"}
+              <span>视频时长与直播时长接近，可按整场视频直接对齐</span>
+            {:else}
+              <span>视频与直播时长相差约 {Math.round(videoDurationDeltaSec / 60)} 分钟，请校准一次</span>
+            {/if}
+          </div>
+          <div class="video-calibration-actions">
+            <button type="button" class="secondary-button" on:click={confirmVideoStartsWithLive}>视频从开播开始</button>
+            <button type="button" class="secondary-button" disabled={selectedDealOffsetSec == null} on:click={calibrateSelectedDealAtCurrentFrame}>当前位置就是所选成交点</button>
+          </div>
+        </div>
       {/if}
       {#if paymentEventsError}
         <small class="live-dashboard-error">{paymentEventsError}</small>
@@ -3484,6 +3838,8 @@
   <div class="analysis-main">
   <CompanyAnalysisWorkspace
     bind:activeTab={companyWorkspaceTab}
+    videoId={video?.id ?? null}
+    archiveSource={Boolean(archive)}
     events={paymentEvents}
     transcriptEntries={transcriptEntries}
     selectedOffsetSec={selectedDealOffsetSec}
@@ -4176,6 +4532,25 @@
   .payment-events-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .payment-events-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
   .payment-events-peak { color: #027a48; font-size: 10px; }
+  .timeline-match-success {
+    padding: 8px 10px; border: 1px solid #a6f4c5; border-radius: 9px;
+    background: #ecfdf3; color: #027a48; font-size: 12px;
+  }
+  .video-calibration-card {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px; border: 1px solid #b2ddff; border-radius: 10px;
+    background: #f0f9ff;
+  }
+  .video-calibration-card.warning { border-color: #fedf89; background: #fffaeb; }
+  .video-calibration-card > div:first-child { display: grid; gap: 3px; }
+  .video-calibration-card strong { color: #175cd3; font-size: 12px; }
+  .video-calibration-card.warning strong { color: #b54708; }
+  .video-calibration-card span { color: #475467; font-size: 11px; }
+  .video-calibration-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  @media (max-width: 900px) {
+    .video-calibration-card { align-items: stretch; flex-direction: column; }
+    .video-calibration-actions { justify-content: flex-start; }
+  }
   .hidden-file-input { display: none; }
   .text-button { border: none; background: transparent; color: #667085; cursor: pointer; font-size: 11px; padding: 0; }
   button { font: inherit; }

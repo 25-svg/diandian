@@ -29,6 +29,7 @@ pub struct LiveSessionImport {
     pub account_key: String,
     pub shop_name: String,
     pub started_at: String,
+    pub ended_at: String,
     pub payment_amount_fen: i64,
     pub per_thousand_payment_amount_fen: Option<i64>,
     pub viewer_count: Option<i64>,
@@ -248,15 +249,20 @@ fn parse_live_session(
     board: &HashMap<String, String>,
     conversion: &HashMap<String, String>,
 ) -> Result<LiveSessionImport, String> {
-    let started_at = required_field(basic, "直播时间")?
-        .split('-')
-        .next()
-        .ok_or_else(|| "官方导出直播时间格式无效".to_string())?
-        .trim();
-    let started_at = chrono::NaiveDateTime::parse_from_str(started_at, "%Y/%m/%d %H:%M:%S")
-        .map_err(|_| "官方导出直播时间格式无效".to_string())?
-        .format("%Y-%m-%dT%H:%M:%S")
-        .to_string();
+    let live_time = required_field(basic, "直播时间")?;
+    let (started_at, ended_at) = live_time
+        .split_once('-')
+        .ok_or_else(|| "官方导出直播时间缺少结束时间".to_string())?;
+    let parse_live_time = |value: &str| {
+        chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y/%m/%d %H:%M:%S")
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .map_err(|_| "官方导出直播时间格式无效".to_string())
+    };
+    let started_at = parse_live_time(started_at)?;
+    let ended_at = parse_live_time(ended_at)?;
+    if ended_at <= started_at {
+        return Err("官方导出直播结束时间必须晚于开始时间".to_string());
+    }
     let payment_amount_fen = parse_amount_to_fen(required_field(basic, "直播间用户支付金额")?)
         .ok_or_else(|| "官方导出支付金额格式无效".to_string())?;
 
@@ -264,6 +270,7 @@ fn parse_live_session(
         account_key: required_field(basic, "抖音号or火山号")?.trim().to_string(),
         shop_name: required_field(basic, "达人昵称")?.trim().to_string(),
         started_at,
+        ended_at,
         payment_amount_fen,
         per_thousand_payment_amount_fen: basic
             .get("千次观看用户支付金额")
@@ -395,6 +402,7 @@ mod tests {
         assert_eq!(session.account_key, "20296833869");
         assert_eq!(session.shop_name, "金典拍拍相机专卖店");
         assert_eq!(session.started_at, "2026-07-28T08:15:49");
+        assert_eq!(session.ended_at, "2026-07-28T15:44:39");
         assert_eq!(session.payment_amount_fen, 23_655_200);
         assert_eq!(session.per_thousand_payment_amount_fen, Some(2_643_925));
         assert_eq!(session.viewer_count, Some(6782));
@@ -412,6 +420,7 @@ mod tests {
         let imported = parse_live_dashboard_xlsx(path).unwrap();
 
         assert_eq!(imported.session.account_key, "20296833869");
+        assert_eq!(imported.session.ended_at, "2026-07-28T15:44:39");
         assert_eq!(imported.session.payment_amount_fen, 23_655_200);
     }
 

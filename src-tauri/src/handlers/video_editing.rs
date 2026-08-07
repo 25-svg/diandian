@@ -67,18 +67,33 @@ pub async fn export_learning_segment(
     start_time: f64,
     end_time: f64,
 ) -> Result<LearningSegmentExport, String> {
-    if !(start_time.is_finite() && end_time.is_finite() && start_time >= 0.0 && end_time > start_time) {
-        return Err("Learning segment requires finite timestamps with 0 <= start_time < end_time".to_string());
+    if !(start_time.is_finite()
+        && end_time.is_finite()
+        && start_time >= 0.0
+        && end_time > start_time)
+    {
+        return Err(
+            "Learning segment requires finite timestamps with 0 <= start_time < end_time"
+                .to_string(),
+        );
     }
 
-    let video = state.db.get_video(video_id).await
-        .map_err(|error| format!("Unable to load learning segment source video {video_id}: {error}"))?;
+    let video = state.db.get_video(video_id).await.map_err(|error| {
+        format!("Unable to load learning segment source video {video_id}: {error}")
+    })?;
     let output_root = state.config.read().await.output.clone();
     let input_path = crate::handlers::video::resolve_external_playback_path(
-        state.db.as_ref(), Path::new(&output_root), video.id, &video.file,
-    ).await?;
+        state.db.as_ref(),
+        Path::new(&output_root),
+        video.id,
+        &video.file,
+    )
+    .await?;
     if !input_path.is_file() {
-        return Err(format!("Learning segment source file does not exist: {}", input_path.display()));
+        return Err(format!(
+            "Learning segment source file does not exist: {}",
+            input_path.display()
+        ));
     }
 
     let output_dir = Path::new(&output_root).join("learning-segments");
@@ -90,8 +105,12 @@ pub async fn export_learning_segment(
         end_time,
     ));
     let re_encoded = crate::ffmpeg::export_learning_segment_mp4(
-        &input_path, &output_path, start_time, end_time - start_time,
-    ).await?;
+        &input_path,
+        &output_path,
+        start_time,
+        end_time - start_time,
+    )
+    .await?;
 
     Ok(LearningSegmentExport {
         output_path: output_path.to_string_lossy().to_string(),

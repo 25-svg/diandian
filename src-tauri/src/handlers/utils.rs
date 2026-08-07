@@ -319,23 +319,23 @@ pub async fn open_clip(state: state_type!(), video_id: i64) -> Result<(), String
     // Jump to the download path and open with the OS player instead.
     if should_open_clip_externally(&video.platform, &video.file) {
         let output = state.config.read().await.output.clone();
-        let path =
-            resolve_playable_disk_path(state.db.as_ref(), Path::new(&output), video_id, &video.file)
-                .await?;
+        let path = resolve_playable_disk_path(
+            state.db.as_ref(),
+            Path::new(&output),
+            video_id,
+            &video.file,
+        )
+        .await?;
         let path = crate::handlers::utils::prefer_accessible_windows_path(&path);
         if !path.is_file() {
-            return Err(format!(
-                "视频文件不存在或当前不可访问：{}",
-                path.display()
-            ));
+            return Err(format!("视频文件不存在或当前不可访问：{}", path.display()));
         }
         #[cfg(windows)]
         {
             let arg = format!("/select,{}", path.to_string_lossy());
             let _ = Command::new("explorer").arg(&arg).spawn();
-            open::that_detached(&path).map_err(|error| {
-                format!("无法启动系统播放器（{}）：{error}", path.display())
-            })?;
+            open::that_detached(&path)
+                .map_err(|error| format!("无法启动系统播放器（{}）：{error}", path.display()))?;
             return Ok(());
         }
         #[cfg(not(windows))]
@@ -409,7 +409,9 @@ async fn resolve_playable_disk_path(
     let candidate = PathBuf::from(file.trim());
     if candidate.is_absolute() {
         return if candidate.is_file() {
-            Ok(crate::handlers::utils::prefer_accessible_windows_path(&candidate))
+            Ok(crate::handlers::utils::prefer_accessible_windows_path(
+                &candidate,
+            ))
         } else {
             Err(format!(
                 "视频文件不存在或当前不可访问：{}",
@@ -420,7 +422,9 @@ async fn resolve_playable_disk_path(
 
     let joined = output.join(file);
     if joined.is_file() {
-        Ok(crate::handlers::utils::prefer_accessible_windows_path(&joined))
+        Ok(crate::handlers::utils::prefer_accessible_windows_path(
+            &joined,
+        ))
     } else {
         Err(format!(
             "视频文件不存在或当前不可访问：{}",
@@ -667,7 +671,11 @@ mod tests {
             return;
         }
         let mapped = super::prefer_accessible_windows_path(&unc);
-        assert!(mapped.is_file(), "mapped path should exist: {}", mapped.display());
+        assert!(
+            mapped.is_file(),
+            "mapped path should exist: {}",
+            mapped.display()
+        );
         assert!(
             !mapped.to_string_lossy().starts_with(r"\\"),
             "should prefer drive letter over UNC: {}",

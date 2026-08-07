@@ -136,6 +136,7 @@ mod tests {
     use super::*;
     use crate::database::live_dashboard::{
         LIVE_DASHBOARD_KPI_ALIGNMENT_MIGRATION_SQL, LIVE_DASHBOARD_MIGRATION_SQL,
+        LIVE_DASHBOARD_TIMELINE_MIGRATION_SQL,
     };
     use sqlx::{sqlite::SqlitePoolOptions, Executor};
 
@@ -147,6 +148,9 @@ mod tests {
             .unwrap();
         pool.execute(LIVE_DASHBOARD_MIGRATION_SQL).await.unwrap();
         pool.execute(LIVE_DASHBOARD_KPI_ALIGNMENT_MIGRATION_SQL)
+            .await
+            .unwrap();
+        pool.execute(LIVE_DASHBOARD_TIMELINE_MIGRATION_SQL)
             .await
             .unwrap();
         pool.execute(LIVE_DASHBOARD_BINDINGS_MIGRATION_SQL)

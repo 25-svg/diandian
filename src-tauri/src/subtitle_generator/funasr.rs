@@ -123,6 +123,16 @@ impl FunAsr {
         audio_path: &Path,
         fact_card: Option<Value>,
     ) -> Result<FunAsrResponse, String> {
+        self.transcribe_with_hotwords(audio_path, fact_card, DEFAULT_HOTWORDS)
+            .await
+    }
+
+    pub async fn transcribe_with_hotwords(
+        &self,
+        audio_path: &Path,
+        fact_card: Option<Value>,
+        hotwords: &str,
+    ) -> Result<FunAsrResponse, String> {
         let absolute = std::fs::canonicalize(audio_path)
             .map_err(|e| format!("Failed to resolve FunASR audio path: {e}"))?;
         let response = self
@@ -130,7 +140,7 @@ impl FunAsr {
             .post(format!("{ENDPOINT}/transcribe"))
             .json(&TranscribeRequest {
                 audio_path: absolute.to_string_lossy().to_string(),
-                hotwords: DEFAULT_HOTWORDS.to_string(),
+                hotwords: hotwords.trim().to_string(),
                 fact_card,
             })
             .send()
@@ -243,8 +253,7 @@ fn configure_bundled_environment(command: &mut Command, runtime_dir: &Path) {
     let model_root = runtime_dir.join("models");
     let asr_model = model_root
         .join("iic--speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch");
-    let vad_model =
-        model_root.join("iic--speech_fsmn_vad_zh-cn-16k-common-pytorch");
+    let vad_model = model_root.join("iic--speech_fsmn_vad_zh-cn-16k-common-pytorch");
     if asr_model.is_dir() {
         command.env("BSR_FUNASR_ASR_MODEL", asr_model);
     }

@@ -17,7 +17,9 @@ pub fn is_official_live_dashboard_export(path: &Path) -> bool {
         || suffix
             .strip_prefix(" (")
             .and_then(|value| value.strip_suffix(')'))
-            .is_some_and(|number| !number.is_empty() && number.chars().all(|value| value.is_ascii_digit()))
+            .is_some_and(|number| {
+                !number.is_empty() && number.chars().all(|value| value.is_ascii_digit())
+            })
 }
 
 #[cfg(test)]

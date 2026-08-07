@@ -64,6 +64,30 @@ pub async fn fetch_doudian_payment_events_state(
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]
+pub async fn import_raw_doudian_payment_events(
+    state: state_type!(),
+    live_id: String,
+    path: String,
+) -> Result<crate::raw_order_timeline::RawOrderTimelineImportResult, String> {
+    let session = state
+        .db
+        .get_bound_live_dashboard_session(&live_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "请先绑定对应的直播 Excel 场次，再导入原始订单 JSON".to_string())?;
+    let products = state
+        .db
+        .list_live_dashboard_products(session.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::raw_order_timeline::import_raw_order_timeline(
+        std::path::Path::new(&path),
+        &session,
+        &products,
+    )
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_doudian_order_config(
     state: state_type!(),
 ) -> Result<crate::config::DoudianOrderConfig, String> {

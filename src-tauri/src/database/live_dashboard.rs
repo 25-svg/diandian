@@ -68,6 +68,10 @@ ALTER TABLE live_dashboard_sessions ADD COLUMN exposure_viewer_rate REAL;
 ALTER TABLE live_dashboard_sessions ADD COLUMN qianchuan_spend_fen INTEGER;
 "#;
 
+pub const LIVE_DASHBOARD_TIMELINE_MIGRATION_SQL: &str = r#"
+ALTER TABLE live_dashboard_sessions ADD COLUMN ended_at TEXT NOT NULL DEFAULT '';
+"#;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveDashboardSessionRow {
@@ -75,6 +79,7 @@ pub struct LiveDashboardSessionRow {
     pub account_key: String,
     pub shop_name: String,
     pub started_at: String,
+    pub ended_at: String,
     pub payment_amount_fen: i64,
     pub per_thousand_payment_amount_fen: Option<i64>,
     pub viewer_count: Option<i64>,
@@ -137,10 +142,10 @@ impl Database {
         let mut transaction = pool.begin().await?;
         let now = chrono::Utc::now().to_rfc3339();
         let session = sqlx::query_as::<_, LiveDashboardSessionRow>(
-            "INSERT INTO live_dashboard_sessions (account_key, shop_name, started_at, payment_amount_fen, per_thousand_payment_amount_fen, viewer_count, average_online, average_watch_seconds, viewer_conversion_rate, deal_buyer_count, deal_item_count, product_click_conversion_rate, exposure_viewer_rate, qianchuan_spend_fen, source_file, imported_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+            "INSERT INTO live_dashboard_sessions (account_key, shop_name, started_at, ended_at, payment_amount_fen, per_thousand_payment_amount_fen, viewer_count, average_online, average_watch_seconds, viewer_conversion_rate, deal_buyer_count, deal_item_count, product_click_conversion_rate, exposure_viewer_rate, qianchuan_spend_fen, source_file, imported_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
              ON CONFLICT(account_key, started_at) DO UPDATE SET \
-               shop_name=excluded.shop_name, payment_amount_fen=excluded.payment_amount_fen, \
+               shop_name=excluded.shop_name, ended_at=excluded.ended_at, payment_amount_fen=excluded.payment_amount_fen, \
                per_thousand_payment_amount_fen=excluded.per_thousand_payment_amount_fen, viewer_count=excluded.viewer_count, \
                average_online=excluded.average_online, average_watch_seconds=excluded.average_watch_seconds, viewer_conversion_rate=excluded.viewer_conversion_rate, \
                deal_buyer_count=excluded.deal_buyer_count, deal_item_count=excluded.deal_item_count, \
@@ -151,6 +156,7 @@ impl Database {
         .bind(&imported.session.account_key)
         .bind(&imported.session.shop_name)
         .bind(&imported.session.started_at)
+        .bind(&imported.session.ended_at)
         .bind(imported.session.payment_amount_fen)
         .bind(imported.session.per_thousand_payment_amount_fen)
         .bind(imported.session.viewer_count)
@@ -284,6 +290,9 @@ mod tests {
         pool.execute(LIVE_DASHBOARD_KPI_ALIGNMENT_MIGRATION_SQL)
             .await
             .unwrap();
+        pool.execute(LIVE_DASHBOARD_TIMELINE_MIGRATION_SQL)
+            .await
+            .unwrap();
         let database = Database::new();
         database.set(pool).await;
         database
@@ -295,6 +304,7 @@ mod tests {
                 account_key: "20296833869".into(),
                 shop_name: "金典拍拍相机专卖店".into(),
                 started_at: "2026-07-28T08:15:49".into(),
+                ended_at: "2026-07-28T15:44:39".into(),
                 payment_amount_fen: 23_655_200,
                 per_thousand_payment_amount_fen: Some(2_643_925),
                 viewer_count: Some(6782),

@@ -3,6 +3,7 @@
 
 mod anchor_detection;
 mod audio_utils;
+mod compass_auto_download;
 mod config;
 mod constants;
 mod danmu2ass;
@@ -13,8 +14,8 @@ mod fs_util;
 mod handlers;
 #[cfg(feature = "headless")]
 mod http_server;
+mod idm_naming_assistant;
 mod knowledge_writer;
-mod compass_auto_download;
 mod live_dashboard_binding;
 mod live_dashboard_download_filter;
 mod live_data_import;
@@ -22,6 +23,7 @@ mod master_script;
 mod migration;
 mod nas_archive;
 mod progress;
+mod raw_order_timeline;
 mod recorder_manager;
 mod security;
 mod state;
@@ -570,6 +572,12 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::record::RECORD_ARCHIVE_KIND_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 34,
+            description: "add_live_dashboard_timeline_end",
+            sql: database::live_dashboard::LIVE_DASHBOARD_TIMELINE_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -889,10 +897,12 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::compass_auto_download::query_compass_live_sessions,
         crate::compass_auto_download::start_compass_live_downloads,
         crate::compass_auto_download::close_compass_auto_download,
+        crate::idm_naming_assistant::prepare_idm_download_filename,
         crate::handlers::live_dashboard_binding::resolve_live_dashboard_for_record,
         crate::handlers::live_dashboard_binding::bind_live_dashboard_session,
         crate::handlers::live_dashboard_binding::list_live_dashboard_bindings_for_live_ids,
         crate::handlers::doudian_orders::fetch_doudian_payment_events,
+        crate::handlers::doudian_orders::import_raw_doudian_payment_events,
         crate::handlers::doudian_orders::get_doudian_order_config,
         crate::handlers::doudian_orders::update_doudian_order_config,
         crate::handlers::master_script::start_master_ingest,
@@ -974,7 +984,12 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::video::get_video_typelist,
         crate::handlers::video::update_video_cover,
         crate::handlers::video::generate_video_subtitle,
+        crate::handlers::video::generate_video_deal_window_subtitle,
         crate::handlers::video::get_video_subtitle,
+        crate::handlers::video::get_video_deal_window_subtitle,
+        crate::handlers::video::get_video_deal_window_partial_subtitle,
+        crate::handlers::video::get_video_product_mention_scan,
+        crate::handlers::video::generate_video_product_mention_scan,
         crate::handlers::video::get_video_playback_source,
         crate::handlers::video::prepare_video_playback,
         crate::handlers::video::prepare_video_playback_preview,

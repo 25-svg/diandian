@@ -2,7 +2,7 @@
   import { createEventDispatcher } from "svelte";
   import { Package, Scissors, Loader2, RefreshCw } from "lucide-svelte";
   import type { PaymentEvent } from "../../orderDealTimeline";
-  import { formatDealMoneyYuan, paymentEventRowKey } from "../../orderDealTimeline";
+  import { buildDealWaves, formatDealMoneyYuan } from "../../orderDealTimeline";
   import {
     filterTranscriptWindow,
     formatWorkspaceClock,
@@ -35,6 +35,7 @@
   }>();
 
   $: sortedEvents = [...events].sort((left, right) => left.offsetSec - right.offsetSec);
+  $: dealWaves = buildDealWaves(sortedEvents);
   $: activeOffset = selectedOffsetSec ?? sortedEvents[0]?.offsetSec ?? null;
   $: activeEvent = activeOffset == null
     ? null
@@ -132,21 +133,24 @@
   {:else}
     <div class="panel-grid">
       <aside class="order-column" aria-label="订单列表">
-        <h3>下单时间点</h3>
+        <h3>成交波次</h3>
         <div class="order-list">
-          {#each sortedEvents as event, index (paymentEventRowKey(event, index))}
+          {#each dealWaves as wave (wave.id)}
             <button
               type="button"
               class="order-card"
-              class:selected={event.offsetSec === activeOffset}
-              on:click={() => handleSelect(event.offsetSec)}
+              class:selected={wave.events.some((event) => event.offsetSec === activeOffset)}
+              on:click={() => handleSelect(wave.anchorOffsetSec)}
             >
-              <time>{minuteLabel(event.offsetSec)}</time>
-              <span class="product" title={event.productName || "未命名商品"}>
+              <time>
+                {minuteLabel(wave.startOffsetSec)}
+                {#if wave.endOffsetSec > wave.startOffsetSec}—{minuteLabel(wave.endOffsetSec)}{/if}
+              </time>
+              <span class="product" title={wave.productName}>
                 <Package size={12} />
-                {event.productName || "未命名商品"}
+                {wave.productName}
               </span>
-              <strong>{event.payAmountFen == null ? "—" : formatDealMoneyYuan(event.payAmountFen)}</strong>
+              <strong>{wave.eventCount} 次 · {formatDealMoneyYuan(wave.totalPayAmountFen)}</strong>
             </button>
           {/each}
         </div>
@@ -258,7 +262,7 @@
   .order-column, .speech-column { min-height: 0; min-width: 0; border: 1px solid #e4e7ec; border-radius: 12px; background: #fff; overflow: hidden; display: flex; flex-direction: column; }
   .order-column h3 { margin: 0; padding: 10px 12px 6px; font-size: 12px; color: #475467; }
   .order-list { padding: 0 8px 8px; display: grid; gap: 6px; flex: 1 1 auto; min-height: 0; overflow: auto; }
-  .order-card { display: grid; grid-template-columns: 54px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid #eef2f6; border-radius: 8px; background: #fafafa; text-align: left; cursor: pointer; font-size: 12px; color: #344054; }
+  .order-card { display: grid; grid-template-columns: 94px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid #eef2f6; border-radius: 8px; background: #fafafa; text-align: left; cursor: pointer; font-size: 12px; color: #344054; }
   .order-card.selected { border-color: #84caFF; background: #eff8ff; box-shadow: inset 0 0 0 1px #2e90fa; }
   .order-card time { color: #175cd3; font-variant-numeric: tabular-nums; }
   .product { display: inline-flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
