@@ -251,10 +251,7 @@ pub async fn generate_master_sample_batch_draft(
             .begin_master_sample_batch_synthesis(batch_id)
             .await
             .map_err(String::from)?;
-        let api_key = state.config.read().await.openai_api_key.trim().to_string();
-        if api_key.is_empty() {
-            return Err("MiniMax API Key 尚未配置，无法生成最终母稿".into());
-        }
+        let api_key = crate::handlers::ai::configured_minimax_api_key(&state).await?;
         let parameter_cards = state
             .db
             .list_asr_parameter_cards()
@@ -340,6 +337,8 @@ pub async fn publish_master_sample_batch_draft(
     {
         return Err("请先生成完成并核对最终母稿草稿，再发布企业母稿".into());
     }
+    let host_label = resolve_batch_host_label(&state, &detail).await?;
+    let kb_root = host_knowledge_base_root(&host_label)?;
     let draft_json = detail
         .synthesis
         .as_ref()
@@ -357,17 +356,28 @@ pub async fn publish_master_sample_batch_draft(
         .ok_or_else(|| "母稿样本缺少可追溯逐字稿来源".to_string())?;
     let script_key = builder::safe_key(&format!("MS-BATCH-{}", detail.batch.id))?;
     let vault = configured_vault(&state).await?;
-    let base = PathBuf::from("10-企业母稿").join(&script_key).join("V1.0");
-    let index_relative = base.join("README.md");
+    let speech_base = kb_root.join("话术").join("V1.0");
+    let index_relative = speech_base.join("README.md");
     let index = render_batch_master_index(&script_key, &detail, &draft);
     let sections = batch_draft_sections(&detail, &draft)?;
     let mut files = vec![(index_relative.clone(), index.clone())];
     for (section, row) in draft.sections.iter().zip(&sections) {
         files.push((
-            base.join(format!("{:02}-{}.md", row.position, row.section_key)),
+            speech_base.join(format!("{:02}-{}.md", row.position, row.section_key)),
             render_batch_master_section(&script_key, row, section),
         ));
     }
+    files.push((
+        kb_root.join("分析建议").join("执行规则.md"),
+        render_host_analysis_advice(&host_label, &detail, &draft),
+    ));
+    let video_paths = load_batch_video_paths(&state, &draft).await;
+    files.extend(render_host_deal_video_refs(
+        &kb_root,
+        &host_label,
+        &draft,
+        &video_paths,
+    ));
     let mut created = Vec::<PathBuf>::new();
     for (relative, content) in files {
         if let Err(error) = write_new_master_file(&vault, &relative, &content, &mut created).await {
@@ -418,6 +428,8 @@ pub async fn publish_corrected_master_sample_batch_version(
     if detail.batch.status != "published" {
         return Err("请先发布 V1.0 母稿，再生成校正版本".into());
     }
+    let host_label = resolve_batch_host_label(&state, &detail).await?;
+    let kb_root = host_knowledge_base_root(&host_label)?;
     let script_key = builder::safe_key(&format!("MS-BATCH-{}", detail.batch.id))?;
     let previous = state
         .db
@@ -463,20 +475,29 @@ pub async fn publish_corrected_master_sample_batch_version(
     }
 
     let vault = configured_vault(&state).await?;
-    let base = PathBuf::from("10-企业母稿").join(&script_key).join("V1.1");
-    let index_relative = base.join("README.md");
+    let speech_base = kb_root.join("话术").join("V1.1");
+    let index_relative = speech_base.join("README.md");
     let index =
         render_corrected_batch_master_index(&detail, &previous, &sections, correction_count);
     let mut files = vec![(index_relative.clone(), index.clone())];
     for section in &sections {
         files.push((
-            base.join(format!(
+            speech_base.join(format!(
                 "{:02}-{}.md",
                 section.position, section.section_key
             )),
             render_corrected_batch_master_section(&script_key, section),
         ));
     }
+    files.push((
+        kb_root.join("分析建议").join("校正说明-V1.1.md"),
+        format!(
+            "# 分析建议（校正版）\n\n- 主播：{}\n- 样本批次：{}\n- 版本：V1.1\n\n## 本次校正\n\n- 已应用 {} 处可确定的型号格式校正。\n- 未能由规则验证的内容保持原样，避免擅自改写主播原话。\n",
+            host_label,
+            detail.batch.title.trim(),
+            correction_count
+        ),
+    ));
     let mut created = Vec::<PathBuf>::new();
     for (relative, content) in files {
         if let Err(error) = write_new_master_file(&vault, &relative, &content, &mut created).await {
@@ -828,10 +849,7 @@ pub async fn preview_master_script(
 ) -> Result<MasterPreview, String> {
     let script_key = builder::safe_key(&request.script_key)?;
     let truth = load_master_truth(&state, request.source_id).await?;
-    let api_key = state.config.read().await.openai_api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("MiniMax API Key 尚未配置，无法整理母稿".into());
-    }
+    let api_key = crate::handlers::ai::configured_minimax_api_key(&state).await?;
     let draft = model::generate_master_draft(
         &api_key,
         &request.title,
@@ -1684,6 +1702,199 @@ async fn configured_vault(state: &State) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Resolves the host display name used for `{主播名}知识库`.
+/// Prefers batch `host_label`; falls back to any non-empty video `anchor_name`.
+async fn resolve_batch_host_label(
+    state: &State,
+    detail: &MasterSampleBatchDetail,
+) -> Result<String, String> {
+    let from_batch = detail.batch.host_label.trim();
+    if !from_batch.is_empty() {
+        return Ok(from_batch.to_string());
+    }
+    for item in &detail.items {
+        if let Ok(video) = state.db.get_video(item.video_id).await {
+            let anchor = video.anchor_name.trim();
+            if !anchor.is_empty() {
+                return Ok(anchor.to_string());
+            }
+        }
+    }
+    Err(
+        "请先在批次填写样本来源/主播名（如：于千惠），再发布到「主播知识库」；无主播名无法创建知识库目录。"
+            .into(),
+    )
+}
+
+fn host_knowledge_base_root(host_label: &str) -> Result<PathBuf, String> {
+    let name = sanitize_host_knowledge_base_name(host_label)?;
+    Ok(PathBuf::from(name))
+}
+
+fn sanitize_host_knowledge_base_name(host_label: &str) -> Result<String, String> {
+    let trimmed = host_label.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "请先在批次填写样本来源/主播名（如：于千惠），再发布到「主播知识库」。".into(),
+        );
+    }
+    let sanitized: String = trimmed
+        .chars()
+        .filter(|character| {
+            !matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0'
+            ) && !character.is_control()
+        })
+        .collect::<String>()
+        .trim()
+        .trim_end_matches(['.', ' '])
+        .to_string();
+    if sanitized.is_empty() {
+        return Err("主播名包含无效字符，请改用可识别的中文或字母名称后再发布。".into());
+    }
+    if sanitized.ends_with("知识库") {
+        Ok(sanitized)
+    } else {
+        Ok(format!("{sanitized}知识库"))
+    }
+}
+
+async fn load_batch_video_paths(
+    state: &State,
+    draft: &model::BatchMasterDraft,
+) -> HashMap<i64, (String, String)> {
+    let mut paths = HashMap::new();
+    let mut seen = HashSet::new();
+    for evidence in &draft.evidence {
+        if !seen.insert(evidence.video_id) {
+            continue;
+        }
+        if let Ok(video) = state.db.get_video(evidence.video_id).await {
+            let title = if video.title.trim().is_empty() {
+                evidence.video_title.clone()
+            } else {
+                video.title
+            };
+            paths.insert(evidence.video_id, (title, video.file));
+        }
+    }
+    paths
+}
+
+fn render_host_analysis_advice(
+    host_label: &str,
+    detail: &MasterSampleBatchDetail,
+    draft: &model::BatchMasterDraft,
+) -> String {
+    let rules = if draft.operating_rules.is_empty() {
+        "暂无执行规则，待人工补充。".to_string()
+    } else {
+        draft
+            .operating_rules
+            .iter()
+            .map(|rule| format!("- {}", rule.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let patterns = if draft.patterns.is_empty() {
+        "暂无规律观察。".to_string()
+    } else {
+        draft
+            .patterns
+            .iter()
+            .map(|pattern| {
+                format!(
+                    "### {}\n\n{}\n\n证据：{}",
+                    pattern.name.trim(),
+                    pattern.observation.trim(),
+                    if pattern.evidence_ids.is_empty() {
+                        "无".into()
+                    } else {
+                        pattern.evidence_ids.join("、")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    format!(
+        "# 分析建议\n\n- 主播：{}\n- 样本批次：{}\n- 版本：V1.0\n- 状态：已审核发布\n\n## 执行规则\n\n{}\n\n## 规律观察\n\n{}\n\n> AI 只给建议，不代替人拍板照念。\n",
+        host_label.trim(),
+        detail.batch.title.trim(),
+        rules,
+        patterns
+    )
+}
+
+fn render_host_deal_video_refs(
+    kb_root: &Path,
+    host_label: &str,
+    draft: &model::BatchMasterDraft,
+    video_paths: &HashMap<i64, (String, String)>,
+) -> Vec<(PathBuf, String)> {
+    let video_dir = kb_root.join("视频").join("成交");
+    if draft.evidence.is_empty() {
+        return vec![(
+            video_dir.join("README.md"),
+            format!(
+                "# 成交视频索引\n\n- 主播：{}\n- 类目：成交\n\n暂无带视频路径的证据条目。\n",
+                host_label.trim()
+            ),
+        )];
+    }
+    draft
+        .evidence
+        .iter()
+        .map(|evidence| {
+            let (fallback_title, file_path) = video_paths
+                .get(&evidence.video_id)
+                .cloned()
+                .unwrap_or_else(|| (evidence.video_title.clone(), String::new()));
+            let title = if evidence.video_title.trim().is_empty() {
+                fallback_title
+            } else {
+                evidence.video_title.clone()
+            };
+            let path_line = if file_path.trim().is_empty() {
+                "（未找到本地/NAS 路径，请在视频库核对）".to_string()
+            } else {
+                file_path
+            };
+            let file_name = format!("{}.md", sanitize_evidence_file_stem(&evidence.evidence_id));
+            let content = format!(
+                "# {}\n\n- 主播：{}\n- 类目：成交\n- 证据编号：{}\n- 本地/NAS 路径：`{}`\n- 时间窗：{} — {}（毫秒）\n- 引用原话：{}\n\n> 本文件仅为路径引用，**未复制**视频文件进知识库。\n",
+                title.trim(),
+                host_label.trim(),
+                evidence.evidence_id,
+                path_line,
+                evidence.start_ms,
+                evidence.end_ms,
+                evidence.quote.trim(),
+            );
+            (video_dir.join(file_name), content)
+        })
+        .collect()
+}
+
+fn sanitize_evidence_file_stem(evidence_id: &str) -> String {
+    let stem: String = evidence_id
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if stem.is_empty() {
+        "evidence".into()
+    } else {
+        stem
+    }
+}
+
 async fn write_new_master_file(
     vault: &Path,
     relative: &Path,
@@ -1982,8 +2193,22 @@ fn has_deterministic_model_format_correction(host_text: &str, master_text: &str)
 mod correction_status_tests {
     use super::{
         apply_upgrade_candidate_text, has_deterministic_model_format_correction,
-        upgrade_decision_rank,
+        sanitize_host_knowledge_base_name, upgrade_decision_rank,
     };
+
+    #[test]
+    fn builds_host_knowledge_base_folder_name() {
+        assert_eq!(
+            sanitize_host_knowledge_base_name("于千惠").unwrap(),
+            "于千惠知识库"
+        );
+        assert_eq!(
+            sanitize_host_knowledge_base_name("于千惠知识库").unwrap(),
+            "于千惠知识库"
+        );
+        assert!(sanitize_host_knowledge_base_name("  ").unwrap_err().contains("主播名"));
+        assert!(sanitize_host_knowledge_base_name("a/b").unwrap().contains("知识库"));
+    }
 
     #[test]
     fn recognizes_only_deterministic_model_format_corrections() {

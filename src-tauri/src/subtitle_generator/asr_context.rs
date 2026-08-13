@@ -148,18 +148,36 @@ impl DanmuTimeline {
 fn parse_danmu(content: &str) -> Vec<DanmuEntry> {
     let mut entries = content
         .lines()
-        .filter_map(|line| {
-            let (timestamp, text) = line.split_once(':')?;
-            let timestamp_ms = timestamp.trim().parse::<u64>().ok()?;
-            let text = text.trim();
-            (!text.is_empty()).then(|| DanmuEntry {
-                timestamp_ms,
-                text: text.to_string(),
-            })
-        })
+        .filter_map(|line| parse_danmu_line(line))
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.timestamp_ms);
     entries
+}
+
+fn parse_danmu_line(line: &str) -> Option<DanmuEntry> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let timestamp_ms = value
+            .get("ts")
+            .and_then(|ts| ts.as_i64().or_else(|| ts.as_u64().map(|v| v as i64)))?
+            as u64;
+        let text = value.get("content")?.as_str()?.trim();
+        return (!text.is_empty()).then(|| DanmuEntry {
+            timestamp_ms,
+            text: text.to_string(),
+        });
+    }
+    let (timestamp, text) = line.split_once(':')?;
+    let timestamp_ms = timestamp.trim().parse::<u64>().ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| DanmuEntry {
+        timestamp_ms,
+        text: text.to_string(),
+    })
 }
 
 fn sanitize_message(value: &str) -> String {
@@ -202,6 +220,20 @@ mod tests {
         assert_eq!(context.evidence_count, 3);
         assert_eq!(json["context_data"][0]["text"], "看下成色");
         assert_eq!(json["context_data"][2]["text"], "A7M4有准新嘛");
+    }
+
+    #[test]
+    fn parses_json_danmu_lines() {
+        let entries = parse_danmu(
+            r#"{"ts":1000000,"content":"A7M4有准新嘛","user_name":"买家甲"}
+{"ts":1010000,"content":"看下成色","user_id":"9","user_name":"买家乙"}
+1000000:legacy仍可读
+"#,
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].text, "A7M4有准新嘛");
+        assert_eq!(entries[1].text, "legacy仍可读");
+        assert_eq!(entries[2].text, "看下成色");
     }
 
     #[test]

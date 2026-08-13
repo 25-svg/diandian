@@ -117,7 +117,7 @@
     if (check_interval) {
       clearInterval(check_interval);
     }
-    douyinLoginStatus = "请在新窗口中使用抖音 App 扫码并确认登录";
+    douyinLoginStatus = "请在新窗口点右上角红色「登录」扫码；若出现拒绝访问/403，点刷新或关掉窗口重开一次";
     try {
       await invoke("open_douyin_login");
       check_interval = setInterval(check_douyin_login, 2000);

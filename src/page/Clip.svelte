@@ -679,8 +679,9 @@
     }));
   }
 
-  function buildMasterFromVideo(video: VideoItem) {
-    window.dispatchEvent(new CustomEvent("bsr:build-master", { detail: video }));
+  function buildMasterFromVideo(_video: VideoItem) {
+    // 已废弃：整场视频不得直接设为母稿
+    alert("已废弃「设为整场母稿」。请从成交话术精炼后，经切片复盘验证并人工确认，再勾选样本创建「母稿样本批次」入库。");
   }
 
   async function loadMasterSampleBatches() {
@@ -900,9 +901,11 @@
   async function publishSelectedMasterBatchDraft() {
     if (!selectedMasterSampleBatch || publishingMasterBatchDraft) return;
     const isEnterprise = canActivateEnterpriseMaster(selectedMasterSampleBatch.batch.purpose);
+    const hostRaw = (selectedMasterSampleBatch.batch.hostLabel || "").trim() || "该主播";
+    const hostKb = hostRaw.endsWith("知识库") ? hostRaw : `${hostRaw}知识库`;
     const message = isEnterprise
-      ? "确认已核对章节规律、固定原话和证据编号吗？发布后会写入 Obsidian，并成为后续录播评分的唯一企业母稿 V1.0。"
-      : "确认已核对章节规律、固定原话和证据编号吗？该批次会写入 Obsidian 作为头部主播样本，不会成为后续录播的评分母稿。";
+      ? `确认已核对章节规律、固定原话和证据编号吗？发布后会写入 Obsidian「${hostKb}」的 视频/成交、话术、分析建议，并成为后续录播评分的企业母稿 V1.0。`
+      : `确认已核对章节规律、固定原话和证据编号吗？该批次会写入 Obsidian「${hostKb}」的 视频/成交、话术、分析建议，不会成为后续录播的评分母稿。`;
     if (!confirm(message)) return;
     publishingMasterBatchDraft = true;
     masterBatchProgressError = "";
@@ -914,7 +917,7 @@
       selectedMasterSampleBatch = await getMasterSampleBatch(selectedMasterSampleBatch.batch.id);
       await loadMasterSampleBatches();
     } catch (error) {
-      masterBatchProgressError = `无法发布企业母稿：${String(error)}`;
+      masterBatchProgressError = `无法发布到主播知识库：${String(error)}`;
     } finally {
       publishingMasterBatchDraft = false;
     }
@@ -946,7 +949,7 @@
   function openMasterBatchDialog(videoIds = Array.from(selectedVideos), purpose: MasterSampleBatchPurpose = "sample") {
     const ids = Array.from(new Set(videoIds));
     if (ids.length === 0) {
-      alert("请至少选择一场完整直播，再创建母稿样本批次。");
+      alert("请至少勾选已整理的成交话术样本/证据视频，再创建母稿样本批次。");
       return;
     }
     masterBatchVideoIds = ids;
@@ -955,7 +958,7 @@
     masterBatchTitle = purpose === "enterprise"
       ? `金典拍拍直播母稿 ${date}`
       : `头部主播样本批次 ${date}`;
-    masterBatchHostLabel = purpose === "enterprise" ? "头部主播已审核样本" : "头部主播样本";
+    masterBatchHostLabel = "";
     masterBatchTargetCount = Math.max(6, ids.length);
     masterBatchError = "";
     showMasterBatchDialog = true;
@@ -1035,10 +1038,17 @@
         alert("还没有可汇总的主播话术。请先点击“整理主播话术”，完成至少一位头部主播的录播整理。");
         return;
       }
+      const hostLabel = details
+        .map((detail) => (detail.batch.hostLabel || "").trim())
+        .find((label) => label.length > 0) || "";
+      if (!hostLabel) {
+        alert("样本批次缺少主播名。请先在样本批次填写主播名（如：于千惠），再汇总公司统一话术。");
+        return;
+      }
       const date = new Date().toLocaleDateString("zh-CN").replaceAll("/", "-");
       const detail = await createMasterSampleBatch({
         title: `金典拍拍公司统一话术 ${date}`,
-        hostLabel: "已审核的头部主播话术",
+        hostLabel,
         purpose: "enterprise",
         targetSampleCount: videoIds.length,
         videoIds,
@@ -1062,6 +1072,10 @@
   async function createSelectedMasterBatch() {
     if (!masterBatchTitle.trim()) {
       masterBatchError = "请填写样本批次名称。";
+      return;
+    }
+    if (!masterBatchHostLabel.trim()) {
+      masterBatchError = "请填写主播名（样本来源）。发布后将创建「{主播名}知识库」。";
       return;
     }
     creatingMasterBatch = true;
@@ -1854,8 +1868,10 @@
                   <td class="px-4 py-3 w-44">
                     <div class="flex items-center space-x-2">
                       <button
-                        class="p-1.5 rounded-lg hover:bg-emerald-500/10 transition-colors"
-                        title="设为整场母稿"
+                        type="button"
+                        class="p-1.5 rounded-lg opacity-40 cursor-not-allowed"
+                        title="已废弃：请从成交话术精炼后经切片复盘入库"
+                        disabled
                         on:click={() => buildMasterFromVideo(video)}
                       >
                         <BookOpenCheck class="w-4 h-4 text-emerald-600" />
@@ -2169,8 +2185,8 @@
         <h3 class="text-base font-semibold text-gray-900 dark:text-white">{masterBatchPurpose === "enterprise" ? "汇总金典拍拍企业母稿" : "建立头部主播样本批次"}</h3>
         <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
           {masterBatchPurpose === "enterprise"
-            ? `已选 ${masterBatchVideoIds.length} 场已整理样本，将直接复用现有逐字稿和证据，不会重新调用 ASR。`
-            : `已选 ${masterBatchVideoIds.length} 场整场直播。先完成逐场转写和整理，再作为企业母稿的证据来源。`}
+            ? `已选 ${masterBatchVideoIds.length} 份已整理成交话术样本/证据，将直接复用现有逐字稿与证据，不会重新调用 ASR。发布后进入「{主播名}知识库」的 视频/成交、话术、分析建议（视频只写路径引用，不拷贝文件）。`
+            : `已选 ${masterBatchVideoIds.length} 份样本。请确保已是整理后的成交话术证据。发布后进入「{主播名}知识库」的 视频/成交、话术、分析建议（非整场视频直接炼母稿；视频只引用路径）。`}
         </p>
       </div>
       <div class="space-y-4 px-6 py-5">
@@ -2179,8 +2195,8 @@
           <input bind:value={masterBatchTitle} class="mt-1.5 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 dark:border-gray-600 dark:bg-gray-800 dark:text-white" />
         </label>
         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
-          样本来源说明
-          <input bind:value={masterBatchHostLabel} placeholder="例如：罗雨欣、于千惠等头部主播" class="mt-1.5 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 dark:border-gray-600 dark:bg-gray-800 dark:text-white" />
+          主播名（样本来源）
+          <input bind:value={masterBatchHostLabel} placeholder="必填，例如：于千惠（将创建「于千惠知识库」）" class="mt-1.5 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 dark:border-gray-600 dark:bg-gray-800 dark:text-white" />
         </label>
         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
           计划收集场次

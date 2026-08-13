@@ -146,7 +146,7 @@ export function clipTranscriptToSrt(entries: readonly WorkspaceTranscriptEntry[]
 export function buildClipReviewRequest(options: {
   taskId: string;
   parentVideoId: number;
-  ranges: readonly ClipReviewRange[];
+  ranges?: readonly ClipReviewRange[];
   transcriptEntries: readonly WorkspaceTranscriptEntry[];
   videos: readonly VideoItem[];
   taskMetadata: string;
@@ -154,13 +154,13 @@ export function buildClipReviewRequest(options: {
   const videoById = new Map(options.videos.map((video) => [video.id, video]));
   const items = parseGeneratedDealClips(options.taskMetadata).flatMap((generated) => {
     const video = videoById.get(generated.videoId);
-    const range = options.ranges[generated.index];
-    if (!video || !range) return [];
+    if (!video) return [];
+    const range = options.ranges?.[generated.index];
     return [{
       video,
       sourceStartSec: generated.start,
       sourceEndSec: generated.end,
-      reason: range.reason,
+      reason: range?.reason || generated.title || "",
       transcriptEntries: clipLocalTranscript(
         options.transcriptEntries,
         generated.start,
@@ -172,7 +172,116 @@ export function buildClipReviewRequest(options: {
     ? {
         taskId: options.taskId,
         parentVideoId: options.parentVideoId,
-        items,
+        items: sortClipReviewItems(items),
+      }
+    : null;
+}
+
+function sortClipReviewItems(items: ClipReviewItem[]): ClipReviewItem[] {
+  return [...items].sort((left, right) =>
+    left.sourceStartSec - right.sourceStartSec || left.sourceEndSec - right.sourceEndSec
+  );
+}
+
+export function mergeClipReviewRequest(
+  current: ClipReviewRequest | null,
+  incoming: ClipReviewRequest,
+): ClipReviewRequest {
+  const byId = new Map((current?.items ?? []).map((item) => [item.video.id, item]));
+  for (const item of incoming.items) {
+    if (!byId.has(item.video.id)) byId.set(item.video.id, item);
+  }
+  return {
+    taskId: incoming.taskId,
+    parentVideoId: incoming.parentVideoId,
+    items: sortClipReviewItems([...byId.values()]),
+  };
+}
+
+export type SavedClipReviewItem = {
+  videoId: number;
+  sourceStartSec: number;
+  sourceEndSec: number;
+  reason: string;
+};
+
+export type SavedClipReviewRequest = {
+  taskId: string;
+  parentVideoId: number;
+  items: SavedClipReviewItem[];
+};
+
+export function clipReviewRequestStorageKey(sourceKey: string): string {
+  return `bsr:clip-review-request:v1:${sourceKey}`;
+}
+
+export function serializeClipReviewRequest(request: ClipReviewRequest): SavedClipReviewRequest {
+  return {
+    taskId: request.taskId,
+    parentVideoId: request.parentVideoId,
+    items: request.items.map((item) => ({
+      videoId: item.video.id,
+      sourceStartSec: item.sourceStartSec,
+      sourceEndSec: item.sourceEndSec,
+      reason: item.reason,
+    })),
+  };
+}
+
+export function parseSavedClipReviewRequest(raw: string | null): SavedClipReviewRequest | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as Partial<SavedClipReviewRequest>;
+    if (!value || typeof value.taskId !== "string" || !Number.isFinite(value.parentVideoId) || !Array.isArray(value.items)) {
+      return null;
+    }
+    const items = value.items.flatMap((item) => {
+      if (!item || !Number.isFinite(item.videoId) || !Number.isFinite(item.sourceStartSec) || !Number.isFinite(item.sourceEndSec)) {
+        return [];
+      }
+      return [{
+        videoId: Math.trunc(item.videoId),
+        sourceStartSec: item.sourceStartSec,
+        sourceEndSec: item.sourceEndSec,
+        reason: typeof item.reason === "string" ? item.reason : "",
+      }];
+    });
+    return items.length
+      ? { taskId: value.taskId, parentVideoId: Math.trunc(value.parentVideoId), items }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function rebuildClipReviewRequest(options: {
+  taskId: string;
+  parentVideoId: number;
+  items: readonly SavedClipReviewItem[];
+  videos: readonly VideoItem[];
+  transcriptEntries: readonly WorkspaceTranscriptEntry[];
+}): ClipReviewRequest | null {
+  const videoById = new Map(options.videos.map((video) => [video.id, video]));
+  const items = options.items.flatMap((saved) => {
+    const video = videoById.get(saved.videoId);
+    if (!video || saved.sourceEndSec <= saved.sourceStartSec) return [];
+    return [{
+      video,
+      sourceStartSec: saved.sourceStartSec,
+      sourceEndSec: saved.sourceEndSec,
+      reason: saved.reason,
+      transcriptEntries: clipLocalTranscript(
+        options.transcriptEntries,
+        saved.sourceStartSec,
+        saved.sourceEndSec,
+      ),
+    }];
+  });
+  return items.length
+    ? {
+        taskId: options.taskId,
+        parentVideoId: options.parentVideoId,
+        items: sortClipReviewItems(items),
       }
     : null;
 }

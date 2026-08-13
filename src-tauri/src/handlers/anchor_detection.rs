@@ -236,10 +236,7 @@ async fn run_minimax_anchor_detection(
     state: &State,
     video_id: i64,
 ) -> Result<(String, String, String, String), String> {
-    let api_key = state.config.read().await.openai_api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("MiniMax API Key 尚未配置，请由管理员在设置中完成配置".to_string());
-    }
+    let api_key = crate::handlers::ai::configured_minimax_api_key(state).await?;
 
     let context = resolve_video_transcript_context(state, video_id).await?;
     let duration_ms = crate::ffmpeg::probe_media_duration_ms(&context.media_file).await?;
@@ -277,10 +274,10 @@ async fn run_archive_minimax_anchor_detection(
     live_id: &str,
     _duration_seconds: f64,
 ) -> Result<(String, String, String, String), String> {
-    let api_key = config.read().await.openai_api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("MiniMax API Key is not configured".to_string());
-    }
+    let api_key = {
+        let config = config.read().await;
+        crate::handlers::ai::configured_minimax_api_key_from_config(&config)?
+    };
     let platform_type = PlatformType::from_str(platform)
         .map_err(|_| format!("unsupported archive platform: {platform}"))?;
     let cache = config.read().await.cache.clone();

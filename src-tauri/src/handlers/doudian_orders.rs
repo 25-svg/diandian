@@ -1,3 +1,4 @@
+use crate::database::DatabaseError;
 use crate::doudian_orders::{
     fetch_payment_events, resolve_live_window, FetchDoudianPaymentEventsResult,
 };
@@ -40,11 +41,15 @@ pub async fn fetch_doudian_payment_events_state(
     state: &State,
     request: FetchDoudianPaymentEventsRequest,
 ) -> Result<FetchDoudianPaymentEventsResult, String> {
-    let record = state
+    let record = match state
         .db
         .get_record(&request.room_id, &request.live_id)
         .await
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(row) => Some(row),
+        Err(DatabaseError::NotFound) => None,
+        Err(error) => return Err(error.to_string()),
+    };
 
     let dashboard_session = state
         .db
@@ -53,7 +58,7 @@ pub async fn fetch_doudian_payment_events_state(
         .map_err(|error| error.to_string())?;
 
     let (live_started_at, live_ended_at) = resolve_live_window(
-        &record,
+        record.as_ref(),
         dashboard_session.as_ref(),
         request.live_started_at,
         request.live_ended_at,

@@ -1,8 +1,8 @@
 use crate::database::live_dashboard::LiveDashboardSessionRow;
 use crate::live_dashboard_binding::{
-    candidate_sessions, imported_video_candidate_sessions, infer_shop_name_from_texts,
-    match_dashboard_sessions, match_imported_video_sessions, session_matches_shop,
-    LiveDashboardMatchCandidate, RecordForLiveDashboardBinding, CANDIDATE_WINDOW_SECS,
+    infer_shop_name_from_texts, match_dashboard_sessions, match_imported_video_by_duration,
+    match_imported_video_sessions, session_matches_shop, LiveDashboardMatchCandidate,
+    RecordForLiveDashboardBinding,
 };
 use crate::state::State;
 use crate::state_type;
@@ -105,8 +105,21 @@ pub async fn resolve_live_dashboard_for_record_state(
             .list_live_dashboard_sessions()
             .await
             .map_err(|error| error.to_string())?;
-        let matched =
+        let mut matched =
             match_imported_video_sessions(&video.title, &video.file, &video.note, &sessions);
+        if matched.automatic.is_none() {
+            let duration_matched = match_imported_video_by_duration(
+                &video.title,
+                &video.file,
+                &video.note,
+                &video.created_at,
+                (video.length > 0).then_some(video.length),
+                &sessions,
+            );
+            if duration_matched.automatic.is_some() || matched.candidates.is_empty() {
+                matched = duration_matched;
+            }
+        }
         if let Some((session, method)) = matched.automatic {
             state
                 .db
@@ -121,16 +134,7 @@ pub async fn resolve_live_dashboard_for_record_state(
         }
         return Ok(ResolveLiveDashboardResult {
             session: None,
-            candidates: imported_video_candidate_sessions(
-                &video.title,
-                &video.file,
-                &video.note,
-                &sessions,
-                CANDIDATE_WINDOW_SECS,
-            )
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+            candidates: matched.candidates.into_iter().map(Into::into).collect(),
             match_method: None,
         });
     }
@@ -153,6 +157,7 @@ pub async fn resolve_live_dashboard_for_record_state(
         room_id: record.room_id,
         title: record.title,
         created_at: record.created_at,
+        length_secs: (record.length > 0.0).then_some(record.length.round() as i64),
     };
     let sessions = state
         .db
@@ -175,10 +180,7 @@ pub async fn resolve_live_dashboard_for_record_state(
 
     Ok(ResolveLiveDashboardResult {
         session: None,
-        candidates: candidate_sessions(&input, &sessions, CANDIDATE_WINDOW_SECS)
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+        candidates: matched.candidates.into_iter().map(Into::into).collect(),
         match_method: None,
     })
 }

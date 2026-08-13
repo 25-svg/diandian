@@ -247,6 +247,14 @@ assert.deepEqual(friendlyMasterError("母稿已更新，请按最新版本重新
   detail: "这条结果基于旧版企业标准，不能直接加入新版。",
   nextAction: "回到对应录播，按当前企业标准重新分析该片段。",
 });
+assert.deepEqual(
+  friendlyMasterError("请先在批次填写样本来源/主播名（如：于千惠），再发布到「主播知识库」"),
+  {
+    title: "缺少主播名",
+    detail: "请先在批次填写样本来源/主播名（如：于千惠），再发布到「主播知识库」",
+    nextAction: "在批次中填写样本来源/主播名（如：于千惠）后重试发布。",
+  },
+);
 assert.deepEqual(upgradePublishGate(false, 1), { allowed: false, reason: "请先确认母稿差异" });
 assert.deepEqual(upgradePublishGate(true, 0), { allowed: false, reason: "至少选择一条已通过的候选辅稿" });
 assert.deepEqual(upgradePublishGate(true, 2), { allowed: true, reason: "可以发布母稿新版本" });

@@ -4,6 +4,10 @@
   import type { PaymentEvent } from "../../orderDealTimeline";
   import { buildDealWaves, formatDealMoneyYuan } from "../../orderDealTimeline";
   import {
+    summarizeWaveChattersMap,
+    type DanmuSpeakerEntry,
+  } from "../../dealWaveChatters";
+  import {
     filterTranscriptWindow,
     formatWorkspaceClock,
     resolveDealSpeechWindow,
@@ -16,6 +20,7 @@
   export let selectedOffsetSec: number | null = null;
   export let transcriptReady = false;
   export let canAutoClip = false;
+  export let autoClipDisabledReason = "需要成交订单、逐字稿和可切片视频";
   export let autoClipping = false;
   export let autoClipProgress = "";
   export let autoClipError = "";
@@ -23,6 +28,9 @@
   export let speechRefining = false;
   export let speechRefineProgress = "";
   export let speechRefineError = "";
+  /** Absolute-ms danmu rows for weak pre-pay speaker对照. */
+  export let danmuEntries: DanmuSpeakerEntry[] = [];
+  export let liveStartedAt: string | null = null;
 
   let expandContext = false;
   let lastRefinedKey = "";
@@ -35,8 +43,15 @@
   }>();
 
   $: sortedEvents = [...events].sort((left, right) => left.offsetSec - right.offsetSec);
-  $: dealWaves = buildDealWaves(sortedEvents);
+  $: dealWaves = [...buildDealWaves(sortedEvents)].sort(
+    (left, right) => left.startOffsetSec - right.startOffsetSec,
+  );
+  $: waveChatters = summarizeWaveChattersMap(dealWaves, danmuEntries, liveStartedAt);
   $: activeOffset = selectedOffsetSec ?? sortedEvents[0]?.offsetSec ?? null;
+  $: activeWave = activeOffset == null
+    ? null
+    : dealWaves.find((wave) => wave.events.some((event) => event.offsetSec === activeOffset)) ?? null;
+  $: activeChatters = activeWave ? waveChatters.get(activeWave.id) ?? null : null;
   $: activeEvent = activeOffset == null
     ? null
     : sortedEvents.find((event) => event.offsetSec === activeOffset) ?? null;
@@ -79,14 +94,13 @@
   <header class="panel-head">
     <div>
       <strong>成交话术</strong>
-      <p>下单时间为锚点；AI 回溯完整成交链路并生成一个连续切片，完成后自动进入三栏复盘页。</p>
     </div>
     <div class="head-actions">
       <button
         type="button"
         class="auto-clip-btn"
         disabled={!canAutoClip || autoClipping}
-        title={!canAutoClip ? "需要成交订单、逐字稿和可切片视频" : "批量导出当前选中商品簇的完整成交链路 MP4"}
+        title={!canAutoClip ? autoClipDisabledReason : "批量导出当前选中商品簇的完整成交链路 MP4"}
         on:click={() => dispatch("autoClip")}
       >
         {#if autoClipping}
@@ -94,11 +108,11 @@
         {:else}
           <Scissors size={14} />
         {/if}
-        AI 分析话术并自动切片
+        AI 分析并切片
       </button>
     </div>
   </header>
-  {#if autoClipProgress || autoClipError || speechRefineProgress || speechRefineError || speechRefining}
+  {#if autoClipProgress || autoClipError || speechRefineError || speechRefining}
     <div
       class="auto-clip-status"
       class:error={Boolean(autoClipError || speechRefineError)}
@@ -119,8 +133,6 @@
           <Loader2 size={14} class="is-spinning" />
           {speechRefineProgress || "AI 正在定位成交链路…"}
         </span>
-      {:else if speechRefineProgress}
-        <span>{speechRefineProgress}</span>
       {/if}
     </div>
   {/if}
@@ -146,10 +158,23 @@
                 {minuteLabel(wave.startOffsetSec)}
                 {#if wave.endOffsetSec > wave.startOffsetSec}—{minuteLabel(wave.endOffsetSec)}{/if}
               </time>
-              <span class="product" title={wave.productName}>
-                <Package size={12} />
-                {wave.productName}
-              </span>
+              <div class="product-cell">
+                <span class="product" title={wave.productName}>
+                  <Package size={12} />
+                  {wave.productName}
+                </span>
+                {#if wave.buyerLabel}
+                  <span class="buyer" title={wave.buyerLabel}>收货：{wave.buyerLabel}</span>
+                {/if}
+                {#if waveChatters.get(wave.id)?.label}
+                  <span
+                    class="chatters"
+                    title={waveChatters.get(wave.id)?.hint || "付款前互动人（弱对照）"}
+                  >
+                    互动：{waveChatters.get(wave.id)?.label}
+                  </span>
+                {/if}
+              </div>
               <strong>{wave.eventCount} 次 · {formatDealMoneyYuan(wave.totalPayAmountFen)}</strong>
             </button>
           {/each}
@@ -161,6 +186,11 @@
           <div class="speech-meta">
             <span>讲解窗：{minuteLabel(activeWindow.start)} — {minuteLabel(activeWindow.end)}</span>
             <span>锚点下单：{minuteLabel(activeEvent.offsetSec)}</span>
+            {#if activeChatters?.label}
+              <span title={activeChatters.hint}>付款前互动：{activeChatters.label}</span>
+            {:else if activeChatters?.hint}
+              <span class="muted">{activeChatters.hint}</span>
+            {/if}
             <span class="tier" class:pending={activeWindow.mode !== "refined"} class:ready={activeWindow.mode === "refined"}>
               {windowModeLabel}
             </span>
@@ -265,7 +295,11 @@
   .order-card { display: grid; grid-template-columns: 94px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid #eef2f6; border-radius: 8px; background: #fafafa; text-align: left; cursor: pointer; font-size: 12px; color: #344054; }
   .order-card.selected { border-color: #84caFF; background: #eff8ff; box-shadow: inset 0 0 0 1px #2e90fa; }
   .order-card time { color: #175cd3; font-variant-numeric: tabular-nums; }
+  .product-cell { min-width: 0; display: grid; gap: 2px; }
   .product { display: inline-flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .buyer, .chatters { color: #667085; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chatters { color: #475467; }
+  .muted-inline { color: #98a2b3; }
   .speech-column { padding: 0; }
   .speech-meta { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #eef2f6; font-size: 11px; color: #475467; background: #f9fafb; }
   .tier { padding: 2px 8px; border-radius: 999px; }

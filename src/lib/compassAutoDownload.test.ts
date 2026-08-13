@@ -6,6 +6,8 @@ import {
   COMPASS_TARGET_SHOPS,
   compassStatusLabel,
   compassSessionKey,
+  inferCompassDateFromVideo,
+  inferCompassShopFromTexts,
   markCompassSessionImported,
   normalizeCompassDate,
   type CompassSession,
@@ -13,6 +15,15 @@ import {
 
 assert.equal(canStartCompassDownload(false), true, "one-click download must work before querying");
 assert.equal(canStartCompassDownload(true), false, "a running batch must not be started twice");
+assert.equal(inferCompassShopFromTexts(["金典拍拍科创专卖店_2026-08-01"]), "金典拍拍科创专卖店");
+assert.equal(inferCompassShopFromTexts(["金典拍拍相机专卖店直播"]), "金典拍拍相机专卖店");
+assert.equal(
+  inferCompassDateFromVideo({
+    createdAt: "2026-08-12T10:02:00",
+    texts: ["金典拍拍相机专卖店_2026-08-12_09-00-00.ts"],
+  }),
+  "2026-08-12",
+);
 assert.deepEqual(COMPASS_TARGET_SHOPS.map((shop) => shop.value), [
   "金典拍拍科创专卖店",
   "金典拍拍相机专卖店",

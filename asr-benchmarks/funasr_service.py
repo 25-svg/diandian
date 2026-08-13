@@ -68,7 +68,11 @@ def model_source(env_name: str, cache_name: str, fallback: str) -> str:
 def load_model() -> None:
     global MODEL, MODEL_LOAD_SECONDS
     started = time.perf_counter()
-    torch.set_num_threads(4)
+    try:
+        thread_count = max(1, int(os.environ.get("BSR_FUNASR_TORCH_THREADS", "4")))
+    except ValueError:
+        thread_count = 4
+    torch.set_num_threads(thread_count)
     MODEL = AutoModel(
         model=model_source(
             "BSR_FUNASR_ASR_MODEL",

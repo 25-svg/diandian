@@ -3,6 +3,8 @@ export type PaymentEvent = {
   payAmountFen: number | null;
   productName?: string;
   orderId?: string;
+  /** Masked receiver / nick for streamer review, e.g. "张*". */
+  buyerLabel?: string;
 };
 
 export type PaymentEventsSummary = {
@@ -32,6 +34,8 @@ export type DealWave = {
   eventCount: number;
   totalPayAmountFen: number;
   productName: string;
+  /** One or more masked buyer labels for this wave. */
+  buyerLabel: string;
   events: PaymentEvent[];
 };
 
@@ -84,6 +88,14 @@ function normalizePaymentEvent(raw: unknown): PaymentEvent | null {
     payAmountFen: payAmountFen == null ? null : Math.max(0, Math.trunc(payAmountFen)),
     productName: readString(record.product_name ?? record.productName) || undefined,
     orderId: readString(record.order_id ?? record.orderId) || undefined,
+    buyerLabel: readString(
+      record.buyer_label
+        ?? record.buyerLabel
+        ?? record.mask_post_receiver
+        ?? record.maskPostReceiver
+        ?? record.user_nick_name
+        ?? record.userNickName,
+    ) || undefined,
   };
 }
 
@@ -201,6 +213,19 @@ export function buildDealWaves(
     const productName = products.length > 1
       ? `${products[0]?.label || "多个商品"} 等 ${products.length} 个商品`
       : products[0]?.label || "未命名商品";
+    const buyerLabels: string[] = [];
+    const seenBuyers = new Set<string>();
+    for (const event of group) {
+      const label = event.buyerLabel?.trim();
+      if (!label || seenBuyers.has(label)) continue;
+      seenBuyers.add(label);
+      buyerLabels.push(label);
+    }
+    const buyerLabel = buyerLabels.length === 0
+      ? ""
+      : buyerLabels.length === 1
+        ? buyerLabels[0]
+        : `${buyerLabels[0]} 等 ${buyerLabels.length} 人`;
     const startOffsetSec = group[0]?.offsetSec ?? 0;
     const endOffsetSec = group[group.length - 1]?.offsetSec ?? startOffsetSec;
     return {
@@ -211,6 +236,7 @@ export function buildDealWaves(
       eventCount: group.length,
       totalPayAmountFen: group.reduce((total, event) => total + (event.payAmountFen ?? 0), 0),
       productName,
+      buyerLabel,
       events: group,
     };
   });

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
-use crate::config::DoudianOrderConfig;
+use crate::config::{doudian_desktop_dirs, DoudianOrderConfig};
 use crate::database::live_dashboard::LiveDashboardSessionRow;
 use crate::database::record::RecordRow;
 
@@ -25,6 +25,94 @@ pub fn default_doudian_order_config() -> DoudianOrderConfig {
     DoudianOrderConfig::default()
 }
 
+struct ResolvedDoudianCredentials {
+    config: DoudianOrderConfig,
+    env_tried: Vec<String>,
+    token_tried: Vec<String>,
+    sdk_tried: Vec<String>,
+}
+
+/// Prefer configured paths; if missing, try each Desktop/数据接口 then Desktop roots.
+/// Does not mutate saved user config — only resolves files for this fetch.
+fn resolve_doudian_credential_paths(config: &DoudianOrderConfig) -> ResolvedDoudianCredentials {
+    let desktops = doudian_desktop_dirs();
+
+    fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+
+    fn pick_existing_file(configured: &str, fallbacks: &[PathBuf]) -> (String, Vec<String>) {
+        let mut tried = Vec::new();
+        let configured_path = PathBuf::from(configured);
+        tried.push(configured_path.to_string_lossy().to_string());
+        if configured_path.is_file() {
+            return (configured.to_string(), tried);
+        }
+        for candidate in fallbacks {
+            let display = candidate.to_string_lossy().to_string();
+            if tried.iter().any(|item| item == &display) {
+                continue;
+            }
+            tried.push(display.clone());
+            if candidate.is_file() {
+                return (display, tried);
+            }
+        }
+        (configured.to_string(), tried)
+    }
+
+    fn pick_existing_dir(configured: &str, fallbacks: &[PathBuf]) -> (String, Vec<String>) {
+        let mut tried = Vec::new();
+        let configured_path = PathBuf::from(configured);
+        tried.push(configured_path.to_string_lossy().to_string());
+        if configured_path.is_dir() {
+            return (configured.to_string(), tried);
+        }
+        for candidate in fallbacks {
+            let display = candidate.to_string_lossy().to_string();
+            if tried.iter().any(|item| item == &display) {
+                continue;
+            }
+            tried.push(display.clone());
+            if candidate.is_dir() {
+                return (display, tried);
+            }
+        }
+        (configured.to_string(), tried)
+    }
+
+    let mut env_fallbacks = Vec::new();
+    let mut token_fallbacks = Vec::new();
+    let mut sdk_fallbacks = Vec::new();
+        for desktop in &desktops {
+        let data_api = desktop.join("数据接口");
+        push_unique(&mut env_fallbacks, data_api.join(".env"));
+        push_unique(&mut env_fallbacks, desktop.join(".env"));
+        push_unique(&mut token_fallbacks, data_api.join("doudian_token.env"));
+        push_unique(&mut token_fallbacks, desktop.join("doudian_token.env"));
+        let sdk_root = desktop.join("doudian-sdk-python-1.1.0-20260724091610");
+        push_unique(&mut sdk_fallbacks, sdk_root.join("sdk-python"));
+        push_unique(&mut sdk_fallbacks, sdk_root);
+    }
+
+    let (env_file, env_tried) = pick_existing_file(&config.env_file, &env_fallbacks);
+    let (token_file, token_tried) = pick_existing_file(&config.token_file, &token_fallbacks);
+    let (sdk_path, sdk_tried) = pick_existing_dir(&config.sdk_path, &sdk_fallbacks);
+
+    let mut resolved = config.clone();
+    resolved.env_file = env_file;
+    resolved.token_file = token_file;
+    resolved.sdk_path = sdk_path;
+    ResolvedDoudianCredentials {
+        config: resolved,
+        env_tried,
+        token_tried,
+        sdk_tried,
+    }
+}
+
 fn payment_events_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/doudian_fetch_payment_events.py")
 }
@@ -41,11 +129,8 @@ fn parse_timestamp(value: &str) -> Result<DateTime<FixedOffset>, String> {
         "%Y-%m-%d %H:%M:%S",
         "%Y/%m/%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
-        "%Y/%m/%d %H:%M:%S-%Y/%m/%d %H:%M:%S",
     ] {
-        if let Ok(naive) =
-            NaiveDateTime::parse_from_str(trimmed.split('-').next().unwrap_or(trimmed).trim(), fmt)
-        {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
             return CN_OFFSET
                 .from_local_datetime(&naive)
                 .single()
@@ -60,7 +145,7 @@ fn format_live_time(value: DateTime<FixedOffset>) -> String {
 }
 
 pub fn resolve_live_window(
-    record: &RecordRow,
+    record: Option<&RecordRow>,
     dashboard_session: Option<&LiveDashboardSessionRow>,
     live_started_at: Option<String>,
     live_ended_at: Option<String>,
@@ -69,8 +154,10 @@ pub fn resolve_live_window(
         parse_timestamp(&value)?
     } else if let Some(session) = dashboard_session {
         parse_timestamp(&session.started_at)?
-    } else {
+    } else if let Some(record) = record {
         parse_timestamp(&record.created_at)?
+    } else {
+        return Err("无法确定本场开播时间，请先绑定直播 Excel 或从录播进入".into());
     };
 
     let ended = if let Some(value) = live_ended_at.filter(|item| !item.trim().is_empty()) {
@@ -79,8 +166,8 @@ pub fn resolve_live_window(
         dashboard_session.filter(|session| !session.ended_at.trim().is_empty())
     {
         parse_timestamp(&session.ended_at)?
-    } else if record.length > 0.0 {
-        started + Duration::seconds(record.length.round() as i64)
+    } else if let Some(item) = record.filter(|item| item.length > 0.0) {
+        started + Duration::seconds(item.length.round() as i64)
     } else {
         started + Duration::hours(8)
     };
@@ -95,27 +182,34 @@ pub fn resolve_live_window(
 async fn run_python_script(
     python: &str,
     script_path: &Path,
-    config: &DoudianOrderConfig,
+    resolved: &ResolvedDoudianCredentials,
     live_started_at: &str,
     live_ended_at: &str,
 ) -> Result<String, String> {
+    let config = &resolved.config;
     if !script_path.is_file() {
         return Err(format!("找不到脚本：{}", script_path.display()));
     }
     if !Path::new(&config.token_file).is_file() {
         return Err(format!(
-            "找不到抖店 token 文件：{}。请先运行 scripts/doudian_get_token.py",
-            config.token_file
+            "找不到抖店 token 文件：{}。已尝试：{}。请先运行 scripts/doudian_get_token.py",
+            config.token_file,
+            resolved.token_tried.join(" | ")
         ));
     }
     if !Path::new(&config.env_file).is_file() {
         return Err(format!(
-            "找不到抖店 env 文件：{}。需包含 DOUYIN_OPEN_APP_KEY/SECRET",
-            config.env_file
+            "找不到抖店 env 文件：{}。已尝试：{}。需包含 DOUYIN_OPEN_APP_KEY/SECRET",
+            config.env_file,
+            resolved.env_tried.join(" | ")
         ));
     }
     if !Path::new(&config.sdk_path).is_dir() {
-        return Err(format!("找不到抖店 SDK：{}", config.sdk_path));
+        return Err(format!(
+            "找不到抖店 SDK：{}。已尝试：{}",
+            config.sdk_path,
+            resolved.sdk_tried.join(" | ")
+        ));
     }
 
     let mut command = Command::new(python);
@@ -183,10 +277,11 @@ pub async fn fetch_payment_events(
 ) -> Result<FetchDoudianPaymentEventsResult, String> {
     let python = pick_python_executable().await?;
     let script_path = payment_events_script_path();
+    let resolved = resolve_doudian_credential_paths(config);
     let stdout = run_python_script(
         &python,
         &script_path,
-        config,
+        &resolved,
         live_started_at,
         live_ended_at,
     )
@@ -223,6 +318,12 @@ pub async fn fetch_payment_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_timestamp_accepts_iso_local_datetime_without_timezone() {
+        let parsed = parse_timestamp("2026-08-01T08:57:19").expect("local ISO timestamp");
+        assert_eq!(format_live_time(parsed), "2026/08/01 08:57:19");
+    }
 
     #[test]
     fn resolve_live_window_prefers_dashboard_start_and_end() {
@@ -267,7 +368,7 @@ mod tests {
         };
 
         let (start, end) =
-            resolve_live_window(&record, Some(&session), None, None).expect("window");
+            resolve_live_window(Some(&record), Some(&session), None, None).expect("window");
         assert_eq!(start, "2026/07/28 08:15:49");
         assert_eq!(end, "2026/07/28 15:44:39");
     }

@@ -967,7 +967,7 @@
         throw new Error("没有找到刚导入的视频，请重新导入后再试。");
       }
       if (event.detail?.asMaster) {
-        masterSourceVideo = importedVideo;
+        alert("已废弃「导入后作为整场直播母稿」。请从成交话术精炼后，经 Clip「母稿样本批次」发布到「主播知识库」的 视频/成交、话术、分析建议。");
         return;
       }
       window.dispatchEvent(new CustomEvent("bsr:open-video-analysis", { detail: importedVideo }));

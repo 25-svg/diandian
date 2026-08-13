@@ -188,6 +188,13 @@ export function friendlyMasterError(reason: unknown): FriendlyMasterError {
       nextAction: "请稍后刷新进度；如状态停止，再点击“继续未完成场次”。",
     };
   }
+  if (raw.includes("主播名") || raw.includes("样本来源") || raw.includes("主播知识库")) {
+    return {
+      title: "缺少主播名",
+      detail: raw.includes("请先") ? raw : "发布到主播知识库前必须填写主播名。",
+      nextAction: "在批次中填写样本来源/主播名（如：于千惠）后重试发布。",
+    };
+  }
   return {
     title: "这一步暂时没有完成",
     detail: "系统没有删除视频、逐字稿或已发布企业标准。",

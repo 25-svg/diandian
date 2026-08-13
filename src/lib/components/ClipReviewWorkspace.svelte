@@ -18,11 +18,16 @@
     splitTranscriptForScriptQuality,
     type ScriptIssueAnnotation,
   } from "../scriptQuality";
+  import { parseSavedScriptQuality, scriptQualityStorageKey } from "../scriptQualityPersistence";
 
   export let request: ClipReviewRequest;
+  /** When true, stays inside company analysis shell (no jump to 切片 page). */
+  export let embedded = false;
+  export let backgroundProgress = "";
 
   const dispatch = createEventDispatcher<{ close: void }>();
   let activeIndex = 0;
+  let activeVideoId = 0;
   let activeItem: ClipReviewItem | null = null;
   let activeKey = "";
   let loadedKey = "";
@@ -40,8 +45,11 @@
   let transcriptLoading = false;
   let transcriptError = "";
 
-  $: if (activeIndex >= request.items.length) activeIndex = 0;
-  $: activeItem = request.items[activeIndex] ?? null;
+  $: if (request.items.length && !request.items.some((item) => item.video.id === activeVideoId)) {
+    activeVideoId = request.items[0].video.id;
+  }
+  $: activeIndex = Math.max(0, request.items.findIndex((item) => item.video.id === activeVideoId));
+  $: activeItem = request.items[activeIndex] ?? request.items[0] ?? null;
   $: activeKey = activeItem ? `${request.taskId}:${activeItem.video.id}` : "";
   $: if (activeItem && activeKey && activeKey !== loadedKey) {
     loadedKey = activeKey;
@@ -93,6 +101,15 @@
         if (loadedKey === key) transcriptLoading = false;
       }
     }
+    const qualityKey = scriptQualityStorageKey(`clip-review:${item.video.id}`);
+    const saved = parseSavedScriptQuality(localStorage.getItem(qualityKey));
+    if (saved && (saved.summary || saved.annotations.length)) {
+      if (loadedKey !== key) return;
+      qualitySummary = saved.summary;
+      annotations = saved.annotations;
+      selectedCueId = saved.annotations[0]?.cueId ?? null;
+      return;
+    }
     await runAnalysis(key);
   }
 
@@ -125,6 +142,17 @@
       if (loadedKey !== expectedKey) return;
       annotations = mergeScriptQualityAnnotations(batches);
       qualitySummary = summaries.join("\n") || "本段未发现需要重点修改的话术，可继续人工检查文稿。";
+      const videoId = request.items.find((item) => `${request.taskId}:${item.video.id}` === expectedKey)?.video.id;
+      if (videoId != null) {
+        try {
+          localStorage.setItem(scriptQualityStorageKey(`clip-review:${videoId}`), JSON.stringify({
+            summary: qualitySummary,
+            annotations,
+          }));
+        } catch {
+          // ignore quota / private mode
+        }
+      }
     } catch (error) {
       if (loadedKey !== expectedKey) return;
       analysisError = String(error).replace(/^Error:\s*/i, "");
@@ -167,20 +195,22 @@
   }
 </script>
 
-<div class="clip-review-shell">
+<div class="clip-review-shell" class:embedded>
   <header class="review-header">
     <button type="button" class="back-button" on:click={() => dispatch("close")}>
-      <ArrowLeft size={16} /> 返回切片列表
+          <ArrowLeft size={16} /> {embedded ? "返回整场复盘" : "返回切片列表"}
     </button>
     <div class="header-copy">
       <strong>成交切片复盘</strong>
-      <span>左侧看视频，中间校对文稿，右侧查看 AI 改法建议</span>
+      {#if backgroundProgress}
+        <span>{backgroundProgress}</span>
+      {/if}
     </div>
-    {#if request.items.length > 1}
+    {#if request.items.length > 1 || backgroundProgress}
       <nav class="clip-tabs" aria-label="本次生成的切片">
         {#each request.items as item, index (item.video.id)}
-          <button type="button" class:active={index === activeIndex} on:click={() => { activeIndex = index; }}>
-            {index + 1}. {item.video.title}
+          <button type="button" class:active={index === activeIndex} on:click={() => { activeVideoId = item.video.id; }}>
+            {formatWorkspaceClock(item.sourceStartSec)} · {item.video.title}
           </button>
         {/each}
       </nav>
@@ -296,6 +326,7 @@
 
 <style>
   .clip-review-shell { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); padding: 14px; box-sizing: border-box; overflow: hidden; background: #f5f7fa; }
+  .clip-review-shell.embedded { padding: 0; background: transparent; }
   .review-header { display: flex; align-items: center; gap: 14px; min-width: 0; padding: 0 2px 12px; }
   .back-button { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 7px 10px; border: 1px solid #d0d5dd; border-radius: 8px; background: #fff; color: #344054; font-size: 12px; cursor: pointer; }
   .header-copy { min-width: 0; display: grid; gap: 2px; }

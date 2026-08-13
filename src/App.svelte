@@ -13,46 +13,86 @@
   import LiveDataDashboard from "./page/LiveDataDashboard.svelte";
   import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
   import type { RecordItem } from "./lib/db";
-  import type { VideoItem } from "./lib/interface";
-  import type { ClipReviewRequest } from "./lib/clipReview";
+  import { isClipVideo, type VideoItem } from "./lib/interface";
+  import { buildExistingClipReviewRequest, type ClipReviewRequest } from "./lib/clipReview";
   import { getMasterBaseline, listMasterSampleBatches } from "./lib/masterScript";
   import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
 
   let active = "总览";
   let analysisArchive: RecordItem | null = null;
   let analysisVideo: VideoItem | null = null;
   let analysisRefreshToken = 0;
   let analysisMode: "legacy" | "company_deal" = "legacy";
+  let analysisFocusTab: "" | "clip_review" = "";
   let analysisNavigationLock = false;
   let liveDashboardSessionId: number | null = null;
   let masterSourceVideo: VideoItem | null = null;
   let clipReviewRequest: ClipReviewRequest | null = null;
+  let showMiniMaxSetup = false;
+  let miniMaxApiKey = "";
+  let miniMaxSetupError = "";
+  let miniMaxSetupSaving = false;
+  let miniMaxSetupComplete = false;
+
+  async function checkMiniMaxSetup(): Promise<void> {
+    try {
+      const status = await invoke<{ configured: boolean }>("get_minimax_setup_status");
+      showMiniMaxSetup = !status.configured;
+    } catch (error: any) {
+      console.warn("Failed to inspect MiniMax setup status", error);
+    }
+  }
+
+  async function initializeMiniMax(): Promise<void> {
+    if (!miniMaxApiKey.trim() || miniMaxSetupSaving) return;
+    miniMaxSetupSaving = true;
+    miniMaxSetupError = "";
+    miniMaxSetupComplete = false;
+    try {
+      await invoke("initialize_minimax_api_key", { apiKey: miniMaxApiKey.trim() });
+      miniMaxApiKey = "";
+      miniMaxSetupComplete = true;
+      setTimeout(() => {
+        showMiniMaxSetup = false;
+        miniMaxSetupComplete = false;
+      }, 900);
+    } catch (error: any) {
+      miniMaxSetupError = error?.message || String(error);
+    } finally {
+      miniMaxSetupSaving = false;
+    }
+  }
 
   function resolveVideoAnalysisDetail(detail: unknown): {
     video: VideoItem | null;
     mode: "legacy" | "company_deal";
+    focusTab: "" | "clip_review";
   } {
     if (!detail || typeof detail !== "object") {
-      return { video: null, mode: "legacy" };
+      return { video: null, mode: "legacy", focusTab: "" };
     }
     const record = detail as Record<string, unknown>;
     const nested = record.video;
+    const focusTab = record.focusTab === "clip_review" ? "clip_review" : "";
     if (nested && typeof nested === "object" && nested !== null && "id" in nested) {
       return {
         video: nested as VideoItem,
         mode: record.analysisMode === "company_deal" ? "company_deal" : "legacy",
+        focusTab,
       };
     }
     if ("id" in record) {
-      return { video: detail as VideoItem, mode: "legacy" };
+      return { video: detail as VideoItem, mode: "legacy", focusTab };
     }
-    return { video: null, mode: "legacy" };
+    return { video: null, mode: "legacy", focusTab: "" };
   }
 
   function openAnalysisPage(options: {
     archive?: RecordItem | null;
     video?: VideoItem | null;
     mode?: "legacy" | "company_deal";
+    focusTab?: "" | "clip_review";
   }): void {
     const archive = options.archive ?? null;
     const video = options.video ?? null;
@@ -64,6 +104,7 @@
     analysisArchive = archive;
     analysisVideo = video;
     analysisMode = options.mode ?? "legacy";
+    analysisFocusTab = options.focusTab ?? "";
     analysisRefreshToken += 1;
     active = "录播分析";
     queueMicrotask(() => {
@@ -101,6 +142,16 @@
   onMount(() => {
     void set_title("典典直播切片");
     void ensureActiveEnterpriseMaster();
+    void checkMiniMaxSetup();
+  });
+  onMount(() => {
+    const openMiniMaxSetup = () => {
+      miniMaxSetupError = "";
+      miniMaxSetupComplete = false;
+      showMiniMaxSetup = true;
+    };
+    window.addEventListener("bsr:open-minimax-setup", openMiniMaxSetup);
+    return () => window.removeEventListener("bsr:open-minimax-setup", openMiniMaxSetup);
   });
   onMount(async () => {
     await onOpenUrl((urls: string[]) => {
@@ -155,10 +206,19 @@
       });
     };
     const openVideoAnalysis = (event: Event) => {
-      const { video, mode } = resolveVideoAnalysisDetail(
+      const { video, mode, focusTab } = resolveVideoAnalysisDetail(
         (event as CustomEvent<unknown>).detail,
       );
-      openAnalysisPage({ archive: null, video, mode });
+      // Clips belong in the three-column review workspace. Opening them in
+      // ArchiveAnalysis treats a short MP4 as a full session and queues remux/ASR.
+      if (video && isClipVideo(video)) {
+        analysisArchive = null;
+        analysisVideo = null;
+        clipReviewRequest = buildExistingClipReviewRequest(video, "");
+        active = "切片";
+        return;
+      }
+      openAnalysisPage({ archive: null, video, mode, focusTab });
     };
     const openCompanyDealReview = (event: Event) => {
       const archive = (event as CustomEvent<RecordItem>).detail;
@@ -176,8 +236,8 @@
         mode: "company_deal",
       });
     };
-    const openMasterBuilder = (event: Event) => {
-      masterSourceVideo = (event as CustomEvent<VideoItem>).detail;
+    const openMasterBuilder = (_event: Event) => {
+      alert("已废弃「整场进母稿」。请从成交话术精炼后，经 Clip「母稿样本批次」发布到「主播知识库」的 视频/成交、话术、分析建议。");
     };
     const openLiveDashboard = (event: Event) => {
       liveDashboardSessionId = (event as CustomEvent<{ sessionId: number }>).detail.sessionId;
@@ -238,6 +298,7 @@
           video={analysisVideo}
           refreshToken={analysisRefreshToken}
           analysisMode={analysisMode}
+          focusTab={analysisFocusTab}
           on:back={() => {
             active = analysisVideo ? "切片" : "录播";
           }}
@@ -278,6 +339,43 @@
       masterSourceVideo = null;
     }}
   />
+{/if}
+
+{#if showMiniMaxSetup}
+  <div class="minimax-setup-backdrop" role="presentation">
+    <section class="minimax-setup-card" role="dialog" aria-modal="true" aria-labelledby="minimax-setup-title">
+      <div class="minimax-setup-icon">AI</div>
+      <div>
+        <p class="minimax-setup-eyebrow">首次使用</p>
+        <h2 id="minimax-setup-title">配置成交话术 AI 分析</h2>
+        <p class="minimax-setup-copy">转文稿继续使用本地 FunASR。MiniMax 仅用于成交链路分析和自动切片，密钥将使用当前 Windows 用户加密保存。</p>
+      </div>
+      <label for="minimax-first-key">MiniMax API Key</label>
+      <input
+        id="minimax-first-key"
+        type="password"
+        autocomplete="off"
+        placeholder="粘贴完整 MiniMax API Key"
+        bind:value={miniMaxApiKey}
+        on:keydown={(event) => {
+          if (event.key === "Enter") void initializeMiniMax();
+        }}
+      />
+      {#if miniMaxSetupError}
+        <p class="minimax-setup-error">{miniMaxSetupError}</p>
+      {/if}
+      {#if miniMaxSetupComplete}
+        <p class="minimax-setup-success">连接成功，安全配置已保存。</p>
+      {/if}
+      <div class="minimax-setup-actions">
+        <button class="minimax-skip" type="button" disabled={miniMaxSetupSaving} on:click={() => showMiniMaxSetup = false}>暂时跳过</button>
+        <button class="minimax-save" type="button" disabled={miniMaxSetupSaving || miniMaxApiKey.trim().length < 12} on:click={() => void initializeMiniMax()}>
+          {miniMaxSetupSaving ? "正在测试连接…" : "测试并保存"}
+        </button>
+      </div>
+      <p class="minimax-setup-hint">未配置时仍可录制、播放和转文稿；使用 AI 分析时系统会再次提示。</p>
+    </section>
+  </div>
 {/if}
 
 <style>
@@ -347,4 +445,61 @@
     background: var(--mac-bg-elevated);
     box-shadow: var(--mac-shadow-lg);
   }
+
+  .minimax-setup-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(15, 23, 42, 0.48);
+    backdrop-filter: blur(12px);
+  }
+  .minimax-setup-card {
+    width: min(520px, calc(100vw - 32px));
+    display: grid;
+    gap: 14px;
+    padding: 28px;
+    border: 1px solid rgba(255, 255, 255, 0.8);
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.97);
+    box-shadow: 0 28px 90px rgba(15, 23, 42, 0.28);
+    color: #172033;
+  }
+  .minimax-setup-icon {
+    width: 48px;
+    height: 48px;
+    display: grid;
+    place-items: center;
+    border-radius: 14px;
+    background: linear-gradient(135deg, #1677ff, #6d5dfc);
+    color: white;
+    font-weight: 800;
+  }
+  .minimax-setup-eyebrow { margin: 0 0 4px; color: #1677ff; font-size: 12px; font-weight: 700; }
+  .minimax-setup-card h2 { margin: 0; font-size: 22px; }
+  .minimax-setup-copy, .minimax-setup-hint { margin: 8px 0 0; color: #667085; font-size: 13px; line-height: 1.6; }
+  .minimax-setup-card label { font-size: 13px; font-weight: 700; }
+  .minimax-setup-card input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px 14px;
+    border: 1px solid #d0d5dd;
+    border-radius: 11px;
+    outline: none;
+    font: inherit;
+  }
+  .minimax-setup-card input:focus { border-color: #1677ff; box-shadow: 0 0 0 3px rgba(22, 119, 255, 0.12); }
+  .minimax-setup-error, .minimax-setup-success { margin: 0; padding: 10px 12px; border-radius: 9px; font-size: 13px; }
+  .minimax-setup-error { background: #fff1f0; color: #c62828; }
+  .minimax-setup-success { background: #ecfdf3; color: #027a48; }
+  .minimax-setup-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  .minimax-setup-actions button { padding: 10px 16px; border-radius: 10px; font: inherit; font-weight: 700; cursor: pointer; }
+  .minimax-skip { border: 1px solid #d0d5dd; background: white; color: #475467; }
+  .minimax-save { border: 0; background: #1677ff; color: white; }
+  .minimax-setup-actions button:disabled { cursor: not-allowed; opacity: 0.5; }
+  :global(.dark) .minimax-setup-card { border-color: rgba(255,255,255,.1); background: #182033; color: #f8fafc; }
+  :global(.dark) .minimax-setup-card input { border-color: #475467; background: #101828; color: #f8fafc; }
+  :global(.dark) .minimax-skip { border-color: #475467; background: #101828; color: #e4e7ec; }
 </style>

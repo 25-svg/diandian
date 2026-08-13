@@ -1,6 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy, onMount, tick } from "svelte";
   import { open, save } from "@tauri-apps/plugin-dialog";
+  import { listen } from "@tauri-apps/api/event";
   import {
     ArrowLeft,
     BarChart3,
@@ -10,9 +11,7 @@
     Copy,
     Download,
     FileSearch,
-    ListChecks,
     Loader2,
-    MessageSquareText,
     Minus,
     Maximize2,
     Minimize2,
@@ -21,6 +20,7 @@
     Plus,
     RefreshCw,
     RotateCcw,
+    Sparkles,
     Upload,
   } from "lucide-svelte";
   import TranscriptReviewPanel from "../lib/components/analysis/TranscriptReviewPanel.svelte";
@@ -38,7 +38,7 @@
     selectDealClipContext,
     type DealClipRange,
   } from "../lib/dealOrderAutoClip";
-  import { buildClipReviewRequest, clipTranscriptToSrt } from "../lib/clipReview";
+  import { buildClipReviewRequest, buildExistingClipReviewRequest, clipReviewRequestStorageKey, clipTranscriptToSrt, mergeClipReviewRequest, parseGeneratedDealClips, parseSavedClipReviewRequest, rebuildClipReviewRequest, serializeClipReviewRequest, type ClipReviewRange, type ClipReviewRequest } from "../lib/clipReview";
   import { get_static_url, invoke, TAURI_ENV } from "../lib/invoker";
   import type { RecordItem } from "../lib/db";
   import { isClipVideo, type VideoItem } from "../lib/interface";
@@ -46,6 +46,11 @@
   import { operationalScriptLabel } from "../lib/scriptTaxonomy";
   import { buildImportedArchiveLiveId, isImportedArchive } from "../lib/importedArchive";
   import { dashboardMetricCards, openLiveDashboard, type LiveDashboardMetrics } from "../lib/liveDashboard";
+  import {
+    inferCompassDateFromVideo,
+    inferCompassShopFromTexts,
+    compassStatusLabel,
+  } from "../lib/compassAutoDownload";
   import { buildSessionDiagnosis } from "../lib/sessionDiagnosis";
   import {
     buildOptimizationPlan,
@@ -63,8 +68,11 @@
     type PaymentEvent,
     type PaymentEventsSummary,
   } from "../lib/orderDealTimeline";
+  import type { DanmuSpeakerEntry } from "../lib/dealWaveChatters";
   import {
     buildDealTranscriptWindows,
+    buildTranscriptGapWindows,
+    excludeDealWindowCues,
     totalDealTranscriptDuration,
     type DealTranscriptWindow,
   } from "../lib/dealTranscriptWindows";
@@ -73,6 +81,7 @@
     buildScriptQualityUserMessage,
     mergeScriptQualityAnnotations,
     parseScriptQualityBundle,
+    scriptIssueKindLabel,
     scriptQualitySystemPrompt,
     splitTranscriptForScriptQuality,
     type ScriptIssueAnnotation,
@@ -150,12 +159,17 @@
     type MasterComparisonResult,
   } from "../lib/masterScript";
   import { parseSavedScriptQuality, scriptQualityStorageKey } from "../lib/scriptQualityPersistence";
+  import {
+    dealSpeechRefineStorageKey,
+    parseSavedDealSpeechRefine,
+  } from "../lib/dealSpeechRefinePersistence";
   import { playbackPresentation } from "../lib/playbackPresentation";
 
   export let archive: RecordItem | null = null;
   export let video: VideoItem | null = null;
   export let refreshToken = 0;
   export let analysisMode: "legacy" | "company_deal" = "legacy";
+  export let focusTab: "" | "clip_review" = "";
 
   type TranscriptRefreshResult = {
     subtitle: string;
@@ -172,6 +186,7 @@
     status: string;
     metadata: string;
     message?: string;
+    created_at?: string;
   };
 
   type VideoPlaybackSource = {
@@ -274,6 +289,21 @@
   let playbackLoadError = "";
   let transcriptLoadError = "";
   let isTranscribing = false;
+  /** Background full-session ASR after deal-window import; does not block 成交话术 UI. */
+  let isFullSessionBackfilling = false;
+  /** One auto gap-fill / disk-hydrate attempt per video/source. */
+  let autoGapFillAttemptKey = "";
+  /** In-page dedupe for company_deal auto order pull (also persisted per live_id). */
+  const autoPullOrdersAttempted = new Set<string>();
+  let importTranscriptPipelineSequence = 0;
+  let fullSessionBackfillSequence = 0;
+  let candidateScriptAnalyzing = false;
+  let candidateScriptError = "";
+  let candidateScriptSummary = "";
+  let candidateScriptAnnotations: ScriptIssueAnnotation[] = [];
+  let candidateScriptCueId: number | null = null;
+  let candidateScriptForId = "";
+  let candidateScriptRequestSequence = 0;
   let isDiscovering = false;
   let reviewingId = "";
   let copiedAction = "";
@@ -301,6 +331,7 @@
   let embeddedPreviewRequest = 0;
   let embeddedPreviewStartOffset = 0;
   let embeddedPlaybackPositionSec = 0;
+  let htmlPlaybackPositionSec = 0;
   let embeddedPlaybackPlaying = false;
   let embeddedPlayerShell: HTMLDivElement | null = null;
   let playbackObserverSequence = 0;
@@ -309,17 +340,26 @@
     ? Math.max(0, transcriptEntries[transcriptEntries.length - 1].end)
     : 0;
   $: fullPlaybackDurationSec = nativePlaybackDurationSec || Math.max(0, Number(video?.length) || 0);
+  $: analysisPlaybackPositionSec = nativePlayerActive
+    ? nativePlaybackPositionSec
+    : embeddedPreviewActive
+      ? embeddedPlaybackPositionSec
+      : htmlPlaybackPositionSec;
   const TASK_POLL_INTERVAL_MS = 3_000;
   const TASK_POLL_MAX_ATTEMPTS = 120;
   let highlightFilter: "全部" | "完整成交链路（已核验）" | "其他可评分片段" = "全部";
   let reviewTab: "analysis" | "script" | "training" = "analysis";
   let workspaceTab: "proofreading" | "analysis" = "analysis";
-  let companyWorkspaceTab: CompanyAnalysisTab = "deal_speech";
+  let companyWorkspaceTab: CompanyAnalysisTab = "align";
+  let companyClipReviewRequest: ClipReviewRequest | null = null;
   let selectedDealOffsetSec: number | null = null;
   let dealAutoClipping = false;
   let dealAutoClipProgress = "";
   let dealAutoClipError = "";
   let dealAutoClipSequence = 0;
+  let dealClipBatchTaskId = "";
+  let dealClipBatchParentId = 0;
+  let dealClipBatchRanges: ClipReviewRange[] = [];
   let dealSpeechRefineCache: Record<string, DealClipRange> = {};
   let dealSpeechRefineFailures: Record<string, string> = {};
   let dealSpeechRefineSequence = 0;
@@ -360,6 +400,8 @@
   let liveDashboardBindingLoading = false;
   let liveDashboardBindingError = "";
   let selectedLiveDashboardSessionId = "";
+  let excelDownloading = false;
+  let excelDownloadHint = "";
   let paymentEvents: PaymentEvent[] = [];
   let paymentEventsSummary: PaymentEventsSummary | null = null;
   let paymentEventsSourceLabel = "";
@@ -367,6 +409,8 @@
   let paymentEventsInput: HTMLInputElement | null = null;
   let paymentEventsLoading = false;
   let paymentEventsMatchMessage = "";
+  let dealDanmuEntries: DanmuSpeakerEntry[] = [];
+  let dealDanmuLoadKey = "";
   let videoStartOffsetSec = 0;
   let videoCalibrationStatus: "unverified" | "full_session" | "manual" = "unverified";
   let dealRefinementInput: HTMLInputElement | null = null;
@@ -422,8 +466,74 @@
     return () => window.clearInterval(ticker);
   });
 
+  onMount(() => {
+    let disposed = false;
+    const unlistens: Array<() => void> = [];
+    void (async () => {
+      unlistens.push(
+        await listen<{ startedAt?: string; shopName?: string }>("live-dashboard-imported", async (event) => {
+          if (disposed) return;
+          stage = "整场 Excel 已下载并导入，正在按本场视频匹配…";
+          await loadLiveDashboardBinding(archive, video);
+          if (liveDashboardBinding?.session) {
+            excelDownloading = false;
+            excelDownloadHint = "";
+            stage = `已匹配 Excel：${liveDashboardBinding.session.shopName} · ${liveDashboardBinding.session.startedAt}`;
+          } else if (event.payload?.startedAt) {
+            excelDownloadHint = `已导入 ${event.payload.startedAt}，请在列表中确认本场`;
+          }
+        }),
+      );
+      unlistens.push(
+        await listen<{
+          taskId?: string;
+          parentVideoId?: number;
+          rangeCount?: number;
+          succeeded?: number;
+        }>("deal-auto-clip-ready", (event) => {
+          if (disposed || event.payload?.taskId !== dealClipBatchTaskId) return;
+          const succeeded = Number(event.payload?.succeeded || 0);
+          const rangeCount = Number(event.payload?.rangeCount || dealClipBatchRanges.length);
+          dealAutoClipProgress = `已切出 ${succeeded}/${rangeCount} 条，可先看切片复盘，后台继续切`;
+          stage = dealAutoClipProgress;
+          void adoptDealAutoClipsFromTaskId(dealClipBatchTaskId);
+        }),
+      );
+      unlistens.push(
+        await listen<{ status?: string; message?: string }>("compass-auto-download-progress", (event) => {
+          if (disposed || !excelDownloading) return;
+          const status = event.payload?.status || "";
+          const message = event.payload?.message || compassStatusLabel(status);
+          excelDownloadHint = message;
+          if (status === "login-required") {
+            stage = "请在弹出的罗盘窗口扫码登录后再下载";
+          }
+          if (["failed", "shop-mismatch", "shop-unavailable"].includes(status)) {
+            excelDownloading = false;
+            liveDashboardBindingError = message;
+          }
+          if (status === "batch-finished") {
+            excelDownloading = false;
+            void loadLiveDashboardBinding(archive, video);
+          }
+        }),
+      );
+    })();
+    return () => {
+      disposed = true;
+      unlistens.forEach((unlisten) => unlisten());
+    };
+  });
+
   $: selectedCandidate = candidates.find((item) => item.id === selectedCandidateId) || null;
   $: selectedReview = selectedCandidate ? reviews[selectedCandidate.id] || null : null;
+  $: selectedCandidateSentences = (() => {
+    const candidate = selectedCandidate;
+    if (!candidate) return [] as TranscriptEntry[];
+    return transcriptEntries.filter(
+      (entry) => entry.end >= candidate.start && entry.start <= candidate.end,
+    );
+  })();
   $: reusableCandidates = candidates.filter(isStructuredDiscoveryCandidate);
   $: sessionReviewSummary = summarizeSessionReview(reusableCandidates, masterComparisons, reviews);
   $: transcriptSignalMap = Object.fromEntries(candidates.map((candidate) => [
@@ -480,6 +590,10 @@
       : candidates.filter((item) => !isMasterScoreEligible(item));
   $: currentSource = sourceIdentity(archive, video);
   $: currentSourceKey = currentSource ? analysisSourceKey(currentSource) : "";
+  $: dealLiveStartedAt = paymentEventsSummary?.liveStartedAt
+    || liveDashboardBinding?.session?.startedAt
+    || archive?.created_at
+    || null;
   // A desktop restart or a late archive prop update can clear the iframe URL
   // after initialization. Recreate the full-session player from the selected
   // company archive instead of leaving the left panel empty.
@@ -596,14 +710,26 @@
   function sessionsAsBindCandidates(
     sessions: BoundLiveDashboardSession[],
   ): LiveDashboardBindingCandidate[] {
+    const videoLengthSec = Math.round(Number(archive?.length || video?.length || 0));
+    const clock = Date.parse(String(archive?.created_at || video?.created_at || ""));
     return [...sessions]
-      .sort((left, right) => String(right.startedAt).localeCompare(String(left.startedAt)))
-      .map((session) => ({
-        session,
-        timeDeltaSeconds: 0,
-        accountMatch: false,
-        shopNameMatch: false,
-      }));
+      .map((session) => {
+        const started = Date.parse(String(session.startedAt));
+        const ended = Date.parse(String(session.endedAt || ""));
+        const spanSec = Number.isFinite(started) && Number.isFinite(ended) && ended > started
+          ? Math.round((ended - started) / 1000)
+          : 0;
+        const durationDelta = videoLengthSec > 0 && spanSec > 0
+          ? Math.abs(spanSec - videoLengthSec)
+          : Number.MAX_SAFE_INTEGER;
+        const timeDeltaSeconds = Number.isFinite(clock) && Number.isFinite(started)
+          ? Math.abs(Math.round((started - clock) / 1000))
+          : Number.MAX_SAFE_INTEGER;
+        return { session, timeDeltaSeconds, durationDelta, accountMatch: false, shopNameMatch: false };
+      })
+      .sort((left, right) => left.durationDelta - right.durationDelta || left.timeDeltaSeconds - right.timeDeltaSeconds)
+      .slice(0, 12)
+      .map(({ durationDelta: _durationDelta, ...candidate }) => candidate);
   }
 
   async function loadLiveDashboardBinding(
@@ -641,6 +767,9 @@
       }
       if ((resolved?.candidates?.length ?? 0) > 0) {
         liveDashboardBinding = resolved;
+        if (!selectedLiveDashboardSessionId) {
+          selectedLiveDashboardSessionId = String(resolved.candidates[0].session.id);
+        }
         return;
       }
 
@@ -653,6 +782,8 @@
       };
       if (!sessions.length) {
         liveDashboardBindingError = "尚未导入直播大屏 XLSX。请先到「直播数据大屏」导入对应场次（如 7/28 08:15），再回来手动绑定。";
+      } else if (!selectedLiveDashboardSessionId && liveDashboardBinding.candidates[0]) {
+        selectedLiveDashboardSessionId = String(liveDashboardBinding.candidates[0].session.id);
       }
     } catch (error: any) {
       liveDashboardBindingError = error?.message || String(error);
@@ -677,6 +808,39 @@
       liveDashboardBindingError = error?.message || String(error);
     } finally {
       liveDashboardBindingLoading = false;
+    }
+  }
+
+  function currentExcelDownloadTarget(): { shopName: string; targetDate: string | null } {
+    const texts = [archive?.title, video?.title, video?.file, video?.note, archive?.anchor_name];
+    return {
+      shopName: inferCompassShopFromTexts(texts),
+      targetDate: inferCompassDateFromVideo({
+        createdAt: archive?.created_at || video?.created_at,
+        texts,
+      }),
+    };
+  }
+
+  async function downloadExcelForCurrentVideo(): Promise<void> {
+    const target = currentExcelDownloadTarget();
+    if (!target.targetDate) {
+      liveDashboardBindingError = "无法从视频判断开播日期，请到「直播数据大屏」选择日期后下载";
+      return;
+    }
+    excelDownloading = true;
+    excelDownloadHint = `${target.shopName} · ${target.targetDate}；首次需扫码登录`;
+    liveDashboardBindingError = "";
+    stage = `正在打开罗盘下载 ${target.shopName} ${target.targetDate} 的整场数据…`;
+    try {
+      await invoke("start_compass_live_downloads", {
+        targetDate: target.targetDate,
+        targetShopName: target.shopName,
+      });
+    } catch (error: any) {
+      excelDownloading = false;
+      liveDashboardBindingError = error?.message || String(error);
+      stage = "下载整场 Excel 失败";
     }
   }
 
@@ -737,6 +901,51 @@
       videoCalibrationStatus = saved.videoCalibrationStatus || "unverified";
     } catch (error: any) {
       paymentEventsError = error?.message || String(error);
+    }
+  }
+
+  async function loadDealDanmuEntries(): Promise<void> {
+    const selectedArchive = archive;
+    if (!selectedArchive) {
+      dealDanmuEntries = [];
+      dealDanmuLoadKey = "";
+      return;
+    }
+    const loadKey = `${selectedArchive.platform}:${selectedArchive.room_id}:${selectedArchive.live_id}`;
+    if (loadKey === dealDanmuLoadKey && dealDanmuEntries.length > 0) return;
+    dealDanmuLoadKey = loadKey;
+    try {
+      const rows = await invoke<Array<Record<string, unknown>>>("get_danmu_record", {
+        platform: selectedArchive.platform,
+        roomId: String(selectedArchive.room_id),
+        liveId: String(selectedArchive.live_id),
+      });
+      dealDanmuEntries = (Array.isArray(rows) ? rows : []).map((row) => {
+        const ts = Number(row.ts);
+        const content = typeof row.content === "string" ? row.content : "";
+        const userName = typeof row.user_name === "string"
+          ? row.user_name
+          : typeof row.userName === "string"
+            ? row.userName
+            : null;
+        const userId = typeof row.user_id === "string"
+          ? row.user_id
+          : typeof row.userId === "string"
+            ? row.userId
+            : row.user_id != null
+              ? String(row.user_id)
+              : row.userId != null
+                ? String(row.userId)
+                : null;
+        return {
+          ts,
+          content,
+          user_name: userName,
+          user_id: userId,
+        };
+      }).filter((entry) => Number.isFinite(entry.ts) && entry.content);
+    } catch {
+      dealDanmuEntries = [];
     }
   }
 
@@ -808,32 +1017,95 @@
     paymentEventsSummary = bundle.summary ?? null;
     paymentEventsSourceLabel = bundle.sourceLabel || "order.searchList";
     if (currentSourceKey) savePaymentEvents(currentSourceKey);
-    stage = `已加载 ${bundle.events.length} 笔成交订单，可与片段时间轴对齐`;
+    stage = `已加载 ${bundle.events.length} 笔成交订单`;
+    if (analysisMode === "company_deal") {
+      companyWorkspaceTab = "deal_speech";
+    }
+    if (analysisMode === "company_deal" && video && !isClipVideo(video)) {
+      void runImportOrderTranscriptPipeline();
+    }
+  }
+
+  function autoPullOrdersStorageKey(liveId: string): string {
+    return `bsr:auto-pull-orders:v1:${liveId}`;
+  }
+
+  function markAutoPullOrdersAttempted(liveId: string): void {
+    if (!liveId) return;
+    autoPullOrdersAttempted.add(liveId);
+    try {
+      localStorage.setItem(autoPullOrdersStorageKey(liveId), "1");
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  function clearAutoPullOrdersAttempted(liveId: string): void {
+    if (!liveId) return;
+    autoPullOrdersAttempted.delete(liveId);
+    try {
+      localStorage.removeItem(autoPullOrdersStorageKey(liveId));
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  function hasAutoPullOrdersAttempted(liveId: string): boolean {
+    if (!liveId) return true;
+    if (autoPullOrdersAttempted.has(liveId)) return true;
+    try {
+      return localStorage.getItem(autoPullOrdersStorageKey(liveId)) === "1";
+    } catch {
+      return false;
+    }
   }
 
   async function fetchPaymentEventsFromApi(): Promise<void> {
-    if (!archive || archive.platform !== "douyin") {
-      paymentEventsError = "仅抖音录播支持一键拉取成交订单";
+    const liveId = dashboardBindLiveId || resolveDashboardBindLiveId(archive, video);
+    if (!liveId) {
+      paymentEventsError = "无法确定本场，请先打开公司录播或绑定直播 Excel";
       return;
     }
+    const liveStartedAt =
+      liveDashboardBinding?.session?.startedAt
+      || archive?.created_at
+      || video?.created_at
+      || null;
+    const liveEndedAt = liveDashboardBinding?.session?.endedAt || null;
     paymentEventsLoading = true;
     paymentEventsError = "";
     try {
       const result = await invoke<FetchDoudianPaymentEventsResult>("fetch_doudian_payment_events", {
-        roomId: String(archive.room_id),
-        liveId: String(archive.live_id),
-        liveStartedAt: liveDashboardBinding?.session?.startedAt ?? null,
-        liveEndedAt: null,
+        roomId: archive?.room_id != null ? String(archive.room_id) : "imported",
+        liveId,
+        liveStartedAt,
+        liveEndedAt,
       });
       applyPaymentEventsBundle(parsePaymentEventsPayload({
         events: result.events,
         summary: result.summary,
         source_label: result.sourceLabel || "order.searchList",
       }));
+      markAutoPullOrdersAttempted(liveId);
     } catch (error: any) {
+      clearAutoPullOrdersAttempted(liveId);
       paymentEventsError = error?.message || String(error);
     } finally {
       paymentEventsLoading = false;
+    }
+  }
+
+  /** company_deal：本场无订单时自动 order.searchList；失败只写提示，不阻塞分析。 */
+  async function maybeAutoFetchPaymentEvents(): Promise<void> {
+    if (analysisMode !== "company_deal") return;
+    if (video && isClipVideo(video)) return;
+    if (paymentEvents.length > 0 || paymentEventsLoading) return;
+    const liveId = dashboardBindLiveId || resolveDashboardBindLiveId(archive, video);
+    if (!liveId || hasAutoPullOrdersAttempted(liveId)) return;
+    stage = "正在自动拉取成交订单…";
+    await fetchPaymentEventsFromApi();
+    if (paymentEventsError && !paymentEvents.length) {
+      stage = "自动拉取成交未成功，可手动点「自动拉取订单」或继续分析";
     }
   }
 
@@ -872,9 +1144,7 @@
       if (!videoLikelyFullSession) {
         stage = `成交数据已精确对账；视频与直播时长相差 ${Math.round(videoDurationDeltaSec / 60)} 分钟，请校准视频起点`;
       }
-      if (analysisMode === "company_deal" && video) {
-        void smartRefreshTranscript(false, true);
-      }
+      // company_deal 流水线由 applyPaymentEventsBundle 触发：先成交窗并行转写，再后台整场补转
     } catch (error: any) {
       paymentEventsError = error?.message || String(error);
     } finally {
@@ -936,6 +1206,13 @@
       if (selectedDealOffsetSec != null) selectedDealOffsetSec -= shift;
       dealSpeechRefineCache = {};
       activeDealSpeechRange = null;
+      if (currentSourceKey) {
+        try {
+          localStorage.removeItem(dealSpeechRefineStorageKey(currentSourceKey));
+        } catch {
+          // ignore quota / private mode
+        }
+      }
     }
     videoStartOffsetSec = normalized;
     videoCalibrationStatus = status;
@@ -1292,12 +1569,18 @@
     highlightFilter = "全部";
     reviewTab = "analysis";
     workspaceTab = "analysis";
-    companyWorkspaceTab = "deal_speech";
+    companyWorkspaceTab = "align";
+    companyClipReviewRequest = null;
     selectedDealOffsetSec = null;
+    dealDanmuEntries = [];
+    dealDanmuLoadKey = "";
     dealAutoClipping = false;
     dealAutoClipProgress = "";
     dealAutoClipError = "";
     dealAutoClipSequence += 1;
+    dealClipBatchTaskId = "";
+    dealClipBatchParentId = 0;
+    dealClipBatchRanges = [];
     dealSpeechRefineCache = {};
     dealSpeechRefineFailures = {};
     dealSpeechRefineSequence += 1;
@@ -1444,12 +1727,113 @@
     }
   }
 
+  function loadDealSpeechRefine(sourceKey: string): void {
+    dealSpeechRefineCache = parseSavedDealSpeechRefine(
+      localStorage.getItem(dealSpeechRefineStorageKey(sourceKey)),
+    );
+    syncActiveDealSpeechRange();
+  }
+
+  function saveDealSpeechRefine(sourceKey = currentSourceKey): void {
+    if (!sourceKey) return;
+    try {
+      localStorage.setItem(dealSpeechRefineStorageKey(sourceKey), JSON.stringify(dealSpeechRefineCache));
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  function saveCompanyClipReview(request: ClipReviewRequest, sourceKey = currentSourceKey): void {
+    if (!sourceKey) return;
+    try {
+      localStorage.setItem(
+        clipReviewRequestStorageKey(sourceKey),
+        JSON.stringify(serializeClipReviewRequest(request)),
+      );
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  async function restoreCompanyClipReview(
+    sourceKey = currentSourceKey,
+    openTab = false,
+  ): Promise<boolean> {
+    if (!video) return false;
+    const saved = parseSavedClipReviewRequest(localStorage.getItem(clipReviewRequestStorageKey(sourceKey)));
+    if (saved && saved.parentVideoId === video.id) {
+      const videos = await invoke<VideoItem[]>("get_all_videos");
+      const restored = rebuildClipReviewRequest({
+        taskId: saved.taskId,
+        parentVideoId: saved.parentVideoId,
+        items: saved.items,
+        videos,
+        transcriptEntries,
+      });
+      if (restored) companyClipReviewRequest = restored;
+    }
+    if (!companyClipReviewRequest?.items.length) {
+      const tasks = await invoke<BackgroundTask[]>("get_tasks");
+      const batch = [...tasks]
+        .filter((task) => {
+          const type = String(task.task_type || task.taskType || "");
+          if (type !== "deal_auto_clip_batch") return false;
+          if (!["success", "processing"].includes(task.status)) return false;
+          try {
+            const metadata = JSON.parse(task.metadata || "{}") as Record<string, unknown>;
+            const parentId = Number(metadata.parent_video_id ?? metadata.parentVideoId);
+            return parentId === video.id && parseGeneratedDealClips(task.metadata).length > 0;
+          } catch {
+            return false;
+          }
+        })
+        .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")))[0];
+      if (batch) {
+        const videos = await invoke<VideoItem[]>("get_all_videos");
+        const restored = buildClipReviewRequest({
+          taskId: batch.id,
+          parentVideoId: video.id,
+          transcriptEntries,
+          videos,
+          taskMetadata: batch.metadata,
+        });
+        if (restored) {
+          companyClipReviewRequest = restored;
+          saveCompanyClipReview(restored, sourceKey);
+        }
+      }
+    }
+    if ((openTab || focusTab === "clip_review") && companyClipReviewRequest?.items.length) {
+      companyWorkspaceTab = "clip_review";
+    }
+    return Boolean(companyClipReviewRequest?.items.length);
+  }
+
+  async function openCompanyClipReviewTab(): Promise<void> {
+    if (companyClipReviewRequest?.items.length) {
+      companyWorkspaceTab = "clip_review";
+      return;
+    }
+    stage = "正在加载已生成的切片…";
+    const restored = await restoreCompanyClipReview(currentSourceKey, true);
+    stage = restored
+      ? `已打开 ${companyClipReviewRequest?.items.length || 0} 条切片复盘`
+      : "本场还没有可复盘的切片。请先点「AI 分析并切片」，或从任务页打开已成功的成交自动切片。";
+  }
+
   async function initialize(): Promise<void> {
     loadedSourceKey = currentSourceKey;
     loadedRefreshToken = refreshToken;
+    if (video && isClipVideo(video)) {
+      window.dispatchEvent(new CustomEvent("bsr:open-clip-review", {
+        detail: buildExistingClipReviewRequest(video, ""),
+      }));
+      return;
+    }
     if (currentSourceKey) loadPaymentEvents(currentSourceKey);
     resetState(true);
-    void loadLiveDashboardBinding(archive, video);
+    const dashboardBindPromise = loadLiveDashboardBinding(archive, video);
+    void loadDealDanmuEntries();
     const requestIdentity = activeAnalysisRequestIdentity();
     const requestId = ++initializeRequestSequence;
     const selectedVideo = video;
@@ -1463,7 +1847,14 @@
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
     const restored = loadSaved(activeAnalysisRequestIdentity());
     if (currentSourceKey) loadSavedScriptQuality(currentSourceKey);
+    if (currentSourceKey) loadDealSpeechRefine(currentSourceKey);
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+    void restoreCompanyClipReview(currentSourceKey, focusTab === "clip_review");
+    void (async () => {
+      await dashboardBindPromise;
+      if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+      await maybeAutoFetchPaymentEvents();
+    })();
     const finishPostTranscriptWork = async () => {
       if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
       if (selectedCandidate?.verificationStatus === "unverified") {
@@ -1474,13 +1865,22 @@
     };
     if (restored && transcript.trim()) {
       stage = `已恢复 ${transcriptEntries.length} 条逐字稿，可继续查看视频与成交数据`;
-      void loadTranscriptReview().then(async () => {
+      void (async () => {
+        if (
+          analysisMode === "company_deal"
+          && selectedVideo
+          && !isClipVideo(selectedVideo)
+        ) {
+          await adoptRicherDiskSubtitleIfAvailable(selectedVideo.id, activeAnalysisRequestIdentity());
+        }
+        if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+        await loadTranscriptReview();
         if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
         if (analysisMode !== "company_deal" && currentDiscoveryAction() === "auto" && !discoveryCompleted) {
           await discoverCandidates(currentSourceKey, "auto");
         }
         await finishPostTranscriptWork();
-      });
+      })();
     } else {
       void smartRefreshTranscript(restored).then(finishPostTranscriptWork);
     }
@@ -1684,6 +2084,11 @@
     embeddedPlaybackPositionSec = fullPlaybackDurationSec
       ? Math.min(fullPlaybackDurationSec, absolutePosition)
       : absolutePosition;
+  }
+
+  function updateHtmlPlaybackPosition(): void {
+    if (!videoElement || embeddedPreviewActive || nativePlayerActive) return;
+    htmlPlaybackPositionSec = Math.max(0, videoElement.currentTime || 0);
   }
 
   function handleEmbeddedSeekChange(event: Event): void {
@@ -1944,7 +2349,13 @@
       saveState();
     } catch (reason: any) {
       if (!background && requestId === masterComparisonSequence) {
-        masterComparisonError = reason?.message || String(reason);
+        const message = reason?.message || String(reason);
+        // Missing window transcript is expected during partial ASR; hide the panel error.
+        masterComparisonError = /没有可用于评分的逐字稿/.test(message) ? "" : message;
+        if (!masterComparisonError) {
+          masterComparison = null;
+          masterMatchStatus = "idle";
+        }
       }
     } finally {
       if (!background && requestId === masterComparisonSequence) masterComparisonLoading = false;
@@ -1966,12 +2377,26 @@
       if (!background) masterMatchStatus = "idle";
       return;
     }
+    const hasScorableTranscript = transcriptEntries.some(
+      (entry) => entry.end >= candidate.start && entry.start <= candidate.end && entry.text.trim(),
+    );
+    if (!hasScorableTranscript) {
+      // Avoid noisy Failed-to-invoke banner when the window has no cues yet.
+      if (!background && selectedCandidateId === candidate.id) {
+        masterMatchStatus = "idle";
+        masterComparison = null;
+        masterComparisonError = "";
+        masterComparisonLoading = false;
+      }
+      return;
+    }
     const existing = masterComparisons[candidate.id];
     if (existing && !force) {
       if (!background && selectedCandidateId === candidate.id) {
         masterComparison = existing;
         selectedMasterSectionId = existing.comparison.masterSectionId || 0;
         masterMatchStatus = existing.comparison.masterSectionId ? "matched" : "unmatched";
+        masterComparisonError = "";
       }
       return;
     }
@@ -1981,9 +2406,7 @@
         selectedMasterSectionId = 0;
         masterComparison = null;
         masterComparisonLoading = false;
-        masterComparisonError = candidate.verificationStatus === "failed"
-          ? "暂不能评分：系统尚未完成前后对话核验，请重新发现候选片段。"
-          : "暂不能评分：这条是旧版候选数据，缺少原话、入选理由或时间证据，请重新发现候选片段。";
+        masterComparisonError = "";
       }
       return;
     }
@@ -2027,7 +2450,7 @@
   async function runFullSessionReview(): Promise<void> {
     if (!masterBaseline || !currentSource || !reusableCandidates.length || isSessionReviewing) return;
     if (reviewingId) {
-      errorMessage = "当前片段仍在生成复盘，请等待完成或点击“取消当前复盘”后再开始整场复盘。";
+      errorMessage = "当前片段仍在生成复盘，请等待完成或点击“取消当前复盘”后再开始本场对照复盘。";
       return;
     }
     const sessionGate = highlightReviewGate(
@@ -2347,7 +2770,7 @@
         if (completed.trim()) return completed;
         throw new Error("成交窗口转写任务已经结束，但没有生成可用文稿。");
       }
-      stage = (task.message || "").trim() || "正在转写下单时间附近的话术…";
+      stage = (task.message || "").trim() || "成交窗并行转写中…";
       await waitForTaskPoll();
     }
     throw new Error("成交窗口仍在后台转写，请稍后刷新本页查看结果。");
@@ -2361,7 +2784,7 @@
     const tasks = await invoke<BackgroundTask[]>("get_tasks");
     const activeTask = activeDealWindowTranscriptTask(tasks, videoId);
     if (activeTask) {
-      stage = (activeTask.message || "").trim() || "正在继续转写下单时间附近的话术…";
+      stage = (activeTask.message || "").trim() || "成交窗并行转写中…";
       return waitForDealWindowTranscriptTask(videoId, onPartial);
     }
     let completedSubtitle = "";
@@ -2371,6 +2794,7 @@
       eventId: `deal_window_asr_${videoId}_${Date.now()}`,
       id: videoId,
       ranges,
+      artifactStem: "deal-windows",
     }).then((subtitle) => {
       completedSubtitle = subtitle;
       settled = true;
@@ -2390,6 +2814,278 @@
     await generation;
     if (generationError) throw generationError;
     return completedSubtitle;
+  }
+
+  /**
+   * After Excel/JSON orders land: parallel deal-window ASR first, then
+   * non-blocking full-session backfill for 整场复盘 (non-deal sentences).
+   */
+  async function runImportOrderTranscriptPipeline(): Promise<void> {
+    const selectedVideo = video;
+    if (
+      analysisMode !== "company_deal"
+      || !selectedVideo
+      || isClipVideo(selectedVideo)
+      || !paymentEvents.length
+    ) {
+      return;
+    }
+    // Avoid double-start while regenerate / another deal-window pass is running.
+    if (isTranscribing) return;
+
+    const pipelineId = ++importTranscriptPipelineSequence;
+    const requestIdentity = activeAnalysisRequestIdentity();
+    const requestId = ++transcriptRequestSequence;
+    isTranscribing = true;
+    transcriptLoadError = "";
+    try {
+      const ranges = buildDealTranscriptWindows(paymentEvents, boundVideoDurationSec);
+      if (!ranges.length) {
+        stage = "成交时间不在当前视频范围内，请先校准视频起点";
+        return;
+      }
+      const windowMinutes = Math.max(1, Math.ceil(totalDealTranscriptDuration(ranges) / 60));
+      stage = `成交窗并行转写中…（${ranges.length} 窗 · 约 ${windowMinutes} 分钟音频）`;
+      const nextTranscript = await resumeOrGenerateDealWindowTranscript(
+        selectedVideo.id,
+        ranges,
+        (partialSubtitle) => {
+          const partialEntries = parseSrt(partialSubtitle);
+          if (!partialEntries.length) return;
+          transcript = partialSubtitle;
+          transcriptEntries = partialEntries;
+          transcriptRefreshNotice = `已生成 ${partialEntries.length} 条文稿，后台继续补充`;
+          stage = `成交窗并行转写中…已显示 ${partialEntries.length} 条`;
+        },
+      );
+      if (
+        pipelineId !== importTranscriptPipelineSequence
+        || !isCurrentAnalysisRequest(
+          requestIdentity,
+          activeAnalysisRequestIdentity(),
+          requestId,
+          transcriptRequestSequence,
+        )
+      ) {
+        return;
+      }
+      if (!nextTranscript.trim()) {
+        throw new Error("成交窗口转写完成，但没有识别到可用文字。");
+      }
+      transcript = nextTranscript;
+      transcriptEntries = parseSrt(transcript);
+      transcriptRefreshNotice = "成交窗转写完成，成交话术可用";
+      stage = `成交窗转写完成，共 ${transcriptEntries.length} 条；即将后台补转非成交段…`;
+      saveState(requestIdentity);
+    } catch (error: any) {
+      if (
+        pipelineId !== importTranscriptPipelineSequence
+        || !isCurrentAnalysisRequest(
+          requestIdentity,
+          activeAnalysisRequestIdentity(),
+          requestId,
+          transcriptRequestSequence,
+        )
+      ) {
+        return;
+      }
+      transcriptLoadError = error?.message || String(error);
+      stage = "成交窗转写失败";
+      return;
+    } finally {
+      if (
+        pipelineId === importTranscriptPipelineSequence
+        && isCurrentAnalysisRequest(
+          requestIdentity,
+          activeAnalysisRequestIdentity(),
+          requestId,
+          transcriptRequestSequence,
+        )
+      ) {
+        isTranscribing = false;
+      }
+    }
+
+    if (
+      pipelineId !== importTranscriptPipelineSequence
+      || !isCurrentAnalysisRequest(
+        requestIdentity,
+        activeAnalysisRequestIdentity(),
+        requestId,
+        transcriptRequestSequence,
+      )
+    ) {
+      return;
+    }
+    void backfillFullSessionTranscriptInBackground(selectedVideo.id);
+  }
+
+  function isSameAnalysisSource(request: AnalysisRequestIdentity): boolean {
+    const active = activeAnalysisRequestIdentity();
+    return request.sourceKey === active.sourceKey
+      && request.sourceRevision === active.sourceRevision;
+  }
+
+  function transcriptTimelineStart(entries: readonly { start: number }[]): number {
+    if (!entries.length) return Number.POSITIVE_INFINITY;
+    let min = Number.POSITIVE_INFINITY;
+    for (const entry of entries) {
+      const start = Number(entry.start);
+      if (Number.isFinite(start) && start < min) min = start;
+    }
+    return min;
+  }
+
+  /**
+   * Prefer the on-disk full-session `.srt` when it covers earlier time or has
+   * many more cues than the in-memory deal-window / gap-fill snapshot.
+   */
+  async function adoptRicherDiskSubtitleIfAvailable(
+    videoId: number,
+    requestIdentity = activeAnalysisRequestIdentity(),
+  ): Promise<boolean> {
+    let existingFull = "";
+    try {
+      existingFull = await invoke<string>("get_video_subtitle", { id: videoId });
+    } catch {
+      return false;
+    }
+    const fullEntries = parseSrt(existingFull);
+    if (!fullEntries.length) return false;
+    const currentStart = transcriptTimelineStart(transcriptEntries);
+    const fullStart = transcriptTimelineStart(fullEntries);
+    const richerByCount = fullEntries.length >= transcriptEntries.length + 20;
+    const richerByStart = fullStart + 30 < currentStart;
+    if (!richerByCount && !richerByStart) return false;
+    if (
+      !isSameAnalysisSource(requestIdentity)
+      || !video
+      || video.id !== videoId
+    ) {
+      return false;
+    }
+    transcript = existingFull;
+    transcriptEntries = fullEntries;
+    transcriptRefreshNotice = `已加载整场逐字稿（${fullEntries.length} 句，含开场）`;
+    stage = transcriptRefreshNotice;
+    saveState(requestIdentity);
+    return true;
+  }
+
+  async function backfillFullSessionTranscriptInBackground(videoId: number): Promise<void> {
+    if (analysisMode !== "company_deal" || !video || video.id !== videoId || isClipVideo(video)) {
+      return;
+    }
+    if (isFullSessionBackfilling) return;
+    const backfillId = ++fullSessionBackfillSequence;
+    const requestIdentity = activeAnalysisRequestIdentity();
+    const durationSec = boundVideoDurationSec;
+    const dealWindows = buildDealTranscriptWindows(paymentEvents, durationSec);
+
+    if (await adoptRicherDiskSubtitleIfAvailable(videoId, requestIdentity)) {
+      return;
+    }
+    if (backfillId !== fullSessionBackfillSequence) return;
+
+    let existingFull = "";
+    try {
+      existingFull = await invoke<string>("get_video_subtitle", { id: videoId });
+    } catch {
+      // Incomplete / deal-only legacy files often fail coverage checks — keep going to gap-fill.
+      existingFull = "";
+    }
+    if (existingFull.trim()) {
+      const fullEntries = parseSrt(existingFull);
+      const nonDeal = excludeDealWindowCues(fullEntries, dealWindows);
+      // Only skip gap-fill when non-deal sentences already exist. Deal-only SRT must not
+      // be treated as a finished full-session transcript (that hid 0~first-deal content).
+      if (nonDeal.length > 0) {
+        if (
+          backfillId === fullSessionBackfillSequence
+          && video?.id === videoId
+          && isSameAnalysisSource(requestIdentity)
+        ) {
+          transcript = existingFull;
+          transcriptEntries = fullEntries;
+          transcriptRefreshNotice = "已读取整场逐字稿";
+          saveState(requestIdentity);
+        }
+        return;
+      }
+    }
+
+    if (!(durationSec > 0)) {
+      if (
+        backfillId === fullSessionBackfillSequence
+        && isSameAnalysisSource(requestIdentity)
+      ) {
+        transcriptRefreshNotice = "无法补转非成交段：视频时长未知，请先打开播放器或等时长探测完成";
+        stage = transcriptRefreshNotice;
+      }
+      return;
+    }
+
+    const gapWindows = buildTranscriptGapWindows(dealWindows, durationSec);
+    if (!gapWindows.length) {
+      if (
+        backfillId === fullSessionBackfillSequence
+        && isSameAnalysisSource(requestIdentity)
+      ) {
+        transcriptRefreshNotice = "成交窗已覆盖整场时间轴，无需补转非成交段";
+        stage = transcriptRefreshNotice;
+      }
+      return;
+    }
+
+    isFullSessionBackfilling = true;
+    transcriptRefreshNotice = `后台补转非成交段…（${gapWindows.length} 段）`;
+    stage = transcriptRefreshNotice;
+    try {
+      const mergedSubtitle = await invoke<string>("generate_video_deal_window_subtitle", {
+        eventId: `gap_fill_${videoId}_${Date.now()}`,
+        id: videoId,
+        ranges: gapWindows.map((range) => ({
+          startSec: range.startSec,
+          endSec: range.endSec,
+        })),
+        artifactStem: "gap-windows",
+      });
+      if (
+        backfillId !== fullSessionBackfillSequence
+        || !video
+        || video.id !== videoId
+        || !isSameAnalysisSource(requestIdentity)
+      ) {
+        return;
+      }
+      if (!mergedSubtitle.trim()) {
+        transcriptRefreshNotice = "补转结束，但未识别到文字";
+        return;
+      }
+      const fullEntries = parseSrt(mergedSubtitle);
+      if (!fullEntries.length) {
+        transcriptRefreshNotice = "补转结束，但缺少时间戳";
+        return;
+      }
+      transcript = mergedSubtitle;
+      transcriptEntries = fullEntries;
+      transcriptRefreshNotice = "非成交段已补入同一份文稿";
+      stage = `文稿补全完成，共 ${fullEntries.length} 条（成交窗 + 补转段）`;
+      saveState(requestIdentity);
+    } catch (error: any) {
+      if (
+        backfillId !== fullSessionBackfillSequence
+        || !isSameAnalysisSource(requestIdentity)
+      ) {
+        return;
+      }
+      transcriptRefreshNotice = `非成交段补转未完成：${error?.message || String(error)}`;
+      stage = "成交话术可用；非成交段稍后可在「整场复盘」重试";
+    } finally {
+      if (backfillId === fullSessionBackfillSequence) {
+        isFullSessionBackfilling = false;
+      }
+    }
   }
 
   async function smartRefreshTranscript(hasSavedAnalysis: boolean, forceTranscriptRefresh = false): Promise<void> {
@@ -2454,7 +3150,7 @@
       } else if (selectedVideo) {
         const useDealWindows = analysisMode === "company_deal" && !isClipVideo(selectedVideo);
         stage = forceTranscriptRefresh
-          ? useDealWindows ? "正在重新识别下单时间附近的话术…" : "正在重新识别视频逐字稿…"
+          ? useDealWindows ? "成交窗并行转写中…" : "正在重新识别视频逐字稿…"
           : useDealWindows ? "正在读取成交窗口逐字稿…" : "正在读取视频逐字稿…";
         if (!forceTranscriptRefresh) {
           try {
@@ -2476,7 +3172,7 @@
             const ranges = buildDealTranscriptWindows(paymentEvents, boundVideoDurationSec);
             if (!ranges.length) throw new Error("成交时间不在当前视频范围内，请先校准视频起点。");
             const windowMinutes = Math.max(1, Math.ceil(totalDealTranscriptDuration(ranges) / 60));
-            stage = `正在转写 ${ranges.length} 个成交窗口，共约 ${windowMinutes} 分钟音频…`;
+            stage = `成交窗并行转写中…（${ranges.length} 窗 · 约 ${windowMinutes} 分钟音频）`;
             nextTranscript = await resumeOrGenerateDealWindowTranscript(
               selectedVideo.id,
               ranges,
@@ -2486,7 +3182,7 @@
                 transcript = partialSubtitle;
                 transcriptEntries = partialEntries;
                 transcriptRefreshNotice = `已生成 ${partialEntries.length} 条文稿，后台继续补充`;
-                stage = `已显示部分逐字稿（${partialEntries.length} 条），后台继续转写…`;
+                stage = `成交窗并行转写中…已显示 ${partialEntries.length} 条`;
               },
             );
           } else {
@@ -2874,6 +3570,87 @@
     }
   }
 
+  function formatRelativeClock(totalSeconds: number): string {
+    const total = Math.max(0, Math.floor(totalSeconds));
+    const minutes = Math.floor(total / 60);
+    const seconds = total % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  async function runCandidateScriptQualityAnalysis(force = false): Promise<void> {
+    const candidate = selectedCandidate;
+    if (!candidate || candidateScriptAnalyzing) return;
+    const sentences = selectedCandidateSentences
+      .map((entry) => ({ ...entry, text: entry.text.trim() }))
+      .filter((entry) => entry.text);
+    if (!sentences.length) {
+      candidateScriptError = "当前片段没有可用逐字稿句子。";
+      return;
+    }
+    if (
+      !force
+      && candidateScriptForId === candidate.id
+      && (candidateScriptAnnotations.length || candidateScriptSummary)
+    ) {
+      return;
+    }
+
+    const requestId = ++candidateScriptRequestSequence;
+    const candidateId = candidate.id;
+    candidateScriptAnalyzing = true;
+    candidateScriptError = "";
+    candidateScriptSummary = "";
+    candidateScriptAnnotations = [];
+    candidateScriptCueId = null;
+    candidateScriptForId = candidateId;
+    try {
+      const entriesById = new Map(sentences.map((entry) => [entry.id, entry]));
+      const chunks = splitTranscriptForScriptQuality(sentences);
+      const batches: ScriptIssueAnnotation[][] = [];
+      const summaries: string[] = [];
+      const systemPrompt = scriptQualitySystemPrompt();
+      for (const chunk of chunks) {
+        if (requestId !== candidateScriptRequestSequence || selectedCandidateId !== candidateId) return;
+        const response = await invoke<string>("minimax_chat", {
+          systemPrompt,
+          messages: [{ role: "user", content: buildScriptQualityUserMessage(chunk) }],
+        });
+        if (requestId !== candidateScriptRequestSequence || selectedCandidateId !== candidateId) return;
+        const bundle = parseScriptQualityBundle(response, entriesById);
+        batches.push(bundle.annotations);
+        if (bundle.summary) summaries.push(bundle.summary);
+        candidateScriptAnnotations = mergeScriptQualityAnnotations(batches);
+        candidateScriptSummary = summaries.join("\n");
+      }
+      if (requestId !== candidateScriptRequestSequence || selectedCandidateId !== candidateId) return;
+      if (!candidateScriptSummary.trim()) {
+        candidateScriptSummary = candidateScriptAnnotations.length
+          ? "本段已标出可改进句，请结合建议稿人工审定后再用。"
+          : "本段未发现需要重点修改的话术，可继续人工检查文稿。";
+      }
+      if (candidateScriptAnnotations.length) {
+        candidateScriptCueId = candidateScriptAnnotations[0].cueId;
+      }
+    } catch (error: any) {
+      if (requestId !== candidateScriptRequestSequence || selectedCandidateId !== candidateId) return;
+      candidateScriptError = error?.message || String(error);
+    } finally {
+      if (requestId === candidateScriptRequestSequence) {
+        candidateScriptAnalyzing = false;
+      }
+    }
+  }
+
+  $: if (
+    selectedCandidate
+    && workspaceTab === "analysis"
+    && selectedCandidateSentences.length
+    && candidateScriptForId !== selectedCandidate.id
+    && !candidateScriptAnalyzing
+  ) {
+    void runCandidateScriptQualityAnalysis(false);
+  }
+
   function seekToTranscriptEntry(entry: TranscriptEntry): void {
     if (isCompanyFullSessionPlayback()) {
       seekFullArchivePlayback(entry.start);
@@ -3027,11 +3804,10 @@
         throw new Error("无法得到有效起止边界");
       }
       dealSpeechRefineCache = { ...dealSpeechRefineCache, [cacheKey]: range };
+      saveDealSpeechRefine();
       const { [cacheKey]: _cleared, ...restFailures } = dealSpeechRefineFailures;
       dealSpeechRefineFailures = restFailures;
-      dealSpeechRefineProgress = range.reason
-        ? `已定位：${range.title || "成交链路"}（${range.reason}）`
-        : `已定位：${range.title || "成交链路"}`;
+      dealSpeechRefineProgress = "";
       dealSpeechRefineError = "";
       if (selectedDealOffsetSec === offsetSec) {
         activeDealSpeechRange = range;
@@ -3064,12 +3840,44 @@
     void ensureDealSpeechRefined(selectedDealOffsetSec, true);
   }
 
+  async function adoptDealAutoClipsFromTaskId(taskId: string): Promise<void> {
+    if (!taskId) return;
+    if (dealClipBatchTaskId && taskId !== dealClipBatchTaskId) return;
+    const parentVideoId = dealClipBatchParentId || video?.id || 0;
+    if (!parentVideoId) return;
+    const tasks = await invoke<BackgroundTask[]>("get_tasks");
+    const task = tasks.find((candidate) => candidate.id === taskId);
+    if (!task?.metadata) return;
+    const videos = await invoke<VideoItem[]>("get_all_videos");
+    const incoming = buildClipReviewRequest({
+      taskId,
+      parentVideoId,
+      ranges: dealClipBatchRanges,
+      transcriptEntries,
+      videos,
+      taskMetadata: task.metadata,
+    });
+    if (!incoming) return;
+    const previousIds = new Set((companyClipReviewRequest?.items ?? []).map((item) => item.video.id));
+    const merged = mergeClipReviewRequest(companyClipReviewRequest, incoming);
+    const added = merged.items.filter((item) => !previousIds.has(item.video.id));
+    if (!added.length && companyClipReviewRequest) return;
+    companyClipReviewRequest = merged;
+    saveCompanyClipReview(merged);
+    if (companyWorkspaceTab !== "clip_review") companyWorkspaceTab = "clip_review";
+    await Promise.allSettled(added.map((item) => invoke("update_video_subtitle", {
+      id: item.video.id,
+      subtitle: clipTranscriptToSrt(item.transcriptEntries),
+    })));
+  }
+
   async function waitForDealAutoClipTask(taskId: string): Promise<BackgroundTask> {
     const maxAttempts = 400;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const tasks = await invoke<BackgroundTask[]>("get_tasks");
       const task = tasks.find((candidate) => candidate.id === taskId);
       if (!task) throw new Error("自动切片任务记录不存在，请到任务页检查。");
+      if (task.metadata) await adoptDealAutoClipsFromTaskId(taskId);
       if (task.status === "success") return task;
       if (["failed", "cancelled", "interrupted"].includes(task.status)) {
         throw new Error(task.message?.trim() || `自动切片任务已${task.status}`);
@@ -3093,9 +3901,9 @@
     const errors: string[] = [];
     try {
       const allContexts = buildDealClipContexts(paymentEvents, transcriptEntries)
-        .filter((context) => context.transcriptLines.length > 0);
-      const selectedContext = selectDealClipContext(allContexts, selectedDealOffsetSec);
-      const contexts = selectedContext ? [selectedContext] : [];
+        .filter((context) => context.transcriptLines.length > 0)
+        .sort((left, right) => left.payAnchorSec - right.payAnchorSec);
+      const contexts = allContexts;
       if (!contexts.length) {
         throw new Error("订单时间附近没有可用逐字稿，无法追溯完整成交链路");
       }
@@ -3110,6 +3918,12 @@
           return;
         }
         const context = contexts[index];
+        const cacheKey = dealClipContextCacheKey(context);
+        const cached = dealSpeechRefineCache[cacheKey];
+        if (cached) {
+          draftRanges.push(cached);
+          continue;
+        }
         dealAutoClipProgress = `Minimax 分析完整成交链路 ${index + 1}/${contexts.length}（同商品 ${context.orderCount} 单）…`;
         stage = dealAutoClipProgress;
         try {
@@ -3123,8 +3937,8 @@
             continue;
           }
           draftRanges.push(range);
-          const cacheKey = dealClipContextCacheKey(context);
           dealSpeechRefineCache = { ...dealSpeechRefineCache, [cacheKey]: range };
+          saveDealSpeechRefine();
           if (selectedDealOffsetSec != null) syncActiveDealSpeechRange(selectedDealOffsetSec);
         } catch (error: any) {
           errors.push(`链路 ${index + 1}: ${error?.message || String(error)}`);
@@ -3147,6 +3961,14 @@
       dealAutoClipProgress = `正在提交 ${ranges.length} 条完整成交链路视频到后台队列…`;
       stage = dealAutoClipProgress;
       const batchEventId = `deal_auto_clip_batch_${selectedVideo.id}_${Date.now()}`;
+      dealClipBatchTaskId = batchEventId;
+      dealClipBatchParentId = selectedVideo.id;
+      dealClipBatchRanges = ranges.map((range) => ({
+        start: range.start,
+        end: range.end,
+        title: range.title,
+        reason: range.reason,
+      }));
       const queued = await invoke<{ taskId: string; count: number }>("queue_deal_auto_clips", {
         eventId: batchEventId,
         parentVideoId: selectedVideo.id,
@@ -3163,7 +3985,7 @@
         return;
       }
 
-      dealAutoClipProgress = `已提交 ${queued.count} 条完整成交链路视频，正在等待生成完成…`;
+      dealAutoClipProgress = `后台切片 0/${queued.count}，切出第一条会自动进入切片复盘`;
       dealAutoClipError = "";
       stage = dealAutoClipProgress;
       const completedTask = await waitForDealAutoClipTask(queued.taskId);
@@ -3174,29 +3996,30 @@
       ) {
         return;
       }
-      const generatedVideos = await invoke<VideoItem[]>("get_all_videos");
-      const reviewRequest = buildClipReviewRequest({
-        taskId: queued.taskId,
-        parentVideoId: selectedVideo.id,
-        ranges,
-        transcriptEntries,
-        videos: generatedVideos,
-        taskMetadata: completedTask.metadata,
-      });
-      if (!reviewRequest) {
-        throw new Error("切片已经生成，但未找到对应的视频结果。请在切片列表中刷新查看。");
+      await adoptDealAutoClipsFromTaskId(queued.taskId);
+      if (!companyClipReviewRequest?.items.length) {
+        const generatedVideos = await invoke<VideoItem[]>("get_all_videos");
+        const reviewRequest = buildClipReviewRequest({
+          taskId: queued.taskId,
+          parentVideoId: selectedVideo.id,
+          ranges,
+          transcriptEntries,
+          videos: generatedVideos,
+          taskMetadata: completedTask.metadata,
+        });
+        if (!reviewRequest) {
+          throw new Error("切片已经生成，但未找到对应的视频结果。请在切片列表中刷新查看。");
+        }
+        companyClipReviewRequest = reviewRequest;
+        saveCompanyClipReview(reviewRequest);
+        companyWorkspaceTab = "clip_review";
       }
-      await Promise.allSettled(reviewRequest.items.map((item) => invoke("update_video_subtitle", {
-        id: item.video.id,
-        subtitle: clipTranscriptToSrt(item.transcriptEntries),
-      })));
       const summary = errors.length
         ? `切片完成；另有 ${errors.length} 条成交链路未获得有效 AI 边界。`
-        : "切片完成，正在进入成交切片复盘页…";
+        : `切片完成，共 ${companyClipReviewRequest?.items.length || 0} 条可在「切片复盘」查看`;
       dealAutoClipProgress = summary;
       stage = summary;
       dealAutoClipping = false;
-      window.dispatchEvent(new CustomEvent("bsr:open-clip-review", { detail: reviewRequest }));
     } catch (error: any) {
       if (
         !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, dealAutoClipSequence)
@@ -3215,8 +4038,103 @@
     }
   }
 
+  async function ensureFullSessionTranscriptForReview(
+    requestIdentity: AnalysisRequestIdentity,
+    requestId: number,
+  ): Promise<typeof transcriptEntries> {
+    const windows = analysisMode === "company_deal" && paymentEvents.length
+      ? buildDealTranscriptWindows(paymentEvents, boundVideoDurationSec)
+      : [];
+    let reviewEntries = analysisMode === "company_deal"
+      ? excludeDealWindowCues(transcriptEntries, windows)
+      : transcriptEntries;
+    if (reviewEntries.length) return reviewEntries;
+
+    const selectedVideo = video;
+    if (!selectedVideo || isClipVideo(selectedVideo)) {
+      throw new Error(
+        paymentEvents.length
+          ? "成交时间窗外没有可复盘句子；成交链路请到「成交话术」查看。"
+          : "没有可用逐字稿。",
+      );
+    }
+
+    stage = "整场复盘需要完整逐字稿，正在检查是否已有整场文稿…";
+    let fullSubtitle = "";
+    try {
+      fullSubtitle = await invoke<string>("get_video_subtitle", { id: selectedVideo.id });
+    } catch {
+      fullSubtitle = "";
+    }
+    if (
+      !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)
+    ) {
+      return [];
+    }
+
+    if (fullSubtitle.trim() && windows.length) {
+      const existingEntries = parseSrt(fullSubtitle);
+      if (!excludeDealWindowCues(existingEntries, windows).length) {
+        // Deal-only / incomplete file — force gap-fill below.
+        fullSubtitle = "";
+      }
+    }
+
+    if (!fullSubtitle.trim()) {
+      scriptQualityError = "";
+      if (analysisMode === "company_deal" && paymentEvents.length && boundVideoDurationSec > 0) {
+        const gapWindows = buildTranscriptGapWindows(windows, boundVideoDurationSec);
+        if (!gapWindows.length) {
+          throw new Error("整场文稿已就绪，但仍无非成交段句子（成交窗可能覆盖整场）。");
+        }
+        stage = `整场复盘：正在补转非成交段…（${gapWindows.length} 段）`;
+        scriptQualitySummary = `正在补转非成交段（${gapWindows.length} 段），完成后自动分析…`;
+        fullSubtitle = await invoke<string>("generate_video_deal_window_subtitle", {
+          eventId: `gap_fill_review_${selectedVideo.id}_${Date.now()}`,
+          id: selectedVideo.id,
+          ranges: gapWindows.map((range) => ({
+            startSec: range.startSec,
+            endSec: range.endSec,
+          })),
+          artifactStem: "gap-windows",
+        });
+      } else {
+        stage = "整场复盘：正在按 10 分钟分段补转整场逐字稿…";
+        scriptQualitySummary = "正在分段补转整场逐字稿（可加速、可断点续跑），完成后自动分析非成交段…";
+        fullSubtitle = await resumeOrGenerateVideoTranscript(selectedVideo.id);
+      }
+      if (
+        !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)
+      ) {
+        return [];
+      }
+      scriptQualitySummary = "";
+    }
+
+    if (!fullSubtitle.trim()) {
+      throw new Error("整场逐字稿补转完成，但没有识别到可用文字。");
+    }
+
+    const fullEntries = parseSrt(fullSubtitle);
+    if (!fullEntries.length) {
+      throw new Error("整场逐字稿已生成，但没有可用时间戳。");
+    }
+
+    transcript = fullSubtitle;
+    transcriptEntries = fullEntries;
+    transcriptRefreshNotice = "已补转整场逐字稿，可用于整场复盘";
+    saveState(requestIdentity);
+
+    reviewEntries = excludeDealWindowCues(fullEntries, windows);
+    if (!reviewEntries.length) {
+      throw new Error("整场文稿已就绪，但仍无非成交段句子（成交窗可能覆盖整场）。");
+    }
+    return reviewEntries;
+  }
+
   async function runFullSessionScriptQualityReview(): Promise<void> {
-    if (!transcriptEntries.length || isScriptQualityAnalyzing || isTranscribing) return;
+    if (isScriptQualityAnalyzing || isTranscribing) return;
+    if (!transcriptEntries.length && !video) return;
     const requestIdentity = activeAnalysisRequestIdentity();
     const requestId = ++scriptQualityRequestSequence;
     isScriptQualityAnalyzing = true;
@@ -3225,16 +4143,28 @@
     scriptQualityAnnotations = [];
     selectedScriptCueId = null;
     companyWorkspaceTab = "ai_review";
-    const entriesById = new Map(transcriptEntries.map((entry) => [entry.id, entry]));
-    const systemPrompt = scriptQualitySystemPrompt();
-    const chunks = splitTranscriptForScriptQuality(transcriptEntries);
-    const batches: ScriptIssueAnnotation[][] = [];
-    let summaryParts: string[] = [];
-    const chunkWarnings: string[] = [];
     try {
+      const reviewEntries = await ensureFullSessionTranscriptForReview(requestIdentity, requestId);
+      if (
+        !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)
+      ) {
+        return;
+      }
+      if (!reviewEntries.length) {
+        scriptQualityError = "没有可复盘的非成交段句子。";
+        stage = "整场复盘跳过";
+        return;
+      }
+
+      const entriesById = new Map(reviewEntries.map((entry) => [entry.id, entry]));
+      const systemPrompt = scriptQualitySystemPrompt();
+      const chunks = splitTranscriptForScriptQuality(reviewEntries);
+      const batches: ScriptIssueAnnotation[][] = [];
+      let summaryParts: string[] = [];
+      const chunkWarnings: string[] = [];
       for (const chunk of chunks) {
         if (!isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)) return;
-        stage = `话术复盘 ${chunk.index + 1}/${chunk.total}…`;
+        stage = `整场复盘 ${chunk.index + 1}/${chunk.total}…`;
         try {
           const response = await invoke<string>("minimax_chat", {
             systemPrompt,
@@ -3244,8 +4174,6 @@
           const bundle = parseScriptQualityBundle(response, entriesById);
           if (bundle.summary) summaryParts.push(bundle.summary);
           batches.push(bundle.annotations);
-          // Long sessions are chunked. Preserve completed chunks immediately so
-          // leaving the page does not discard an otherwise expensive AI run.
           scriptQualityAnnotations = mergeScriptQualityAnnotations(batches);
           scriptQualitySummary = summaryParts.filter(Boolean).slice(0, 2).join(" ");
           if (currentSourceKey) saveScriptQuality(currentSourceKey);
@@ -3264,10 +4192,10 @@
           : `部分分析块失败（${chunkWarnings.length}/${chunks.length}）：${chunkWarnings[0]}`;
       }
       stage = scriptQualityAnnotations.length
-        ? `话术复盘完成，标出 ${scriptQualityAnnotations.length} 处可改进${chunkWarnings.length ? `（${chunkWarnings.length} 块失败）` : ""}`
+        ? `整场复盘完成，标出 ${scriptQualityAnnotations.length} 处可改进${chunkWarnings.length ? `（${chunkWarnings.length} 块失败）` : ""}`
         : chunkWarnings.length === chunks.length
-          ? "话术复盘失败"
-          : "话术复盘完成，未发现明显可改进句子";
+          ? "整场复盘失败"
+          : "整场复盘完成，未发现明显可改进句子";
       if (scriptQualityAnnotations.length) {
         selectedScriptCueId = scriptQualityAnnotations[0].cueId;
       }
@@ -3275,7 +4203,7 @@
     } catch (error: any) {
       if (!isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)) return;
       scriptQualityError = error?.message || String(error);
-      stage = "话术复盘失败";
+      stage = "整场复盘失败";
     } finally {
       if (isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)) {
         isScriptQualityAnalyzing = false;
@@ -3285,6 +4213,37 @@
 
   $: if (analysisMode === "company_deal" && paymentEvents.length && selectedDealOffsetSec == null) {
     selectedDealOffsetSec = paymentEvents[0]?.offsetSec ?? null;
+  }
+
+  $: dealReviewWindows = analysisMode === "company_deal" && paymentEvents.length
+    ? buildDealTranscriptWindows(paymentEvents, boundVideoDurationSec)
+    : [];
+  $: nonDealTranscriptEntries = analysisMode === "company_deal"
+    ? excludeDealWindowCues(transcriptEntries, dealReviewWindows)
+    : transcriptEntries;
+  $: dealSentenceCount = Math.max(0, transcriptEntries.length - nonDealTranscriptEntries.length);
+
+  // Prefer on-disk full SRT (often already has 开场); otherwise gap-fill once when
+  // the in-memory transcript still starts at the first deal window.
+  $: if (
+    analysisMode === "company_deal"
+    && video
+    && !isClipVideo(video)
+    && paymentEvents.length
+    && boundVideoDurationSec > 0
+    && transcriptEntries.length > 0
+    && !isFullSessionBackfilling
+    && !isTranscribing
+  ) {
+    const startsLate = transcriptTimelineStart(transcriptEntries) > 120;
+    const needsGapFill = dealSentenceCount > 0 && nonDealTranscriptEntries.length === 0;
+    if (startsLate || needsGapFill) {
+      const key = `${video.id}:${currentSourceKey || ""}:${startsLate ? "late" : "deal-only"}`;
+      if (autoGapFillAttemptKey !== key) {
+        autoGapFillAttemptKey = key;
+        void backfillFullSessionTranscriptInBackground(video.id);
+      }
+    }
   }
 
   $: if (
@@ -3555,8 +4514,8 @@
   }
 
   function buildVideoAsMaster(): void {
-    if (!video) return;
-    window.dispatchEvent(new CustomEvent("bsr:build-master", { detail: video }));
+    // 已废弃：整场视频/转写不得直接设为母稿；正确路径见产品规则
+    alert("已废弃「设为整场母稿」。请从成交话术精炼后，经切片复盘验证并人工确认，再通过 Clip「创建母稿样本批次」入库。");
   }
 </script>
 
@@ -3598,7 +4557,12 @@
       </div>
       <span class="stage" class:error-stage={Boolean(errorMessage)}>{errorMessage || stage}</span>
       {#if video}
-        <button class="secondary-button master-button" on:click={buildVideoAsMaster}>
+        <button
+          class="secondary-button master-button"
+          disabled
+          title="已废弃：请从成交话术精炼后经切片复盘入库"
+          on:click={buildVideoAsMaster}
+        >
           <BookOpenCheck size={15} />
           设为整场母稿
         </button>
@@ -3685,14 +4649,9 @@
       <div class="payment-events-heading">
         <div>
           <strong>成交订单时间轴</strong>
-          <span>
-            {#if paymentEventsSummary}
-              已导入 {paymentEventsSummary.eventCount} 笔 · 合计 ¥{paymentEventsSummary.totalPayAmountYuan.toLocaleString("zh-CN")}
-              {#if paymentEventsSourceLabel} · {paymentEventsSourceLabel}{/if}
-            {:else}
-              一次操作依次选择本场 Excel 和未清洗订单 JSON；系统自动对账并生成下单时间轴
-            {/if}
-          </span>
+          {#if paymentEventsSummary}
+            <span>已导入 {paymentEventsSummary.eventCount} 笔 · 合计 ¥{paymentEventsSummary.totalPayAmountYuan.toLocaleString("zh-CN")}</span>
+          {/if}
         </div>
         <div class="payment-events-actions">
           <button type="button" class="secondary-button" disabled={paymentEventsLoading} on:click={importAndCleanOrderTimeline}>
@@ -3702,7 +4661,7 @@
           <button
             type="button"
             class="secondary-button"
-            disabled={paymentEventsLoading || !archive}
+            disabled={paymentEventsLoading}
             on:click={fetchPaymentEventsFromApi}
           >
             {#if paymentEventsLoading}
@@ -3725,23 +4684,13 @@
       </div>
       {#if peakDealMinuteLabel}
         <button type="button" class="payment-events-peak" on:click={seekToDealPeak} title="跳到高峰前两分钟的逐字稿">
-          成交高峰：{peakDealMinuteLabel} · 定位候选时段（±2 分钟）
+          成交高峰：{peakDealMinuteLabel}
         </button>
-      {/if}
-      {#if paymentEventsMatchMessage}
-        <div class="timeline-match-success">{paymentEventsMatchMessage}</div>
       {/if}
       {#if paymentEvents.length && liveDashboardBinding?.session}
         <div class:warning={!videoLikelyFullSession && videoCalibrationStatus === "unverified"} class="video-calibration-card">
           <div>
             <strong>视频时间对齐</strong>
-            {#if videoCalibrationStatus === "manual"}
-              <span>已人工校准：视频从开播后 {Math.round(videoStartOffsetSec)} 秒开始</span>
-            {:else if videoLikelyFullSession || videoCalibrationStatus === "full_session"}
-              <span>视频时长与直播时长接近，可按整场视频直接对齐</span>
-            {:else}
-              <span>视频与直播时长相差约 {Math.round(videoDurationDeltaSec / 60)} 分钟，请校准一次</span>
-            {/if}
           </div>
           <div class="video-calibration-actions">
             <button type="button" class="secondary-button" on:click={confirmVideoStartsWithLive}>视频从开播开始</button>
@@ -3769,62 +4718,7 @@
     <input bind:this={dealRefinementInput} type="file" accept="application/json,.json" class="hidden-file-input" on:change={handleDealRefinementSelected} />
   {/if}
 
-  {#if analysisMode === "company_deal" && analysisPurpose === "enterprise_review" && video && !archive}
-    <section class="payment-events-summary" aria-label="成交订单时间轴">
-      <div class="payment-events-heading">
-        <div>
-          <strong>成交订单时间轴</strong>
-          <span>
-            {#if paymentEventsSummary}
-              已导入 {paymentEventsSummary.eventCount} 笔 · 合计 ¥{paymentEventsSummary.totalPayAmountYuan.toLocaleString("zh-CN")}
-              {#if paymentEventsSourceLabel} · {paymentEventsSourceLabel}{/if}
-            {:else}
-              一次操作依次选择本场 Excel 和未清洗订单 JSON，自动生成下单时间轴
-            {/if}
-          </span>
-        </div>
-        <div class="payment-events-actions">
-          <button type="button" class="secondary-button" disabled={paymentEventsLoading} on:click={importAndCleanOrderTimeline}>
-            <Upload size={14} />
-            导入 Excel + JSON 并自动清洗
-          </button>
-          <button type="button" class="text-button" disabled={paymentEventsLoading || !liveDashboardBinding?.session} on:click={importRawPaymentEvents}>仅重新导入订单 JSON</button>
-          <button type="button" class="text-button" on:click={openPaymentEventsPicker}>导入已清洗文件</button>
-          {#if paymentEvents.length}
-            <button type="button" class="text-button" on:click={clearPaymentEvents}>清除</button>
-          {/if}
-        </div>
-      </div>
-      {#if peakDealMinuteLabel}
-        <button type="button" class="payment-events-peak" on:click={seekToDealPeak} title="跳到高峰前两分钟的逐字稿">
-          成交高峰：{peakDealMinuteLabel} · 定位候选时段（±2 分钟）
-        </button>
-      {/if}
-      {#if paymentEventsMatchMessage}
-        <div class="timeline-match-success">{paymentEventsMatchMessage}</div>
-      {/if}
-      {#if paymentEvents.length && liveDashboardBinding?.session}
-        <div class:warning={!videoLikelyFullSession && videoCalibrationStatus === "unverified"} class="video-calibration-card">
-          <div>
-            <strong>视频时间对齐</strong>
-            {#if videoCalibrationStatus === "manual"}
-              <span>已人工校准：视频从开播后 {Math.round(videoStartOffsetSec)} 秒开始</span>
-            {:else if videoLikelyFullSession || videoCalibrationStatus === "full_session"}
-              <span>视频时长与直播时长接近，可按整场视频直接对齐</span>
-            {:else}
-              <span>视频与直播时长相差约 {Math.round(videoDurationDeltaSec / 60)} 分钟，请校准一次</span>
-            {/if}
-          </div>
-          <div class="video-calibration-actions">
-            <button type="button" class="secondary-button" on:click={confirmVideoStartsWithLive}>视频从开播开始</button>
-            <button type="button" class="secondary-button" disabled={selectedDealOffsetSec == null} on:click={calibrateSelectedDealAtCurrentFrame}>当前位置就是所选成交点</button>
-          </div>
-        </div>
-      {/if}
-      {#if paymentEventsError}
-        <small class="live-dashboard-error">{paymentEventsError}</small>
-      {/if}
-    </section>
+  {#if analysisMode === "company_deal"}
     <input
       bind:this={paymentEventsInput}
       type="file"
@@ -3841,7 +4735,20 @@
     videoId={video?.id ?? null}
     archiveSource={Boolean(archive)}
     events={paymentEvents}
+    danmuEntries={dealDanmuEntries}
+    liveStartedAt={dealLiveStartedAt}
+    transcriptBackfilling={isFullSessionBackfilling}
     transcriptEntries={transcriptEntries}
+    nonDealTranscriptEntries={nonDealTranscriptEntries}
+    dealWindows={dealReviewWindows}
+    dealSentenceCount={dealSentenceCount}
+    needsFullTranscriptBackfill={Boolean(
+      analysisMode === "company_deal"
+      && video
+      && !isClipVideo(video)
+      && dealSentenceCount > 0
+      && nonDealTranscriptEntries.length === 0
+    )}
     selectedOffsetSec={selectedDealOffsetSec}
     transcriptReady={Boolean(transcript)}
     scriptQualityAnalyzing={isScriptQualityAnalyzing}
@@ -3849,6 +4756,7 @@
     scriptQualitySummary={scriptQualitySummary}
     scriptQualityAnnotations={scriptQualityAnnotations}
     selectedScriptCueId={selectedScriptCueId}
+    playbackPositionSec={analysisPlaybackPositionSec}
     canAutoClip={canDealAutoClip}
     autoClipping={dealAutoClipping}
     autoClipProgress={dealAutoClipProgress}
@@ -3866,6 +4774,21 @@
     orderSummary={null}
     showDashboardBind={showCompanyDashboardBind}
     showDataBoard={showCompanyDataBoard}
+    clipReviewRequest={companyClipReviewRequest}
+    alignOrderCount={paymentEventsSummary?.eventCount ?? 0}
+    alignTotalPayYuan={paymentEventsSummary?.totalPayAmountYuan ?? 0}
+    alignLoading={paymentEventsLoading}
+    alignError={paymentEventsError}
+    alignCanPullOrders={Boolean(dashboardBindLiveId || archive || video)}
+    alignCanImportRawJson={Boolean(liveDashboardBinding?.session)}
+    alignPeakLabel={peakDealMinuteLabel ?? ""}
+    alignCanCalibrateCurrent={selectedDealOffsetSec != null}
+    alignShowCalibration={paymentEvents.length > 0}
+    alignCalibrationWarning={!videoLikelyFullSession && videoCalibrationStatus === "unverified"}
+    excelCanDownload={Boolean(currentExcelDownloadTarget().targetDate)}
+    {excelDownloading}
+    {excelDownloadHint}
+    on:downloadExcel={() => void downloadExcelForCurrentVideo()}
     on:seek={(event) => handleCompanyDealSeek(event.detail)}
     on:select={(event) => handleCompanyDealSelect(event.detail)}
     on:analyzeScriptQuality={() => void runFullSessionScriptQualityReview()}
@@ -3875,6 +4798,16 @@
     on:openDashboard={() => openBoundLiveDashboard()}
     on:bindDashboardSession={() => void bindSelectedLiveDashboard()}
     on:rebindDashboardSession={() => void rebindLiveDashboardSession()}
+    on:closeClipReview={() => { companyWorkspaceTab = "ai_review"; }}
+    on:openClipReview={() => void openCompanyClipReviewTab()}
+    on:importClean={() => void importAndCleanOrderTimeline()}
+    on:pullOrders={() => void fetchPaymentEventsFromApi()}
+    on:importRawJson={() => void importRawPaymentEvents()}
+    on:importCleanedFile={() => openPaymentEventsPicker()}
+    on:clearOrders={() => clearPaymentEvents()}
+    on:seekPeak={() => seekToDealPeak()}
+    on:confirmLiveStart={() => confirmVideoStartsWithLive()}
+    on:calibrateCurrent={() => calibrateSelectedDealAtCurrentFrame()}
   >
     <div slot="player" class="company-player-shell">
       {#if playbackLoadError}
@@ -3887,18 +4820,17 @@
         <div class="empty-player">
           <Loader2 size={32} class="is-spinning" />
           <strong>正在加载视频…</strong>
-          <span>原始文件保留不变，加载完成后直接播放。</span>
         </div>
       {:else if video && playbackView !== "player"}
         <div class="empty-player playback-preparation">
           {#if playbackView === "preparing" || isPreparingPlayback}
             <Loader2 size={32} class="is-spinning" />
             <strong>正在生成可播放版本</strong>
-            <span>{playbackSource?.message || "正在转换为 H.264 MP4…"}</span>
+            <span>{playbackSource?.message || "转换中…"}</span>
           {:else}
             <Play size={32} />
-            <strong>原始视频暂时无法在应用内解码</strong>
-            <span>系统会先直接播放原 TS；只有当前 WebView 不支持其编码时，才可按需生成 .playable.mp4。切片始终使用原 TS/NAS。</span>
+            <strong>当前无法直接播放</strong>
+            <span>可生成可播放版本后再看。</span>
             {#if playbackLoadError}
               <span class="playback-inline-error" role="alert">{playbackLoadError}</span>
             {/if}
@@ -4023,7 +4955,7 @@
               </div>
             {:else}
               <!-- svelte-ignore a11y-media-has-caption -->
-              <video bind:this={videoElement} src={playbackMode === "native" ? videoPlayerUrl : undefined} controls playsinline preload="metadata" on:error={() => void handleVideoElementError()} />
+              <video bind:this={videoElement} src={playbackMode === "native" ? videoPlayerUrl : undefined} controls playsinline preload="metadata" on:timeupdate={updateHtmlPlaybackPosition} on:error={() => void handleVideoElementError()} />
             {/if}
           {/if}
         {/if}
@@ -4092,7 +5024,7 @@
               </div>
           {:else}
             <!-- svelte-ignore a11y-media-has-caption -->
-            <video bind:this={videoElement} src={playbackMode === "native" ? videoPlayerUrl : undefined} controls playsinline preload="metadata" on:error={() => void handleVideoElementError()} />
+            <video bind:this={videoElement} src={playbackMode === "native" ? videoPlayerUrl : undefined} controls playsinline preload="metadata" on:timeupdate={updateHtmlPlaybackPosition} on:error={() => void handleVideoElementError()} />
           {/if}
           {/key}
         {:else if playerUrl}
@@ -4215,7 +5147,7 @@
 
     <section class="column review-column">
       <div class="column-title">
-        <div><span class="step">3</span>{workspaceTab === "proofreading" ? "校稿审核" : "片段复盘"}</div>
+        <div><span class="step">3</span>{workspaceTab === "proofreading" ? "校稿审核" : "语句复盘"}</div>
         {#if workspaceTab === "analysis"}<div class="copy-actions">
           <button title="复制话术发展建议" disabled={!selectedReview} on:click={copySpokenScript}>
             {#if copiedAction === "话术发展建议"}<Check size={14} />{:else}<Copy size={14} />{/if}
@@ -4227,38 +5159,40 @@
           </button>
         </div>{:else if auditBundle}<span>{auditBundle.pendingCriticalCount} 条待确认</span>{/if}
       </div>
-      {#if discoveryCompleted && candidates.length}
-        <details class="session-diagnosis" open>
-          <summary>
-            <span>本场诊断摘要</span>
-            <strong>{sessionDiagnosis.headline}</strong>
-          </summary>
-          <div class="diagnosis-actions">
-            <button on:click={() => copyText(currentOptimizationPlanMarkdown(), "优化计划")}><Copy size={13} />复制计划</button>
-            <button on:click={exportOptimizationPlan}><Download size={13} />导出下场优化计划</button>
-          </div>
-          <div class="diagnosis-grid">
-            {#if sessionDiagnosis.highlights.length}
-              <section><h3>值得保留</h3><ul>{#each sessionDiagnosis.highlights as item}<li>{item}</li>{/each}</ul></section>
-            {/if}
-            {#if sessionDiagnosis.issues.length}
-              <section><h3>主要问题</h3><ul>{#each sessionDiagnosis.issues as item}<li>{item}</li>{/each}</ul></section>
-            {/if}
-            {#if sessionDiagnosis.confirmations.length}
-              <section><h3>还要确认</h3><ul>{#each sessionDiagnosis.confirmations as item}<li>{item}</li>{/each}</ul></section>
-            {/if}
-            {#if sessionDiagnosis.nextActions.length}
-              <section class="next-actions"><h3>下场动作</h3><ol>{#each sessionDiagnosis.nextActions as item}<li>{item}</li>{/each}</ol></section>
-            {/if}
-          </div>
-        </details>
-      {/if}
       <div class="workspace-tabs" role="tablist" aria-label="右栏工作区">
         <button class:active={workspaceTab === "proofreading"} on:click={() => workspaceTab = "proofreading"}>
           校稿审核{#if auditBundle?.pendingCriticalCount}<span>{auditBundle.pendingCriticalCount}</span>{/if}
         </button>
-        <button class:active={workspaceTab === "analysis"} on:click={() => workspaceTab = "analysis"}>片段分析</button>
+        <button class:active={workspaceTab === "analysis"} on:click={() => workspaceTab = "analysis"}>语句分析</button>
       </div>
+      {#if discoveryCompleted && candidates.length}
+        <details class="session-diagnosis">
+          <summary>
+            <span>本场诊断摘要</span>
+            <strong>{sessionDiagnosis.headline}</strong>
+          </summary>
+          <div class="diagnosis-scroll">
+            <div class="diagnosis-actions">
+              <button on:click={() => copyText(currentOptimizationPlanMarkdown(), "优化计划")}><Copy size={13} />复制计划</button>
+              <button on:click={exportOptimizationPlan}><Download size={13} />导出下场优化计划</button>
+            </div>
+            <div class="diagnosis-grid">
+              {#if sessionDiagnosis.highlights.length}
+                <section><h3>值得保留</h3><ul>{#each sessionDiagnosis.highlights as item}<li>{item}</li>{/each}</ul></section>
+              {/if}
+              {#if sessionDiagnosis.issues.length}
+                <section><h3>主要问题</h3><ul>{#each sessionDiagnosis.issues as item}<li>{item}</li>{/each}</ul></section>
+              {/if}
+              {#if sessionDiagnosis.confirmations.length}
+                <section><h3>还要确认</h3><ul>{#each sessionDiagnosis.confirmations as item}<li>{item}</li>{/each}</ul></section>
+              {/if}
+              {#if sessionDiagnosis.nextActions.length}
+                <section class="next-actions"><h3>下场动作</h3><ol>{#each sessionDiagnosis.nextActions as item}<li>{item}</li>{/each}</ol></section>
+              {/if}
+            </div>
+          </div>
+        </details>
+      {/if}
       {#if workspaceTab === "proofreading"}
         <div class="proofreading-content">
           {#if auditLoadStatus === "loading"}
@@ -4290,45 +5224,90 @@
       {:else}
       <div class="review-content selectable">
         {#if selectedCandidate}
-          <div class="review-summary">
-            <div>
-              <span class="tier-label" class:core-tier={selectedCandidate.verificationStatus === "verified_complete"}>{candidateDisplayType(selectedCandidate)}</span>
-              <strong>{selectedCandidate.scene || selectedCandidate.product}</strong>
-              <small>{formatTime(selectedCandidate.start)}—{formatTime(selectedCandidate.end)}</small>
+          <section class="ai-script-analysis-pane" aria-label="AI 文稿分析">
+            <header>
+              <strong>AI 文稿分析</strong>
+              <button
+                type="button"
+                disabled={candidateScriptAnalyzing || !selectedCandidateSentences.length}
+                on:click={() => void runCandidateScriptQualityAnalysis(true)}
+              >
+                <Sparkles size={14} />
+                {candidateScriptAnalyzing ? "分析中…" : "重新分析"}
+              </button>
+            </header>
+            <div class="ai-script-analysis-body">
+              {#if candidateScriptAnalyzing}
+                <div class="ai-script-loading">
+                  <Loader2 size={26} class="is-spinning" />
+                  <span>AI 正在按语句分析本段话术…</span>
+                </div>
+              {/if}
+              {#if candidateScriptError}
+                <div class="ai-script-error">{candidateScriptError}</div>
+              {/if}
+              {#if candidateScriptSummary}
+                <article class="ai-script-summary">
+                  <strong>整体结论</strong>
+                  <p>{candidateScriptSummary}</p>
+                </article>
+              {/if}
+              {#if candidateScriptAnnotations.length}
+                <div class="ai-script-issue-list">
+                  {#each candidateScriptAnnotations as annotation (annotation.cueId)}
+                    <button
+                      type="button"
+                      class:selected={candidateScriptCueId === annotation.cueId}
+                      on:click={() => {
+                        candidateScriptCueId = annotation.cueId;
+                        const entry = selectedCandidateSentences.find((item) => item.id === annotation.cueId);
+                        if (entry) seekToTranscriptEntry(entry);
+                      }}
+                    >
+                      <span class="issue-label">
+                        {scriptIssueKindLabel(annotation.kind)} · {formatRelativeClock(Math.max(0, annotation.startMs / 1000 - selectedCandidate.start))}
+                      </span>
+                      <strong>{annotation.originalText}</strong>
+                      <p>{annotation.reason}</p>
+                      <em>{annotation.suggestion}</em>
+                    </button>
+                  {/each}
+                </div>
+              {:else if candidateScriptSummary && !candidateScriptAnalyzing}
+                <div class="ai-script-no-issues">AI 暂未标出重点问题。</div>
+              {:else if !candidateScriptAnalyzing && !selectedCandidateSentences.length}
+                <div class="empty-state">
+                  <span>当前片段时间窗内还没有逐字稿句子，请先完成转写。</span>
+                </div>
+              {/if}
             </div>
-            <div class="highlight-score">
-              <strong>{isStructuredDiscoveryCandidate(selectedCandidate) ? candidateOutcomeLabel(selectedCandidate.outcome) : selectedCandidate.verificationStatus === "verified_complete" ? "已检查" : "待检查"}</strong>
-              <span>{selectedCandidate.interrupted ? "话术受到打断" : selectedCandidate.verificationStatus === "verified_complete" ? "可对照企业标准话术" : "等待下一步复核"}</span>
-            </div>
-          </div>
-          <div class="evidence-card">
-            <div class="signal-row">
-              {#each selectedCandidate.signals as signal}<span>{signal}</span>{/each}
-            </div>
-            {#if selectedCandidate.customerNeed}
-              <p><strong>客户需求</strong>{selectedCandidate.customerNeed}</p>
-            {/if}
-            {#if selectedCandidate.keySentence}
-              <p class="key-sentence-detail"><strong>保留原话</strong>“{selectedCandidate.keySentence}”</p>
-            {:else if selectedCandidate.hook}
-              <blockquote>“{selectedCandidate.hook}”</blockquote>
-            {/if}
-            <p><strong>为什么选中</strong>{selectedCandidate.whySelected || selectedCandidate.reason || "系统正在整理"}</p>
-            {#if selectedCandidate.evidenceItems.length}
-              <div class="evidence-list">
-                <strong>真实证据</strong>
-                {#each selectedCandidate.evidenceItems as item}
-                  <p><time>{item.time}</time><span>{item.quote}</span></p>
-                {/each}
+          </section>
+          <details class="sentence-context-details">
+            <summary>片段线索（次要）</summary>
+            <div class="evidence-card compact">
+              <div class="signal-row">
+                {#each selectedCandidate.signals as signal}<span>{signal}</span>{/each}
               </div>
-            {:else}
-              <p><strong>真实证据</strong>{selectedCandidate.evidence || "系统正在整理"}</p>
-            {/if}
-            <p class="chain-summary"><strong>这段对话走到哪一步</strong>{selectedCandidate.chainStages.join(" → ") || "系统还没有确认完整过程"}</p>
-            <p class="chain-summary"><strong>系统判断</strong>{candidateStatusDetail(selectedCandidate)}</p>
-            <p class="verify-line"><strong>使用前请确认</strong>{selectedCandidate.verify || "暂时没有需要补充确认的内容"}</p>
-          </div>
-          {#if isStructuredDiscoveryCandidate(selectedCandidate)}
+              {#if selectedCandidate.customerNeed}
+                <p><strong>客户需求</strong>{selectedCandidate.customerNeed}</p>
+              {/if}
+              <p><strong>为什么选中</strong>{selectedCandidate.whySelected || selectedCandidate.reason || "系统正在整理"}</p>
+              <p class="chain-summary"><strong>系统判断</strong>{candidateStatusDetail(selectedCandidate)}</p>
+              <p class="verify-line"><strong>使用前请确认</strong>{selectedCandidate.verify || "暂时没有需要补充确认的内容"}</p>
+            </div>
+          </details>
+          {#if selectedReview}
+            <details class="sentence-context-details">
+              <summary>旧版复盘结论（次要）</summary>
+              <div class="evidence-card compact">
+                <p><strong>结论</strong>{selectedReview.beginner.verdict}：{selectedReview.beginner.summary}</p>
+                {#if selectedReview.beginner.improvements.length}
+                  <p><strong>下次怎么改</strong>{selectedReview.beginner.improvements.join("；")}</p>
+                {/if}
+              </div>
+            </details>
+          {/if}
+          {#if isStructuredDiscoveryCandidate(selectedCandidate) && selectedCandidateSentences.length && masterComparison && !masterComparisonError}
             {#if (auditBundle?.pendingCriticalCount || 0) > 0}
               <div class="review-gate-note">
                 逐字稿关键项待确认，当前评分仅供参考，不可进入候选辅稿或母稿。
@@ -4339,19 +5318,14 @@
               bind:selectedSectionId={selectedMasterSectionId}
               result={masterComparison}
               loading={masterComparisonLoading}
-              error={masterComparisonError}
+              error=""
               matchStatus={masterMatchStatus}
               on:upgrade-retried={handleUpgradeReviewRetried}
             />
-          {:else}
-            <section class="candidate-disposition">
-              <strong>这段怎么处理</strong>
-              <p>{candidateDisposition(selectedCandidate)}</p>
-            </section>
           {/if}
           <section class="session-review-card">
             <div>
-              <strong>整场母稿复盘</strong>
+              <strong>本场候选对照母稿</strong>
               <p>
                 完整链路已复盘 {sessionReviewSummary.reviewedCount}/{sessionReviewSummary.totalCandidates} 段 · 平均分 {sessionReviewSummary.averageScore ?? "-"} ·
                 可复用分 85 分及以上 {sessionReviewSummary.highScoreCount} 段 · 待复盘 {sessionReviewSummary.pendingCount} 段 ·
@@ -4365,91 +5339,9 @@
               disabled={!masterBaseline || !reusableCandidates.length}
               on:click={isSessionReviewing ? cancelFullSessionReview : runFullSessionReview}
             >
-              {isSessionReviewing ? `取消整场复盘 ${sessionReviewCompleted}/${reusableCandidates.length}` : "开始整场复盘"}
+              {isSessionReviewing ? `取消本场对照复盘 ${sessionReviewCompleted}/${reusableCandidates.length}` : "开始本场对照复盘"}
             </button>
           </section>
-        {/if}
-
-        {#if selectedReview || (reviewingId && reviewingId === selectedCandidateId)}
-          <div class="review-tabs" role="tablist" aria-label="复盘内容">
-            <button class:active={reviewTab === "analysis"} on:click={() => reviewTab = "analysis"}><BarChart3 size={14} />一眼结论</button>
-            <button class:active={reviewTab === "script"} on:click={() => reviewTab = "script"}><MessageSquareText size={14} />话术发展建议</button>
-            <button class:active={reviewTab === "training"} on:click={() => reviewTab = "training"}><ListChecks size={14} />练习方向</button>
-          </div>
-          {#if reviewingId && reviewingId === selectedCandidateId}
-            <div class="review-loading-banner">
-              <Loader2 size={18} class="is-spinning" />
-              <span>{selectedReview ? "正在更新当前复盘，下面仍可查看上次保存结果。" : "复盘官正在生成分析、话术发展建议和练习方向…"}</span>
-              <button on:click={() => cancelCurrentReview()}>取消当前复盘</button>
-            </div>
-          {/if}
-          {#if selectedReview && reviewTab === "analysis"}
-            <article class="beginner-verdict" class:keep={selectedReview.beginner.verdict === "建议保留"}>
-              <span>这段要不要留？</span>
-              <h2>{selectedReview.beginner.verdict}</h2>
-              <p>{selectedReview.beginner.summary}</p>
-            </article>
-            <section class="beginner-section good">
-              <h3><Check size={16} />做对了什么</h3>
-              <ul>{#each selectedReview.beginner.goodPoints as item}<li>{item}</li>{/each}</ul>
-            </section>
-            <section class="beginner-section improve">
-              <h3><RefreshCw size={16} />下次怎么改</h3>
-              <ul>{#each selectedReview.beginner.improvements as item}<li>{item}</li>{/each}</ul>
-            </section>
-            <section class="beginner-section check">
-              <h3><FileSearch size={16} />还要确认什么</h3>
-              <ul>{#each selectedReview.beginner.checks as item}<li>{item}</li>{/each}</ul>
-            </section>
-            <details class="professional-details">
-              <summary>查看专业分析</summary>
-              <pre>{selectedReview.review}</pre>
-            </details>
-          {:else if selectedReview && reviewTab === "script"}
-            <article class="result-card accent">
-              <h2>话术发展建议（不可直接照念，须培训负责人审定）</h2>
-              <pre>{selectedReview.spokenScript}</pre>
-            </article>
-          {:else if selectedReview}
-            <article class="result-card training">
-              <h2>培训讨论点 / 练习方向</h2>
-              <pre>{selectedReview.trainingChecklist}</pre>
-            </article>
-          {/if}
-          {#if selectedReview}
-            <button
-              class="rerun-button"
-              disabled={Boolean(reviewingId) || !candidateReviewGateState.allowed}
-              title={candidateReviewGateState.message || "重新复盘当前片段"}
-              on:click={() => reviewSelectedCandidate(true)}
-            >
-              <RefreshCw size={14} />重新复盘当前片段
-            </button>
-          {/if}
-          {#if !candidateReviewGateState.allowed}
-            <div class="review-gate-note">{candidateReviewGateState.message}</div>
-          {/if}
-          {#if selectedReview}
-            <div class="saved-hint">已自动保存 · {new Date(selectedReview.updatedAt).toLocaleString("zh-CN")}</div>
-          {/if}
-        {:else if selectedCandidate}
-          <div class="empty-state large">
-            {#if isSessionReviewing}
-              <Loader2 size={30} class="is-spinning" />
-              <span>
-                {sessionReviewTargetId === selectedCandidate.id
-                  ? "整场复盘正在处理当前片段…"
-                  : `当前片段正在排队，整场复盘已完成 ${sessionReviewCompleted}/${reusableCandidates.length} 段`}
-              </span>
-            {:else if candidateReviewGateState.allowed}
-              <FileSearch size={30} />
-              <span>当前片段尚未复盘</span>
-              <button class="primary-button" on:click={() => reviewSelectedCandidate(true)}>开始复盘</button>
-            {:else}
-              <FileSearch size={30} />
-              <span>{candidateReviewGateState.message}</span>
-            {/if}
-          </div>
         {:else}
           <div class="empty-state large">
             {#if isDiscovering}
@@ -4652,10 +5544,11 @@
   .copy-actions { gap: 5px; }
   .copy-actions button { display: inline-flex; align-items: center; gap: 4px; padding: 6px 8px; color: #3a3a3c; font-size: 10px; }
   .review-content { padding: 10px; }
-  .session-diagnosis { flex: 0 0 auto; margin: 8px 10px 0; border: 1px solid #cfe1f7; border-radius: 8px; background: #f7fbff; overflow: hidden; }
-  .session-diagnosis summary { display: grid; gap: 3px; padding: 9px 11px; cursor: pointer; }
+  .session-diagnosis { flex: 0 1 auto; margin: 8px 10px 0; border: 1px solid #cfe1f7; border-radius: 8px; background: #f7fbff; overflow: hidden; max-height: min(32vh, 280px); display: flex; flex-direction: column; min-height: 0; }
+  .session-diagnosis summary { flex: 0 0 auto; display: grid; gap: 3px; padding: 9px 11px; cursor: pointer; }
   .session-diagnosis summary span { color: #175cd3; font-size: 10px; font-weight: 700; }
   .session-diagnosis summary strong { color: #24364b; font-size: 12px; line-height: 1.4; }
+  .session-diagnosis .diagnosis-scroll { min-height: 0; overflow: auto; }
   .diagnosis-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 8px; }
   .diagnosis-actions button { display: inline-flex; align-items: center; gap: 4px; min-height: 28px; padding: 0 8px; border: 1px solid #b8d9ff; border-radius: 6px; background: white; color: #175cd3; font-size: 9px; cursor: pointer; }
   .diagnosis-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; padding: 0 10px 10px; }
@@ -4677,6 +5570,7 @@
   .highlight-score strong { color: #087c42; font-size: 19px; line-height: 1; font-variant-numeric: tabular-nums; }
   .highlight-score span { margin-top: 3px; color: #8e8e93; font-size: 8px; }
   .evidence-card { margin-bottom: 9px; padding: 10px 11px; border: 1px solid rgba(0,0,0,.055); border-radius: 8px; background: #fafbfc; }
+  .evidence-card.compact { margin-top: 6px; margin-bottom: 0; }
   .evidence-card .signal-row { margin-top: 0; }
   .evidence-card blockquote { margin: 9px 0; padding-left: 9px; border-left: 2px solid #1687f8; color: #24364b; font-size: 11px; line-height: 1.5; }
   .evidence-card p { display: grid; grid-template-columns: 52px minmax(0,1fr); gap: 6px; margin: 7px 0 0; color: #5b6577; font-size: 10px; line-height: 1.5; }
@@ -4684,6 +5578,31 @@
   .evidence-card .chain-summary { color: #17663a; }
   .evidence-card .verify-line { color: #8a4b20; }
   .evidence-card .key-sentence-detail { padding: 8px; border-left: 2px solid #1687f8; background: #f3f8ff; color: #24364b; }
+  .ai-script-analysis-pane { margin-bottom: 10px; border: 1px solid #e4e7ec; border-radius: 12px; background: #fff; overflow: hidden; }
+  .ai-script-analysis-pane > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 42px; padding: 8px 11px; border-bottom: 1px solid #eef2f6; }
+  .ai-script-analysis-pane > header strong { color: #101828; font-size: 13px; }
+  .ai-script-analysis-pane > header button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid #2e90fa; border-radius: 7px; background: #eff8ff; color: #175cd3; font-size: 11px; cursor: pointer; }
+  .ai-script-analysis-pane > header button:disabled { opacity: .5; cursor: not-allowed; }
+  .ai-script-analysis-body { display: flex; flex-direction: column; gap: 9px; padding: 9px; max-height: min(48vh, 520px); overflow: auto; }
+  .ai-script-loading { min-height: 96px; display: grid; place-content: center; justify-items: center; gap: 8px; color: #667085; font-size: 12px; text-align: center; }
+  .ai-script-error { padding: 9px 10px; border: 1px solid #fecdca; border-radius: 8px; background: #fef3f2; color: #b42318; font-size: 12px; line-height: 1.5; }
+  .ai-script-summary { padding: 10px; border: 1px solid #b2ddff; border-radius: 9px; background: #eff8ff; }
+  .ai-script-summary strong { color: #175cd3; font-size: 12px; }
+  .ai-script-summary p { margin: 5px 0 0; white-space: pre-wrap; color: #344054; font-size: 12px; line-height: 1.6; }
+  .ai-script-issue-list { display: grid; gap: 8px; }
+  .ai-script-issue-list button { display: grid; gap: 5px; padding: 10px; border: 1px solid #e4e7ec; border-radius: 9px; background: #fff; text-align: left; cursor: pointer; }
+  .ai-script-issue-list button:hover, .ai-script-issue-list button.selected { border-color: #84caff; background: #f5fbff; }
+  .ai-script-issue-list .issue-label { color: #b54708; font-size: 10px; font-weight: 600; }
+  .ai-script-issue-list strong { color: #101828; font-size: 12px; line-height: 1.45; }
+  .ai-script-issue-list p, .ai-script-issue-list em { margin: 0; font-size: 11px; line-height: 1.55; }
+  .ai-script-issue-list p { color: #667085; }
+  .ai-script-issue-list em { color: #027a48; font-style: normal; }
+  .ai-script-no-issues { padding: 18px; color: #667085; font-size: 12px; text-align: center; }
+  .sentence-context-details { margin: 0 0 10px; border-radius: 8px; border: 1px solid rgba(0,0,0,.055); background: #fafbfc; }
+  .sentence-context-details > summary { cursor: pointer; padding: 8px 10px; font-size: 11px; color: #5b6577; list-style: none; }
+  .sentence-context-details > summary::-webkit-details-marker { display: none; }
+  .sentence-context-details[open] > summary { border-bottom: 1px solid rgba(0,0,0,.05); }
+  .sentence-context-details .evidence-card { border: 0; border-radius: 0 0 8px 8px; }
   .evidence-list { margin-top: 9px; color: #5b6577; font-size: 10px; }
   .evidence-list > strong { color: #344054; }
   .evidence-list p { grid-template-columns: 52px minmax(0, 1fr); margin-top: 5px; }
@@ -4752,6 +5671,12 @@
   :global(.dark) .highlight-filters, :global(.dark) .review-tabs, :global(.dark) .workspace-tabs { background: #24262a; }
   :global(.dark) .highlight-filters button.active, :global(.dark) .review-tabs button.active, :global(.dark) .workspace-tabs button.active, :global(.dark) .rerun-button { color: #f5f5f7; background: #3a3d43; }
   :global(.dark) .evidence-card { border-color: #494d55; background: #303238; }
+  :global(.dark) .ai-script-analysis-pane { border-color: #494d55; background: #303238; }
+  :global(.dark) .ai-script-analysis-pane > header { border-bottom-color: #494d55; }
+  :global(.dark) .ai-script-analysis-pane > header strong { color: #f3f4f6; }
+  :global(.dark) .ai-script-issue-list button { border-color: #494d55; background: #26272b; }
+  :global(.dark) .ai-script-issue-list strong { color: #f3f4f6; }
+  :global(.dark) .sentence-context-details { border-color: #494d55; background: #303238; }
   :global(.dark) .beginner-verdict, :global(.dark) .beginner-section { border-color: #494d55; background: #303238; }
   :global(.dark) .beginner-verdict p, :global(.dark) .beginner-section li, :global(.dark) .professional-details pre { color: #d0d5dd; }
   :global(.dark) .result-card { background: #303238; border-color: #494d55; }

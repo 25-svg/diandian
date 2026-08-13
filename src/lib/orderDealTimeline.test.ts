@@ -49,15 +49,26 @@ const peak = buildPeakDealMinuteLabel(buckets);
 assert.match(peak || "", /2分 成交 2 单/);
 
 const waves = buildDealWaves([
-  { offsetSec: 100, payAmountFen: 10000, productName: "索尼 A7M4" },
-  { offsetSec: 150, payAmountFen: 20000, productName: "索尼 A7M4" },
-  { offsetSec: 500, payAmountFen: 30000, productName: "索尼 A7M4" },
-  { offsetSec: 1300, payAmountFen: 40000, productName: "佳能 R5" },
+  { offsetSec: 100, payAmountFen: 10000, productName: "索尼 A7M4", buyerLabel: "张*" },
+  { offsetSec: 150, payAmountFen: 20000, productName: "索尼 A7M4", buyerLabel: "李*" },
+  { offsetSec: 500, payAmountFen: 30000, productName: "索尼 A7M4", buyerLabel: "张*" },
+  { offsetSec: 1300, payAmountFen: 40000, productName: "佳能 R5", buyerLabel: "王*" },
 ]);
 assert.equal(waves.length, 2);
 assert.equal(waves[0]?.eventCount, 3);
 assert.equal(waves[0]?.totalPayAmountFen, 60000);
+assert.equal(waves[0]?.buyerLabel, "张* 等 2 人");
 assert.equal(waves[1]?.productName, "佳能 R5");
+assert.equal(waves[1]?.buyerLabel, "王*");
+
+const parsedBuyer = parsePaymentEventsPayload({
+  events: [
+    { offset_sec: 10, pay_amount_fen: 100, product_name: "A", buyer_label: "赵*" },
+    { offsetSec: 20, payAmountFen: 200, productName: "B", maskPostReceiver: "钱*" },
+  ],
+});
+assert.equal(parsedBuyer?.events[0]?.buyerLabel, "赵*");
+assert.equal(parsedBuyer?.events[1]?.buyerLabel, "钱*");
 
 const empty = analyzeSegmentDealSignals([], 10, 20);
 assert.match(empty.label, /段内 0 单/);

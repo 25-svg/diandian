@@ -357,6 +357,8 @@ export async function clipRange(eventId: string, params: ClipRangeParams) {
 export interface DanmuEntry {
   ts: number;
   content: string;
+  user_id?: string | null;
+  user_name?: string | null;
 }
 
 export interface RecorderList {

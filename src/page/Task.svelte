@@ -13,8 +13,10 @@
     X,
   } from "lucide-svelte";
   import type { RecordItem, TaskRow } from "../lib/db";
-  import type { VideoItem } from "../lib/interface";
+  import { isClipVideo, type VideoItem } from "../lib/interface";
+  import { buildExistingClipReviewRequest } from "../lib/clipReview";
   import {
+    analysisModeForVideo,
     isMissingArchiveError,
     taskNavigationTarget,
   } from "../lib/taskNavigation";
@@ -158,6 +160,10 @@
     switch (task_type.toLowerCase()) {
       case "clip_range":
         return "切片生成";
+      case "deal_auto_clip_batch":
+        return "成交自动切片";
+      case "generate_video_gap_fill_subtitle":
+        return "非成交段补转";
       case "upload_procedure":
         return "切片投稿";
       case "generate_video_subtitle":
@@ -168,6 +174,8 @@
         return "压制字幕";
       case "generate_whole_clip":
         return "生成完整录播";
+      case "prepare_video_playback":
+        return "准备播放";
       default:
         return task_type;
     }
@@ -199,6 +207,28 @@
     expandedTasks = expandedTasks; // 触发响应式更新
   }
 
+  /** Parse "12/64" style counters from task messages for a simple progress bar. */
+  function taskProgress(message: string | null | undefined): {
+    current: number;
+    total: number;
+    percent: number;
+  } | null {
+    const text = (message || "").trim();
+    if (!text) return null;
+    const match = text.match(/(\d+)\s*\/\s*(\d+)/);
+    if (!match) return null;
+    const current = Number(match[1]);
+    const total = Number(match[2]);
+    if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 0) {
+      return null;
+    }
+    return {
+      current: Math.min(current, total),
+      total,
+      percent: Math.min(100, Math.max(0, (current / total) * 100)),
+    };
+  }
+
   async function openTask(task: TaskRow): Promise<void> {
     const target = taskNavigationTarget(task);
     if (!target) return;
@@ -208,6 +238,12 @@
           roomId: target.roomId,
           liveId: target.liveId,
         });
+        if (archive.archive_kind === "company") {
+          window.dispatchEvent(
+            new CustomEvent("bsr:open-company-deal-review", { detail: archive }),
+          );
+          return;
+        }
         window.dispatchEvent(
           new CustomEvent("bsr:open-archive-analysis", { detail: archive }),
         );
@@ -216,8 +252,24 @@
       const video = await invoke<VideoItem>("get_video", {
         id: target.videoId,
       });
+      // Clip MP4s belong in the three-column deal-clip review, not the full-session analysis page.
+      if (isClipVideo(video)) {
+        window.dispatchEvent(
+          new CustomEvent("bsr:open-clip-review", {
+            detail: buildExistingClipReviewRequest(video, ""),
+          }),
+        );
+        return;
+      }
+      const analysisMode = analysisModeForVideo(video, target.preferredMode);
       window.dispatchEvent(
-        new CustomEvent("bsr:open-video-analysis", { detail: video }),
+        new CustomEvent("bsr:open-video-analysis", {
+          detail: {
+            video,
+            analysisMode,
+            focusTab: task.task_type === "deal_auto_clip_batch" ? "clip_review" : "",
+          },
+        }),
       );
     } catch (error) {
       console.error("打开任务来源失败:", error);
@@ -301,7 +353,7 @@
                       <button
                         type="button"
                         class="flex items-center gap-1 text-sm font-medium text-blue-700 hover:underline dark:text-blue-300"
-                        title="进入对应片段分析页面"
+                        title="进入对应页面（切片复盘 / 整场分析）"
                         on:click={() => openTask(task)}
                       >
                         <span>{get_task_type_name(task.task_type)}</span>
@@ -335,8 +387,26 @@
                 </div>
 
                 {#if task.message}
-                  <div class="text-xs text-gray-400 dark:text-gray-500 my-2">
-                    {task.message}
+                  {@const progress = taskProgress(task.message)}
+                  <div class="my-2 space-y-1.5">
+                    <div class="text-xs text-gray-400 dark:text-gray-500">
+                      {task.message}
+                    </div>
+                    {#if progress && ["pending", "processing", "running"].includes(task.status.toLowerCase())}
+                      <div
+                        class="h-1.5 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"
+                        role="progressbar"
+                        aria-valuenow={progress.current}
+                        aria-valuemin={0}
+                        aria-valuemax={progress.total}
+                        aria-label={`进度 ${progress.current}/${progress.total}`}
+                      >
+                        <div
+                          class="h-full rounded-full bg-sky-500 transition-[width] duration-300 ease-out"
+                          style={`width:${progress.percent}%`}
+                        ></div>
+                      </div>
+                    {/if}
                   </div>
                 {/if}
 
@@ -381,7 +451,7 @@
                   <button
                     type="button"
                     class="mac-btn"
-                    title="进入对应片段分析页面"
+                    title="进入对应页面（切片复盘 / 整场分析）"
                     on:click={() => openTask(task)}
                   >
                     <ExternalLink class="h-4 w-4" />

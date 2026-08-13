@@ -99,6 +99,8 @@ impl EventEmitter {
                             DanmuEntry {
                                 ts: *ts,
                                 content: content.clone(),
+                                user_id: None,
+                                user_name: None,
                             },
                         )
                         .map_err(|error| error.to_string())?;

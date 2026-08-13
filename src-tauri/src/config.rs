@@ -35,15 +35,34 @@ pub struct DoudianOrderConfig {
     pub shop_id: String,
 }
 
+/// Prefer Windows known Desktop (may be relocated, e.g. D:\\Desktop), then %USERPROFILE%\\Desktop.
+pub fn doudian_desktop_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(user_dirs) = platform_dirs::UserDirs::new() {
+        dirs.push(user_dirs.desktop_dir);
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        let legacy = PathBuf::from(userprofile).join("Desktop");
+        if !dirs.iter().any(|dir| dir == &legacy) {
+            dirs.push(legacy);
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(PathBuf::from("C:\\Users\\Public").join("Desktop"));
+    }
+    dirs
+}
+
 impl Default for DoudianOrderConfig {
     fn default() -> Self {
-        let desktop = std::env::var("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("C:\\Users\\Public"))
-            .join("Desktop");
+        let desktop = doudian_desktop_dirs()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| PathBuf::from("C:\\Users\\Public").join("Desktop"));
+        let data_api = desktop.join("数据接口");
         Self {
-            env_file: desktop.join(".env").to_string_lossy().to_string(),
-            token_file: desktop
+            env_file: data_api.join(".env").to_string_lossy().to_string(),
+            token_file: data_api
                 .join("doudian_token.env")
                 .to_string_lossy()
                 .to_string(),

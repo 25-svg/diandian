@@ -3,6 +3,7 @@
   import { Loader2 } from "lucide-svelte";
   import {
     dashboardVisualGroups,
+    dashboardCandidateLabel,
     formatDashboardSessionTime,
     type LiveDataBoardCandidate,
     type LiveDataBoardOrderSummary,
@@ -88,8 +89,7 @@
           <option value="">选择正确场次</option>
           {#each candidates as candidate (candidate.session.id)}
             <option value={String(candidate.session.id)}>
-              {formatDashboardSessionTime(candidate.session.startedAt)}
-              · {candidate.session.shopName || candidate.session.accountKey}
+              {dashboardCandidateLabel(candidate)}
             </option>
           {/each}
         </select>

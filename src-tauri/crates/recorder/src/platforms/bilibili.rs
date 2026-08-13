@@ -274,7 +274,16 @@ impl BiliRecorder {
                                         content: danmu.message.clone(),
                                     });
                                     if let Some(storage) = self.danmu_storage.write().await.as_ref() {
-                                        storage.add_line(ts, &danmu.message).await;
+                                        let user_id = (danmu.user_id != 0)
+                                            .then(|| danmu.user_id.to_string());
+                                        storage
+                                            .add_line(
+                                                ts,
+                                                &danmu.message,
+                                                user_id.as_deref(),
+                                                Some(danmu.user_name.as_str()),
+                                            )
+                                            .await;
                                     }
                                 }
                             }

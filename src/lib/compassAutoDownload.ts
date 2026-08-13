@@ -34,6 +34,41 @@ export type CompassProgress = {
   message?: string;
 };
 
+export function inferCompassShopFromTexts(values: readonly (string | null | undefined)[]): string {
+  const identity = values.filter(Boolean).join(" ");
+  if (identity.includes("科创")) return "金典拍拍科创专卖店";
+  return "金典拍拍相机专卖店";
+}
+
+export function inferCompassDateFromVideo(options: {
+  createdAt?: string | null;
+  texts?: readonly (string | null | undefined)[];
+}): string | null {
+  const texts = options.texts ?? [];
+  for (const value of texts) {
+    if (!value) continue;
+    const separated = value.match(/(20\d{2})[-_/年.](\d{1,2})[-_/月.](\d{1,2})/);
+    if (separated) {
+      try {
+        return normalizeCompassDate(`${separated[1]}-${separated[2]}-${separated[3]}`);
+      } catch {
+        continue;
+      }
+    }
+    const compact = value.match(/(20\d{2})(\d{2})(\d{2})/);
+    if (compact) {
+      try {
+        return normalizeCompassDate(`${compact[1]}-${compact[2]}-${compact[3]}`);
+      } catch {
+        continue;
+      }
+    }
+  }
+  const clock = options.createdAt?.trim();
+  if (clock && /^\d{4}-\d{2}-\d{2}/.test(clock)) return clock.slice(0, 10);
+  return null;
+}
+
 export function canStartCompassDownload(running: boolean): boolean {
   return !running;
 }

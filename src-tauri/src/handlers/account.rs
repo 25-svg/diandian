@@ -239,6 +239,10 @@ pub async fn remove_account(
     }
     match state.db.remove_account(&platform, &uid).await {
         Ok(result) => {
+            #[cfg(feature = "gui")]
+            if platform == "douyin" {
+                reset_douyin_login_webview(&state.app_handle);
+            }
             audit_tool_success(&audit);
             Ok(result)
         }
@@ -274,46 +278,193 @@ pub async fn get_qr(_state: state_type!()) -> Result<QrInfo, ()> {
 }
 
 #[cfg(feature = "gui")]
+const DOUYIN_LOGIN_LABEL: &str = "douyin-login";
+
+#[cfg(feature = "gui")]
+const DOUYIN_LOGIN_URL: &str = "https://www.douyin.com/";
+
+#[cfg(feature = "gui")]
+fn douyin_login_init_script() -> &'static str {
+    // Keep WebView2's native UA. Spoofing Chrome UA often triggers Douyin 403.
+    // On 403 / access-denied pages, soft-reload a few times. Then try opening login.
+    r#"
+        (() => {
+          if (window.__bsrDouyinLoginHooked) return;
+          window.__bsrDouyinLoginHooked = true;
+
+          const looksForbidden = () => {
+            const text = (document.body && document.body.innerText) || '';
+            const title = document.title || '';
+            return (
+              text.includes('拒绝访问') ||
+              text.includes('HTTP ERROR 403') ||
+              text.includes('403 Forbidden') ||
+              title.includes('403') ||
+              title.includes('拒绝访问')
+            );
+          };
+
+          if (looksForbidden()) {
+            const n = Number(sessionStorage.getItem('bsr_dy_403_retry') || '0');
+            if (n < 3) {
+              sessionStorage.setItem('bsr_dy_403_retry', String(n + 1));
+              setTimeout(() => { window.location.replace('https://www.douyin.com/'); }, 800 + n * 700);
+            }
+            return;
+          }
+          sessionStorage.removeItem('bsr_dy_403_retry');
+
+          const originalOpen = window.open;
+          window.open = function (url, name, features) {
+            try {
+              const href = typeof url === 'string' ? url : (url && url.href) || '';
+              if (href && /douyin|passport|sso|login/i.test(href)) {
+                window.location.href = href;
+                return null;
+              }
+            } catch (_) {}
+            return originalOpen ? originalOpen.call(window, url, name, features) : null;
+          };
+
+          const loginPanelVisible = () => {
+            if (document.querySelector('#animate_qrcode_container, [class*="qrcode"], [class*="login-panel"], [class*="web-login"]')) {
+              return true;
+            }
+            const texts = Array.from(document.querySelectorAll('div, span, p, li, button'));
+            return texts.some((node) => {
+              const text = (node.textContent || '').trim();
+              return text === '扫码登录' || text === '二维码登录' || text === '验证码登录';
+            });
+          };
+
+          const clickLogin = () => {
+            if (loginPanelVisible()) return true;
+            const byE2e = document.querySelector('[data-e2e="login-button"]');
+            if (byE2e) {
+              byE2e.click();
+              return loginPanelVisible();
+            }
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'));
+            const headerLogin = nodes.find((node) => {
+              const text = (node.textContent || '').trim();
+              if (text !== '登录') return false;
+              if (!node.offsetParent) return false;
+              const rect = node.getBoundingClientRect();
+              return rect.top >= 0 && rect.top < 96 && rect.right > window.innerWidth - 260;
+            });
+            const fallback = nodes.find((node) => {
+              const text = (node.textContent || '').trim();
+              return text === '登录' && node.offsetParent !== null;
+            });
+            const label = headerLogin || fallback;
+            if (!label) return false;
+            const target = label.closest('button, [role="button"], a') || label;
+            try { target.click(); } catch (_) {}
+            return loginPanelVisible();
+          };
+
+          let tries = 0;
+          const timer = setInterval(() => {
+            tries += 1;
+            if (clickLogin() || tries >= 40) {
+              clearInterval(timer);
+            }
+          }, 500);
+        })();
+        "#
+}
+
+/// Destroy the login window if present. Label release can lag slightly on Windows.
+#[cfg(feature = "gui")]
+fn destroy_douyin_login_webview(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window(DOUYIN_LOGIN_LABEL) else {
+        return;
+    };
+    if let Err(error) = window.destroy() {
+        log::warn!("Failed to destroy douyin-login window: {error}");
+        let _ = window.close();
+    }
+}
+
+/// Clear session cookies without deleting the whole WebView2 profile.
+/// Full profile wipes make Douyin intermittently return HTTP 403.
+#[cfg(feature = "gui")]
+fn clear_douyin_login_session(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(DOUYIN_LOGIN_LABEL) {
+        if let Err(error) = window.clear_all_browsing_data() {
+            log::warn!("Failed to clear douyin-login browsing data: {error}");
+        }
+    }
+}
+
+/// Clear Douyin login WebView session for logout / close paths.
+#[cfg(feature = "gui")]
+fn reset_douyin_login_webview(app: &tauri::AppHandle) {
+    clear_douyin_login_session(app);
+    destroy_douyin_login_webview(app);
+}
+
+#[cfg(feature = "gui")]
+async fn wait_douyin_login_webview_gone(app: &tauri::AppHandle) -> bool {
+    for _ in 0..40 {
+        if app.get_webview_window(DOUYIN_LOGIN_LABEL).is_none() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    app.get_webview_window(DOUYIN_LOGIN_LABEL).is_none()
+}
+
+#[cfg(feature = "gui")]
 #[tauri::command]
 pub async fn open_douyin_login(state: state_type!()) -> Result<(), String> {
-    const LABEL: &str = "douyin-login";
+    let login_url: url::Url = DOUYIN_LOGIN_URL
+        .parse()
+        .map_err(|e| format!("Invalid Douyin login URL: {e}"))?;
 
-    if let Some(window) = state.app_handle.get_webview_window(LABEL) {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-        return Ok(());
+    // Close leftover login window, wait for label release. Keep profile dir to avoid 403.
+    clear_douyin_login_session(&state.app_handle);
+    destroy_douyin_login_webview(&state.app_handle);
+    let gone = wait_douyin_login_webview_gone(&state.app_handle).await;
+    if !gone {
+        if let Some(existing) = state.app_handle.get_webview_window(DOUYIN_LOGIN_LABEL) {
+            log::warn!("douyin-login label still present after destroy; reusing window");
+            existing
+                .navigate(login_url.clone())
+                .map_err(|e| format!("打开抖音登录页失败: {e}"))?;
+            existing.show().map_err(|e| e.to_string())?;
+            existing.set_focus().map_err(|e| e.to_string())?;
+            let app = state.app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                if let Some(window) = app.get_webview_window(DOUYIN_LOGIN_LABEL) {
+                    let _ = window.eval(douyin_login_init_script());
+                }
+            });
+            return Ok(());
+        }
     }
 
+    let data_dir = state
+        .app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法获取应用数据目录: {e}"))?
+        .join("douyin-login");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("无法创建抖音登录数据目录: {e}"))?;
+
+    // Use WebView2 default UA — custom Chrome UA mismatches TLS fingerprint and triggers 403.
     tauri::WebviewWindowBuilder::new(
         &state.app_handle,
-        LABEL,
-        tauri::WebviewUrl::External(
-            "https://www.douyin.com/"
-                .parse()
-                .map_err(|e| format!("Invalid Douyin login URL: {e}"))?,
-        ),
+        DOUYIN_LOGIN_LABEL,
+        tauri::WebviewUrl::External(login_url),
     )
     .title("抖音扫码登录")
     .inner_size(1100.0, 760.0)
     .center()
-    .initialization_script(
-        r#"
-        (() => {
-          const timer = setInterval(() => {
-            const nodes = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
-            const label = nodes.find((node) =>
-              node.textContent && node.textContent.trim() === '登录' && node.offsetParent !== null
-            );
-            const target = label && (label.closest('button, [role="button"]') || label);
-            if (target) {
-              target.click();
-              clearInterval(timer);
-            }
-          }, 400);
-          setTimeout(() => clearInterval(timer), 15000);
-        })();
-        "#,
-    )
+    .data_directory(data_dir)
+    .initialization_script(douyin_login_init_script())
     .build()
     .map_err(|e| format!("打开抖音登录窗口失败: {e}"))?;
 
@@ -323,7 +474,7 @@ pub async fn open_douyin_login(state: state_type!()) -> Result<(), String> {
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub async fn get_douyin_login_cookies(state: state_type!()) -> Result<Option<String>, String> {
-    let Some(window) = state.app_handle.get_webview_window("douyin-login") else {
+    let Some(window) = state.app_handle.get_webview_window(DOUYIN_LOGIN_LABEL) else {
         return Ok(None);
     };
 
@@ -360,9 +511,7 @@ pub async fn get_douyin_login_cookies(state: state_type!()) -> Result<Option<Str
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub async fn close_douyin_login(state: state_type!()) -> Result<(), String> {
-    if let Some(window) = state.app_handle.get_webview_window("douyin-login") {
-        window.close().map_err(|e| e.to_string())?;
-    }
+    reset_douyin_login_webview(&state.app_handle);
     Ok(())
 }
 

@@ -80,7 +80,7 @@ socketioxide = "0.17.2"
 scraper = "0.24.0"
 sentry = { version = "0.46.0", features = ["log", "logs"] }
 calamine = "0.26"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }
 webview2-com = { version = "0.38", optional = true }
 
 [features]

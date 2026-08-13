@@ -4,8 +4,13 @@ import {
   buildExistingClipReviewRequest,
   clipLocalTranscript,
   clipTranscriptToSrt,
+  clipReviewRequestStorageKey,
   parseClipTranscript,
   parseGeneratedDealClips,
+  parseSavedClipReviewRequest,
+  rebuildClipReviewRequest,
+  serializeClipReviewRequest,
+  mergeClipReviewRequest,
 } from "./clipReview.js";
 
 const metadata = JSON.stringify({
@@ -85,5 +90,44 @@ assert.equal(existingRequest.taskId, "existing-clip-88");
 assert.equal(existingRequest.items[0].sourceEndSec, 45);
 assert.equal(existingRequest.items[0].reason, "完整成交链路");
 assert.equal(existingRequest.items[0].transcriptEntries.length, 1);
+
+assert.equal(clipReviewRequestStorageKey("import:12"), "bsr:clip-review-request:v1:import:12");
+const savedRequest = serializeClipReviewRequest(request!);
+assert.equal(savedRequest.parentVideoId, 59);
+assert.equal(savedRequest.items[0]?.videoId, 88);
+const restored = rebuildClipReviewRequest({
+  taskId: savedRequest.taskId,
+  parentVideoId: savedRequest.parentVideoId,
+  items: savedRequest.items,
+  videos: request!.items.map((item) => item.video),
+  transcriptEntries: [{ id: 2, start: 40, end: 45, text: "介绍成色" }],
+});
+assert.equal(restored?.items[0]?.video.id, 88);
+assert.equal(parseSavedClipReviewRequest("not-json"), null);
+
+const merged = mergeClipReviewRequest(request, {
+  taskId: "task-1",
+  parentVideoId: 59,
+  items: [{
+    video: { ...request!.items[0]!.video, id: 89, title: "第二条" },
+    sourceStartSec: 10,
+    sourceEndSec: 30,
+    reason: "更早的链路",
+    transcriptEntries: [],
+  }],
+});
+assert.equal(merged.items.length, 2);
+assert.equal(merged.items[0]?.video.id, 89);
+assert.equal(merged.items[1]?.video.id, 88);
+
+const withoutRanges = buildClipReviewRequest({
+  taskId: "task-1",
+  parentVideoId: 59,
+  transcriptEntries: [{ id: 2, start: 40, end: 45, text: "介绍成色" }],
+  videos: request!.items.map((item) => item.video),
+  taskMetadata: metadata,
+});
+assert.equal(withoutRanges?.items[0]?.video.id, 88);
+assert.equal(withoutRanges?.items[0]?.sourceStartSec, 37);
 
 console.log("clipReview tests passed");

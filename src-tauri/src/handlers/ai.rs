@@ -17,6 +17,69 @@ pub struct MiniMaxMessage {
     pub content: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiniMaxSetupStatus {
+    pub configured: bool,
+    pub secure_storage: bool,
+}
+
+pub(crate) fn configured_minimax_api_key_from_config(
+    config: &crate::config::Config,
+) -> Result<String, String> {
+    let legacy_key = config.openai_api_key.trim().to_string();
+    match crate::security::load_minimax_api_key(&config.config_path) {
+        Ok(Some(api_key)) => Ok(api_key),
+        Ok(None) if !legacy_key.is_empty() => Ok(legacy_key),
+        Ok(None) => Err("MiniMax API Key 尚未配置，请先完成首次 AI 初始化。".to_string()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn configured_minimax_api_key(state: &State) -> Result<String, String> {
+    let config = state.config.read().await;
+    configured_minimax_api_key_from_config(&config)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_minimax_setup_status(state: state_type!()) -> Result<MiniMaxSetupStatus, String> {
+    let (config_path, legacy_configured) = {
+        let config = state.config.read().await;
+        (
+            config.config_path.clone(),
+            !config.openai_api_key.trim().is_empty(),
+        )
+    };
+    let secure_configured = crate::security::load_minimax_api_key(&config_path)?.is_some();
+    Ok(MiniMaxSetupStatus {
+        configured: secure_configured || legacy_configured,
+        secure_storage: secure_configured,
+    })
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn initialize_minimax_api_key(
+    state: state_type!(),
+    api_key: String,
+) -> Result<(), String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.len() < 12 {
+        return Err("MiniMax API Key 格式无效，请粘贴完整密钥。".to_string());
+    }
+    let response = request_minimax_text(
+        &api_key,
+        "这是连接测试。",
+        vec![json!({"role": "user", "content": "只回复：连接成功"})],
+        16,
+    )
+    .await?;
+    if response.trim().is_empty() {
+        return Err("MiniMax 连接成功但返回为空，请重试。".to_string());
+    }
+    let config_path = state.config.read().await.config_path.clone();
+    crate::security::store_minimax_api_key(&config_path, &api_key)
+}
+
 #[derive(Debug, Deserialize)]
 struct ProposedCorrection {
     #[serde(rename = "原文")]
@@ -43,10 +106,7 @@ pub async fn minimax_chat(
     system_prompt: String,
     messages: Vec<MiniMaxMessage>,
 ) -> Result<String, String> {
-    let api_key = state.config.read().await.openai_api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("MiniMax API Key 尚未配置，请由管理员完成一次初始化。".to_string());
-    }
+    let api_key = configured_minimax_api_key(&state).await?;
 
     let messages: Vec<Value> = messages
         .into_iter()

@@ -18,6 +18,9 @@ pub struct RawPaymentEvent {
     pub product_id: String,
     pub order_id: String,
     pub order_status: String,
+    /// Masked receiver name from Douyin export (e.g. "张*"). Safe for streamer review.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub buyer_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -175,6 +178,8 @@ fn import_raw_order_timeline_value(
             if !order_id.is_empty() {
                 candidate.parent_order_ids.insert(order_id.clone());
             }
+            let buyer_label = text(order.get("mask_post_receiver"))
+                .or_else_non_empty(|| text(order.get("user_nick_name")));
             candidate.events.push(RawPaymentEvent {
                 offset_sec: sku_pay_time - started_at.timestamp(),
                 pay_amount_fen,
@@ -182,6 +187,7 @@ fn import_raw_order_timeline_value(
                 product_id,
                 order_id: event_order_id,
                 order_status: order_status.clone(),
+                buyer_label,
             });
         }
     }
@@ -377,6 +383,7 @@ mod tests {
                     "order_status_desc": "已发货",
                     "pay_tel": "13800000000",
                     "post_addr": {"detail": "private"},
+                    "mask_post_receiver": "张*",
                     "sku_order_list": [
                         {"room_id": "matched-room", "pay_time": 1785292658_i64, "pay_amount": 9_000_000, "product_id": "p1"},
                         {"room_id": "matched-room", "pay_time": 1785292718_i64, "pay_amount": 5_239_200, "product_id": "p2"},
@@ -411,9 +418,12 @@ mod tests {
         assert_eq!(result.summary.total_pay_amount_fen, 14_239_200);
         assert_eq!(result.summary.confidence, "shop_time_and_excel_products");
         assert_eq!(result.events[0].product_name, "索尼 A7M4");
+        assert_eq!(result.events[0].buyer_label, "张*");
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("13800000000"));
         assert!(!serialized.contains("private"));
+        assert!(serialized.contains("张*"));
+        assert!(serialized.contains("buyerLabel"));
     }
 
     #[test]

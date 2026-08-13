@@ -69,6 +69,29 @@ export function formatDashboardSessionTime(startedAt: string): string {
   });
 }
 
+export function formatDashboardSessionLength(startedAt: string, endedAt?: string | null): string {
+  if (!endedAt) return "";
+  const start = new Date(startedAt).getTime();
+  const end = new Date(endedAt).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return "";
+  const totalMin = Math.round((end - start) / 60000);
+  const hours = Math.floor(totalMin / 60);
+  const minutes = totalMin % 60;
+  return hours > 0 ? `${hours}小时${minutes}分` : `${minutes}分钟`;
+}
+
+export function dashboardCandidateLabel(candidate: {
+  session: { startedAt: string; endedAt?: string; shopName?: string; accountKey?: string; sourceFile?: string };
+}): string {
+  const session = candidate.session;
+  const length = formatDashboardSessionLength(session.startedAt, session.endedAt);
+  const shop = session.shopName || session.accountKey || "";
+  const file = session.sourceFile ? session.sourceFile.split(/[/\\]/).pop() : "";
+  return [formatDashboardSessionTime(session.startedAt), length, shop, file]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 export function formatArchiveDashboardIdentity(
   archive: ArchiveIdentitySource,
   binding?: LiveDashboardBindingSummary | null
@@ -205,6 +228,7 @@ export type LiveDataBoardSession = LiveDashboardMetrics & {
   accountKey: string;
   shopName: string;
   startedAt: string;
+  endedAt?: string;
   sourceFile: string;
 };
 

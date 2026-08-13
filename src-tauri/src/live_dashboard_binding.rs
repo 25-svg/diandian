@@ -5,6 +5,8 @@ use crate::database::live_dashboard::LiveDashboardSessionRow;
 
 pub const AUTO_MATCH_WINDOW_SECS: i64 = 15 * 60;
 pub const CANDIDATE_WINDOW_SECS: i64 = 2 * 60 * 60;
+pub const DURATION_AUTO_MATCH_SECS: i64 = 20 * 60;
+pub const DURATION_CANDIDATE_SECS: i64 = 45 * 60;
 const KNOWN_SHOPS: [&str; 2] = ["金典拍拍科创专卖店", "金典拍拍相机专卖店"];
 
 #[derive(Debug, Clone)]
@@ -13,6 +15,7 @@ pub struct RecordForLiveDashboardBinding {
     pub room_id: String,
     pub title: String,
     pub created_at: String,
+    pub length_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +172,7 @@ pub fn match_dashboard_sessions(
         };
     }
 
-    let candidates = candidate_sessions(record, sessions, AUTO_MATCH_WINDOW_SECS);
+    let mut candidates = candidate_sessions(record, sessions, AUTO_MATCH_WINDOW_SECS);
     let account_matches = candidates
         .iter()
         .filter(|candidate| candidate.account_match)
@@ -195,10 +198,196 @@ pub fn match_dashboard_sessions(
         };
     }
 
+    if let Some(automatic) = unique_duration_match(
+        parse_timestamp(&record.created_at),
+        record.length_secs,
+        &record.title,
+        &record.room_id,
+        sessions,
+    ) {
+        let mut ranked = rank_sessions_by_clock_and_duration(
+            parse_timestamp(&record.created_at),
+            record.length_secs,
+            &record.title,
+            &record.room_id,
+            sessions,
+        );
+        if ranked.is_empty() {
+            ranked = candidates;
+        }
+        return LiveDashboardMatchResult {
+            automatic: Some(automatic),
+            candidates: ranked,
+        };
+    }
+
+    if candidates.is_empty() {
+        candidates = rank_sessions_by_clock_and_duration(
+            parse_timestamp(&record.created_at),
+            record.length_secs,
+            &record.title,
+            &record.room_id,
+            sessions,
+        );
+    }
+
     LiveDashboardMatchResult {
         automatic: None,
         candidates,
     }
+}
+
+pub fn match_imported_video_by_duration(
+    title: &str,
+    file: &str,
+    note: &str,
+    created_at: &str,
+    length_secs: Option<i64>,
+    sessions: &[LiveDashboardSessionRow],
+) -> LiveDashboardMatchResult {
+    let identity = [title, file, note].join(" ");
+    let clock = infer_live_started_at_from_texts(&[title, file, note])
+        .as_deref()
+        .and_then(parse_timestamp)
+        .or_else(|| parse_timestamp(created_at));
+    if let Some(automatic) = unique_duration_match(clock, length_secs, &identity, "", sessions) {
+        return LiveDashboardMatchResult {
+            automatic: Some(automatic),
+            candidates: rank_sessions_by_clock_and_duration(
+                clock,
+                length_secs,
+                &identity,
+                "",
+                sessions,
+            ),
+        };
+    }
+    LiveDashboardMatchResult {
+        automatic: None,
+        candidates: rank_sessions_by_clock_and_duration(
+            clock,
+            length_secs,
+            &identity,
+            "",
+            sessions,
+        ),
+    }
+}
+
+fn session_span_secs(session: &LiveDashboardSessionRow) -> Option<i64> {
+    let start = parse_timestamp(&session.started_at)?;
+    let end = parse_timestamp(&session.ended_at)?;
+    let secs = (end - start).num_seconds();
+    (secs > 60).then_some(secs)
+}
+
+fn unique_duration_match(
+    clock: Option<DateTime<Utc>>,
+    length_secs: Option<i64>,
+    identity: &str,
+    room_id: &str,
+    sessions: &[LiveDashboardSessionRow],
+) -> Option<(LiveDashboardSessionRow, LiveDashboardMatchMethod)> {
+    let video_len = length_secs.filter(|value| *value >= 30 * 60)?;
+    let explicit_shop = infer_shop_name_from_texts(&[identity]);
+    let room_id = room_id.trim();
+    let mut hits = sessions
+        .iter()
+        .filter(|session| {
+            if explicit_shop.is_some_and(|shop| !session_matches_shop(session, shop)) {
+                return false;
+            }
+            session_span_secs(session)
+                .is_some_and(|span| (span - video_len).abs() <= DURATION_AUTO_MATCH_SECS)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(clock) = clock {
+        let same_day = hits
+            .iter()
+            .filter(|session| {
+                parse_timestamp(&session.started_at)
+                    .is_some_and(|started| started.date_naive() == clock.date_naive())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if same_day.len() == 1 {
+            let method = if !room_id.is_empty() && room_id == same_day[0].account_key.trim() {
+                LiveDashboardMatchMethod::AutoAccount
+            } else {
+                LiveDashboardMatchMethod::AutoShop
+            };
+            return Some((same_day[0].clone(), method));
+        }
+        if !same_day.is_empty() {
+            hits = same_day;
+        }
+    }
+    if hits.len() == 1 {
+        let method = if !room_id.is_empty() && room_id == hits[0].account_key.trim() {
+            LiveDashboardMatchMethod::AutoAccount
+        } else {
+            LiveDashboardMatchMethod::AutoShop
+        };
+        return Some((hits[0].clone(), method));
+    }
+    None
+}
+
+fn rank_sessions_by_clock_and_duration(
+    clock: Option<DateTime<Utc>>,
+    length_secs: Option<i64>,
+    identity: &str,
+    room_id: &str,
+    sessions: &[LiveDashboardSessionRow],
+) -> Vec<LiveDashboardMatchCandidate> {
+    let explicit_shop = infer_shop_name_from_texts(&[identity]);
+    let normalized_identity = normalize_match_text(identity);
+    let room_id = room_id.trim();
+    let video_len = length_secs.filter(|value| *value >= 30 * 60);
+    let mut candidates = sessions
+        .iter()
+        .filter_map(|session| {
+            if explicit_shop.is_some_and(|shop| !session_matches_shop(session, shop)) {
+                return None;
+            }
+            let started = parse_timestamp(&session.started_at)?;
+            let time_delta_seconds = clock
+                .map(|value| (started - value).num_seconds().abs())
+                .unwrap_or(i64::MAX / 4);
+            let duration_delta = video_len.and_then(|length| {
+                session_span_secs(session).map(|span| (span - length).abs())
+            });
+            let same_day = clock.is_some_and(|value| started.date_naive() == value.date_naive());
+            let duration_close =
+                duration_delta.is_some_and(|delta| delta <= DURATION_CANDIDATE_SECS);
+            if !same_day && !duration_close && time_delta_seconds > CANDIDATE_WINDOW_SECS {
+                return None;
+            }
+            let normalized_shop_name = normalize_match_text(&session.shop_name);
+            Some(LiveDashboardMatchCandidate {
+                session: session.clone(),
+                time_delta_seconds,
+                account_match: !room_id.is_empty() && room_id == session.account_key.trim(),
+                shop_name_match: explicit_shop.is_some()
+                    || (!normalized_shop_name.is_empty()
+                        && normalized_identity.contains(&normalized_shop_name)),
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_duration = video_len
+            .and_then(|length| session_span_secs(&left.session).map(|span| (span - length).abs()))
+            .unwrap_or(i64::MAX / 4);
+        let right_duration = video_len
+            .and_then(|length| session_span_secs(&right.session).map(|span| (span - length).abs()))
+            .unwrap_or(i64::MAX / 4);
+        left_duration
+            .cmp(&right_duration)
+            .then(left.time_delta_seconds.cmp(&right.time_delta_seconds))
+    });
+    candidates.truncate(12);
+    candidates
 }
 
 pub fn candidate_sessions(
@@ -296,6 +485,7 @@ mod tests {
             room_id: "20296833869".into(),
             title: "金典拍拍主做二手精品相机镜头，直播间领取最高400优惠！".into(),
             created_at: "2026-07-28T08:16:00".into(),
+            length_secs: None,
         };
 
         let result =
@@ -318,6 +508,7 @@ mod tests {
             room_id: "20296833869".into(),
             title: "金典拍拍相机专卖店".into(),
             created_at: "2026-07-28T08:16:00".into(),
+            length_secs: None,
         };
 
         let result = match_dashboard_sessions(
@@ -401,5 +592,48 @@ mod tests {
 
         assert!(result.automatic.is_none());
         assert_eq!(result.candidates.len(), 2);
+    }
+
+    #[test]
+    fn matches_old_video_to_excel_by_same_day_and_duration() {
+        let mut same_day = session(1, "20296833869", "2026-08-12T10:00:00");
+        same_day.ended_at = "2026-08-12T15:14:10".into();
+        let mut other_day = session(2, "20296833869", "2026-07-01T10:00:00");
+        other_day.ended_at = "2026-07-01T15:14:00".into();
+
+        let record = RecordForLiveDashboardBinding {
+            platform: "douyin".into(),
+            room_id: "20296833869".into(),
+            title: "金典拍拍相机专卖店".into(),
+            created_at: "2026-08-12T10:02:00".into(),
+            length_secs: Some(5 * 3600 + 14 * 60 + 10),
+        };
+
+        let result = match_dashboard_sessions(&record, &[same_day, other_day]);
+        assert_eq!(
+            result.automatic.as_ref().map(|(session, _)| session.id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn imported_video_finds_excel_by_duration_without_filename_clock() {
+        let mut hit = session(1, "camera", "2026-08-12T09:00:00");
+        hit.ended_at = "2026-08-12T14:14:00".into();
+        let mut miss = session(2, "camera", "2026-08-12T09:05:00");
+        miss.ended_at = "2026-08-12T10:00:00".into();
+
+        let result = match_imported_video_by_duration(
+            "金典拍拍相机专卖店",
+            "download.mp4",
+            "",
+            "2026-08-12T09:01:00",
+            Some(5 * 3600 + 14 * 60),
+            &[hit, miss],
+        );
+        assert_eq!(
+            result.automatic.as_ref().map(|(session, _)| session.id),
+            Some(1)
+        );
     }
 }

@@ -5,7 +5,7 @@ export type WorkspaceTranscriptEntry = {
   text: string;
 };
 
-export type CompanyAnalysisTab = "deal_speech" | "ai_review";
+export type CompanyAnalysisTab = "align" | "deal_speech" | "clip_review" | "ai_review";
 
 export type DealSpeechWindow = {
   start: number;

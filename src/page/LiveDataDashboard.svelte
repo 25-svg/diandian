@@ -185,18 +185,22 @@
     }
   }
 
-  async function prepareIdmVideoDownload(session: Pick<Session, "shopName" | "startedAt">) {
+  async function prepareIdmVideoDownload(
+    session: Pick<Session, "shopName" | "startedAt">,
+    options: { copyName?: boolean } = {},
+  ) {
     const key = `${session.shopName}|${session.startedAt}`;
+    idmPreparedKey = key;
     try {
-      const prepared = await invoke<{ suggestedFileName: string; watcherStarted: boolean }>(
+      const prepared = await invoke<{ suggestedFileName: string; watcherStarted: boolean; baseName: string }>(
         "prepare_idm_download_filename",
         { shopName: session.shopName, startedAt: session.startedAt },
       );
       idmPreparedKey = key;
-      const copied = await copyDownloadName(prepared.suggestedFileName);
-      message = `已准备：${prepared.suggestedFileName}。现在点击网页“下载该视频”，IDM 将自动填名${copied ? "；文件名也已复制" : ""}。`;
+      const copied = options.copyName === false ? false : await copyDownloadName(prepared.suggestedFileName);
+      message = `只改当前这场：${prepared.baseName}。现在去网页下载这一场即可，不会用别的场次命名。`;
     } catch (error) {
-      message = `准备 IDM 文件名失败：${String(error)}`;
+      message = `准备自动命名失败：${String(error)}`;
     }
   }
 
@@ -241,11 +245,11 @@
       listen<CompassBrowserProgress>("compass-auto-download-progress", (event) => handleCompassProgress(event.payload)),
       listen<{ path: string }>("idm-download-name-applied", (event) => {
         idmPreparedKey = "";
-        message = `IDM 文件名已自动填写：${event.payload.path}`;
+        message = `视频已自动改名为：${event.payload.path}`;
       }),
       listen("idm-download-name-timeout", () => {
         idmPreparedKey = "";
-        message = "两分钟内未检测到 IDM 下载窗口；标准文件名已复制，可手动粘贴。";
+        message = "5 分钟内未捕获到下载文件；请确认 IDM 保存到直播大屏下载目录，或再点一次自动命名。";
       }),
     ]);
   });
@@ -254,6 +258,13 @@
   $: if (initialSessionId != null && initialSessionId !== appliedSessionId) {
     appliedSessionId = initialSessionId;
     void refresh(initialSessionId);
+  }
+
+  $: if (detail?.session) {
+    const key = `${detail.session.shopName}|${detail.session.startedAt}`;
+    if (key !== idmPreparedKey) {
+      void prepareIdmVideoDownload(detail.session, { copyName: false });
+    }
   }
 </script>
 
@@ -295,7 +306,7 @@
             <div class="session-status"><strong>{compassStatusLabel(item.status)}</strong><span>{item.message}</span></div>
             <button type="button" class="mac-btn idm-name-btn" on:click={() => prepareIdmVideoDownload(item.session)}>
               <Clipboard size={14} />
-              {idmPreparedKey === `${item.session.shopName}|${item.session.startedAt}` ? "等待 IDM…" : "准备视频下载"}
+              {idmPreparedKey === `${item.session.shopName}|${item.session.startedAt}` ? "等待这场下载…" : "只命名这一场"}
             </button>
           </article>
         {/each}
@@ -326,9 +337,10 @@
         </select>
       </label>
       <div class="idm-picker-action">
-        <span>视频下载</span>
+        <span>只给当前选中这场自动命名（店铺_开播时间）</span>
         <button type="button" class="mac-btn" disabled={!detail?.session} on:click={() => detail?.session && prepareIdmVideoDownload(detail.session)}>
-          <Clipboard size={14} />准备 IDM 文件名
+          <Clipboard size={14} />
+          {idmPreparedKey === `${detail?.session.shopName}|${detail?.session.startedAt}` ? "等待这场下载…" : "下载这场时自动命名"}
         </button>
       </div>
     </section>

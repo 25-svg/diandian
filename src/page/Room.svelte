@@ -285,6 +285,18 @@
     return ((size * 8) / duration / 1024).toFixed(0);
   }
 
+  function get_live_status_label(room: RecorderInfo) {
+    if (!room.room_info.status) {
+      return "直播未开始";
+    }
+
+    return room.recording ? "直播进行中" : "直播进行中（未录制）";
+  }
+
+  function is_live_but_not_recording(room: RecorderInfo) {
+    return room.room_info.status && !room.recording;
+  }
+
   function handleModalClickOutside(event) {
     // 检查点击是否在任何modal内部
     const clickedElement = event.target;
@@ -557,27 +569,26 @@
             {#if room.enabled}
               <div
                 class={"absolute top-2 left-2 p-1.5 px-2 rounded-md text-white text-xs flex items-center justify-center " +
-                  (room.recording ? "bg-red-500" : "bg-gray-700/90")}
+                  (room.recording ? "bg-red-500" : "bg-yellow-500")}
               >
                 <AutoRecordIcon class="w-4 h-4 text-white" />
                 {#if room.recording}
                   <span class="text-white ml-1">录制中</span>
+                {:else}
+                  <span class="text-white ml-1">未录制</span>
                 {/if}
               </div>
             {/if}
-            {#if !room.room_info.status}
-              <div
-                class={"absolute bottom-2 right-2 p-1.5 px-2 rounded-md text-white text-xs flex items-center justify-center bg-gray-700"}
-              >
-                <span>直播未开始</span>
-              </div>
-            {:else}
-              <div
-                class={"absolute bottom-2 right-2 p-1.5 px-2 rounded-md text-white text-xs flex items-center justify-center bg-green-500"}
-              >
-                <span>直播进行中</span>
-              </div>
-            {/if}
+            <div
+              class={"absolute bottom-2 right-2 p-1.5 px-2 rounded-md text-white text-xs flex items-center justify-center " +
+                (!room.room_info.status
+                  ? "bg-gray-700"
+                  : is_live_but_not_recording(room)
+                    ? "bg-amber-600"
+                    : "bg-green-500")}
+            >
+              <span>{get_live_status_label(room)}</span>
+            </div>
             <button
               class="absolute top-2 right-2 p-1.5 rounded-lg bg-gray-900/50 hover:bg-gray-900/70 transition-colors"
             >

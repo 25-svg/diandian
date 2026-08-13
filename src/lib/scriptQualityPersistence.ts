@@ -6,7 +6,8 @@ export type SavedScriptQuality = {
 };
 
 export function scriptQualityStorageKey(sourceKey: string): string {
-  return `bsr:script-quality:v1:${sourceKey}`;
+  // v2: full-session review excludes deal-order ASR windows.
+  return `bsr:script-quality:v2:${sourceKey}`;
 }
 
 export function parseSavedScriptQuality(raw: string | null): SavedScriptQuality | null {

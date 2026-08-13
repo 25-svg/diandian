@@ -849,6 +849,246 @@ pub async fn generic_ffmpeg_command(args: &[&str]) -> Result<String, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Local FunASR/Whisper: split long recordings into fixed chunks so progress,
+/// resume, and peak memory stay manageable. 10 minutes matches Volcengine.
+const LOCAL_ASR_CHUNK_SEC: u64 = 600;
+/// Only chunk when the source is longer than this (15 minutes).
+const LOCAL_ASR_CHUNK_THRESHOLD_SEC: u64 = 900;
+const WHISPER_CHUNK_CONCURRENCY: usize = 2;
+
+fn local_asr_chunk_dir(file: &Path) -> Result<PathBuf, String> {
+    let parent = file
+        .parent()
+        .ok_or_else(|| "输入视频没有父目录".to_string())?;
+    let stem = file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("recording");
+    Ok(parent.join(format!("{stem}.local-asr-chunks")))
+}
+
+fn list_local_asr_wav_chunks(chunk_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut chunks = std::fs::read_dir(chunk_dir)
+        .map_err(|error| format!("读取本地ASR分段失败: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("wav"))
+        .collect::<Vec<_>>();
+    chunks.sort();
+    Ok(chunks)
+}
+
+async fn ensure_local_asr_audio_chunks(
+    file: &Path,
+    reporter: Option<&ProgressReporter>,
+) -> Result<Vec<PathBuf>, String> {
+    let chunk_dir = local_asr_chunk_dir(file)?;
+    tokio::fs::create_dir_all(&chunk_dir)
+        .await
+        .map_err(|error| format!("创建本地ASR分段目录失败: {error}"))?;
+    let existing = list_local_asr_wav_chunks(&chunk_dir)?;
+    if !existing.is_empty() {
+        return Ok(existing);
+    }
+
+    if let Some(reporter) = reporter {
+        reporter
+            .update("正在按 10 分钟切分音频以加速整场转写…")
+            .await;
+    }
+    let pattern = chunk_dir.join("chunk_%04d.wav");
+    let mut ffmpeg_process = ffmpeg_command();
+    #[cfg(target_os = "windows")]
+    ffmpeg_process.creation_flags(CREATE_NO_WINDOW);
+    let output = ffmpeg_process
+        .arg("-i")
+        .arg(file)
+        .args(["-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
+        .args([
+            "-f",
+            "segment",
+            "-segment_time",
+            &LOCAL_ASR_CHUNK_SEC.to_string(),
+            "-reset_timestamps",
+            "1",
+            "-y",
+        ])
+        .arg(&pattern)
+        .output()
+        .await
+        .map_err(|error| format!("切分整场音频失败: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "切分整场音频失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let chunks = list_local_asr_wav_chunks(&chunk_dir)?;
+    if chunks.is_empty() {
+        return Err("切分整场音频后没有得到分段文件".to_string());
+    }
+    Ok(chunks)
+}
+
+fn load_cached_local_asr_chunk_srt(
+    chunk: &Path,
+    generator_type: SubtitleGeneratorType,
+) -> Result<Option<GenerateResult>, String> {
+    let cached_srt = chunk.with_extension("srt");
+    if !cached_srt.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&cached_srt)
+        .map_err(|error| format!("读取本地ASR缓存分段失败: {error}"))?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GenerateResult {
+        subtitle_id: String::new(),
+        subtitle_content: srtparse::from_str(&content)
+            .map_err(|error| format!("解析本地ASR缓存分段失败: {error}"))?,
+        generator_type,
+    }))
+}
+
+async fn save_cached_local_asr_chunk_srt(
+    chunk: &Path,
+    result: &GenerateResult,
+) -> Result<(), String> {
+    let content = result
+        .subtitle_content
+        .iter()
+        .map(item_to_srt)
+        .collect::<String>();
+    tokio::fs::write(chunk.with_extension("srt"), content)
+        .await
+        .map_err(|error| format!("写入本地ASR缓存分段失败: {error}"))
+}
+
+fn local_asr_generator_label(generator_type: &str) -> SubtitleGeneratorType {
+    match generator_type {
+        "whisper" => SubtitleGeneratorType::Whisper,
+        _ => SubtitleGeneratorType::FunAsr,
+    }
+}
+
+/// Transcribe long local recordings in 10-minute WAV chunks with per-chunk
+/// resume cache. FunASR concurrency follows `BSR_FUNASR_WORKERS` / the worker pool.
+pub async fn generate_chunked_local_video_subtitle(
+    reporter: Option<&ProgressReporter>,
+    file: &Path,
+    generator_type: &str,
+    whisper_model: &str,
+    whisper_prompt: &str,
+    openai_api_key: &str,
+    openai_api_endpoint: &str,
+    language_hint: &str,
+) -> Result<GenerateResult, String> {
+    let chunks = ensure_local_asr_audio_chunks(file, reporter).await?;
+    let total = chunks.len();
+    let label = local_asr_generator_label(generator_type);
+    let concurrency = if generator_type == "whisper" {
+        WHISPER_CHUNK_CONCURRENCY
+    } else {
+        funasr::worker_count()
+    }
+    .max(1)
+    .min(total);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut chunk_results: Vec<Option<GenerateResult>> = vec![None; total];
+    let mut pending = JoinSet::new();
+    let mut next_index = 0usize;
+    let mut completed = 0usize;
+
+    // Prefill from cache so resume skips network/model work.
+    for (index, chunk) in chunks.iter().enumerate() {
+        if let Some(cached) = load_cached_local_asr_chunk_srt(chunk, label.clone())? {
+            chunk_results[index] = Some(cached);
+            completed += 1;
+        }
+    }
+    if completed > 0 {
+        if let Some(reporter) = reporter {
+            reporter
+                .update(&format!("已复用 {completed}/{total} 个分段缓存，继续补齐…"))
+                .await;
+        }
+    }
+
+    while completed < total {
+        while next_index < total && pending.len() < concurrency {
+            if chunk_results[next_index].is_some() {
+                next_index += 1;
+                continue;
+            }
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| format!("本地ASR分段调度失败: {error}"))?;
+            let chunk = chunks[next_index].clone();
+            let index = next_index;
+            next_index += 1;
+            let generator_type = generator_type.to_string();
+            let whisper_model = whisper_model.to_string();
+            let whisper_prompt = whisper_prompt.to_string();
+            let openai_api_key = openai_api_key.to_string();
+            let openai_api_endpoint = openai_api_endpoint.to_string();
+            let language_hint = language_hint.to_string();
+            pending.spawn(async move {
+                let _permit = permit;
+                let result = generate_video_subtitle_once(
+                    None,
+                    &chunk,
+                    &generator_type,
+                    &whisper_model,
+                    &whisper_prompt,
+                    &openai_api_key,
+                    &openai_api_endpoint,
+                    &language_hint,
+                )
+                .await
+                .map_err(|error| format!("第 {}/{} 段转写失败: {error}", index + 1, total))?;
+                save_cached_local_asr_chunk_srt(&chunk, &result).await?;
+                Ok::<(usize, GenerateResult), String>((index, result))
+            });
+        }
+
+        let Some(joined) = pending.join_next().await else {
+            break;
+        };
+        let (index, result) = joined
+            .map_err(|error| format!("本地ASR分段任务异常: {error}"))??;
+        chunk_results[index] = Some(result);
+        completed += 1;
+        if let Some(reporter) = reporter {
+            let parallel_hint = if concurrency > 1 {
+                format!("，并行 {concurrency} 路")
+            } else {
+                String::new()
+            };
+            reporter
+                .update(&format!(
+                    "分段转写进度 {completed}/{total}（每段约 {} 分钟{parallel_hint}）",
+                    LOCAL_ASR_CHUNK_SEC / 60
+                ))
+                .await;
+        }
+    }
+
+    let mut full = GenerateResult {
+        subtitle_id: String::new(),
+        subtitle_content: vec![],
+        generator_type: label,
+    };
+    for (index, chunk_result) in chunk_results.into_iter().enumerate() {
+        let result = chunk_result
+            .ok_or_else(|| format!("第 {}/{} 段缺少识别结果", index + 1, total))?;
+        full.concat_with_offset_ms(&result, index as u64 * LOCAL_ASR_CHUNK_SEC * 1000);
+    }
+    Ok(full)
+}
+
 pub async fn generate_video_subtitle(
     reporter: Option<&ProgressReporter>,
     file: &Path,
@@ -859,6 +1099,62 @@ pub async fn generate_video_subtitle(
     openai_api_endpoint: &str,
     language_hint: &str,
 ) -> Result<GenerateResult, String> {
+    let prefer_chunks = matches!(generator_type, "funasr" | "whisper")
+        && probe_media_duration_ms(file)
+            .await
+            .map(|ms| ms > LOCAL_ASR_CHUNK_THRESHOLD_SEC * 1000)
+            .unwrap_or(false);
+
+    if prefer_chunks {
+        let chunked = generate_chunked_local_video_subtitle(
+            reporter,
+            file,
+            generator_type,
+            whisper_model,
+            whisper_prompt,
+            openai_api_key,
+            openai_api_endpoint,
+            language_hint,
+        )
+        .await;
+        if generator_type == "funasr" {
+            if let Err(error) = &chunked {
+                #[cfg(feature = "local-whisper")]
+                {
+                    log::warn!("FunASR 分段转写失败，回退本地 Whisper 分段: {error}");
+                    if let Some(reporter) = reporter {
+                        reporter
+                            .update("FunASR分段失败，正在用本地 Whisper 分段重试")
+                            .await;
+                    }
+                    return generate_chunked_local_video_subtitle(
+                        reporter,
+                        file,
+                        "whisper",
+                        whisper_model,
+                        whisper_prompt,
+                        openai_api_key,
+                        openai_api_endpoint,
+                        language_hint,
+                    )
+                    .await
+                    .map_err(|whisper_error| {
+                        format!(
+                            "FunASR 分段失败: {error}; Whisper 分段也失败: {whisper_error}"
+                        )
+                    });
+                }
+                #[cfg(not(feature = "local-whisper"))]
+                {
+                    return Err(format!(
+                        "中文直播识别（FunASR）分段失败：{error}。当前构建未启用本地 Whisper。"
+                    ));
+                }
+            }
+        }
+        return chunked;
+    }
+
     let result = generate_video_subtitle_once(
         reporter,
         file,

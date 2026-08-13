@@ -247,7 +247,16 @@ impl DouyinRecorder {
                                     });
 
                                     if let Some(danmu_storage) = self.danmu_storage.read().await.as_ref() {
-                                        danmu_storage.add_line(ts, &danmu.message).await;
+                                        let user_id = (danmu.user_id != 0)
+                                            .then(|| danmu.user_id.to_string());
+                                        danmu_storage
+                                            .add_line(
+                                                ts,
+                                                &danmu.message,
+                                                user_id.as_deref(),
+                                                Some(danmu.user_name.as_str()),
+                                            )
+                                            .await;
                                     }
                                 }
                             }

@@ -515,7 +515,7 @@
       dispatch("imported", {
         videoId: importedVideo.id,
         videoIds: [importedVideo.id],
-        asMaster: importAsMaster,
+        asMaster: false,
       });
       importAsMaster = false;
     } catch (error) {
@@ -739,13 +739,10 @@
                 />
               </div>
               {#if showMasterImportOption}
-              <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-600 dark:bg-gray-700">
-                <input type="checkbox" bind:checked={importAsMaster} class="mt-0.5 h-4 w-4 accent-blue-600" />
-                <span>
-                  <strong class="block text-sm font-medium text-gray-800 dark:text-gray-100">导入后作为整场直播母稿</strong>
-                  <small class="mt-1 block text-xs leading-5 text-gray-500 dark:text-gray-400">适合包含多个商品的完整直播；系统会先生成逐字稿，再按商品整理并等待你发布。</small>
-                </span>
-              </label>
+              <div class="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/40">
+                <strong class="block text-sm font-medium text-amber-900 dark:text-amber-100">整场不可直接进母稿</strong>
+                <small class="mt-1 block text-xs leading-5 text-amber-800/90 dark:text-amber-200/80">请走 Clip「母稿样本批次」→ 发布到「主播知识库」的 视频/成交、话术、分析建议（视频只写路径引用）。</small>
+              </div>
               {/if}
               <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-600 dark:bg-gray-700">
                 <input type="checkbox" checked={analysisPurpose === "competitor_benchmark"} on:change={toggleCompetitorAnalysis} class="mt-0.5 h-4 w-4 accent-blue-600" />

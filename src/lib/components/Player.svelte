@@ -20,6 +20,8 @@
   interface DanmuEntry {
     ts: number;
     content: string;
+    user_id?: string | null;
+    user_name?: string | null;
   }
 
   export let platform: string;

@@ -16,6 +16,7 @@
     openLiveDashboard,
     type LiveDashboardBindingSummary,
   } from "../lib/liveDashboard";
+  import { COMPASS_TARGET_SHOPS, inferCompassShopFromTexts } from "../lib/compassAutoDownload";
   import {
     pruneArchiveSelection,
     selectArchiveRange,
@@ -77,6 +78,7 @@
 
   let selectedRoomId: string | null = null;
   let roomOptions: RoomOption[] = [];
+  let roomAccountById = new Map<string, string>();
 
   let selectedArchives: Set<string> = new Set();
   let lastSelectedArchiveId: string | null = null;
@@ -494,6 +496,15 @@
       allRooms = recorderList.recorders || [];
 
       // 收集所有直播间，用账号名/直播间标题+直播间号展示
+      roomAccountById = new Map(
+        allRooms
+          .map((room: RecorderInfo) => {
+            const id = String(room.room_info.room_id);
+            const name = room.user_info?.user_name?.trim() || "";
+            return [id, name] as const;
+          })
+          .filter((entry) => entry[1]),
+      );
       roomOptions = allRooms
         .map((room: RecorderInfo) => {
           const id = room.room_info.room_id;
@@ -981,6 +992,26 @@
         console.warn("Auto resolve live dashboard failed:", archive.live_id, error);
       }
     }
+  }
+
+  function shopLabelForExcel(shopName: string): string {
+    const known = COMPASS_TARGET_SHOPS.find((shop) => shop.value === shopName);
+    return known ? `${known.label} · ${shopName}` : shopName;
+  }
+
+  function getArchiveAccountForExcel(archive: RecordItem): { accountName: string; shopLabel: string } {
+    const accountName =
+      roomAccountById.get(String(archive.room_id)) ||
+      archive.anchor_name?.trim() ||
+      "";
+    const binding = liveDashboardBindings.get(archive.live_id);
+    const shopName =
+      binding?.shopName?.trim() ||
+      inferCompassShopFromTexts([archive.title, archive.anchor_name, accountName]);
+    return {
+      accountName: accountName || "未识别账号",
+      shopLabel: shopLabelForExcel(shopName),
+    };
   }
 
   function getArchiveIdentity(archive: RecordItem) {
@@ -1499,7 +1530,8 @@
                 </th>
                 <th class="w-24">直播时间</th>
                 <th class="w-36">直播间</th>
-                <th>账号 / 标题</th>
+                <th class="w-40">账号</th>
+                <th>标题</th>
                 <th class="w-28">主播</th>
                 <th class="w-24">时长</th>
                 <th class="w-20">大小</th>
@@ -1510,6 +1542,7 @@
             <tbody>
               {#each filteredArchives as archive (getArchiveKey(archive))}
                 {@const identity = getArchiveIdentity(archive)}
+                {@const account = getArchiveAccountForExcel(archive)}
                 <tr
                   class="archive-selectable-row group cursor-pointer select-none transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[color:var(--mac-blue)]"
                   class:archive-row-selected={selectedArchives.has(archive.live_id)}
@@ -1579,6 +1612,18 @@
                           >{archive.room_id}</span
                         >
                       {/if}
+                    </div>
+                  </td>
+
+                  <td class="px-3 py-3 overflow-hidden">
+                    <div class="min-w-0">
+                      <span
+                        class="block truncate text-sm font-medium text-gray-900 dark:text-white"
+                        title={account.accountName}
+                      >{account.accountName}</span>
+                      <p class="truncate text-xs text-gray-500 dark:text-gray-400" title={`对应 Excel：${account.shopLabel}`}>
+                        {account.shopLabel}
+                      </p>
                     </div>
                   </td>
 

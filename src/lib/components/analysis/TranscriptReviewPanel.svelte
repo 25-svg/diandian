@@ -160,7 +160,7 @@
         on:decide={decide}
       />
     {:else if bundle.corrections.length === 0}
-      <div class="state success"><CheckCircle2 size={30} /><strong>没有需要人工确认的内容</strong><span>可以切换到“片段分析”查看结果。</span></div>
+      <div class="state success"><CheckCircle2 size={30} /><strong>没有需要人工确认的内容</strong><span>可以切换到“语句分析”查看结果。</span></div>
     {:else}
       <div class="state"><span>当前校稿项不存在，请选择上一条或下一条。</span></div>
     {/if}

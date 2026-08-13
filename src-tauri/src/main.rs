@@ -861,6 +861,8 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::account::get_douyin_login_cookies,
         crate::handlers::account::close_douyin_login,
         crate::handlers::ai::minimax_chat,
+        crate::handlers::ai::get_minimax_setup_status,
+        crate::handlers::ai::initialize_minimax_api_key,
         crate::handlers::config::get_config,
         crate::handlers::config::get_static_port,
         crate::handlers::config::get_storage_migration_status,
@@ -1093,6 +1095,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                 });
+                crate::idm_naming_assistant::start_idm_compass_rename_watcher();
                 Ok(())
             })
         })

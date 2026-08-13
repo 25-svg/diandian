@@ -711,30 +711,178 @@ impl RecorderManager {
         }
     }
 
+    /// Non-empty related archives sharing the same parent live session.
+    async fn count_nonempty_parent_segments(&self, room_id: &str, parent_id: &str) -> usize {
+        match self.db.get_archives_by_parent_id(room_id, parent_id).await {
+            Ok(archives) => archives
+                .into_iter()
+                .filter(|archive| archive.size > 0 || archive.length > 0.0)
+                .count(),
+            Err(error) => {
+                log::error!(
+                    "Failed to count parent segments for {room_id}/{parent_id}: {error}"
+                );
+                0
+            }
+        }
+    }
+
+    async fn has_active_whole_clip_task(&self, parent_id: &str) -> bool {
+        let Ok(tasks) = self.db.get_tasks().await else {
+            return false;
+        };
+        tasks.into_iter().any(|task| {
+            if task.task_type != "generate_whole_clip" {
+                return false;
+            }
+            if task.status != "pending" && task.status != "processing" {
+                return false;
+            }
+            serde_json::from_str::<serde_json::Value>(&task.metadata)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("parent_id")
+                        .and_then(|item| item.as_str())
+                        .map(|item| item == parent_id)
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    async fn queue_auto_whole_clip(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        parent_id: String,
+        encode_danmu: bool,
+        message: &str,
+    ) {
+        if self.has_active_whole_clip_task(&parent_id).await {
+            log::info!(
+                "Skip auto whole-clip for parent {parent_id}: task already pending/processing"
+            );
+            return;
+        }
+
+        let Ok(task) = self
+            .db
+            .generate_task(
+                "generate_whole_clip",
+                message,
+                &serde_json::json!({
+                    "platform": platform.as_str(),
+                    "room_id": room_id,
+                    "parent_id": parent_id,
+                    "encode_danmu": encode_danmu,
+                })
+                .to_string(),
+            )
+            .await
+        else {
+            log::error!("Failed to generate auto whole-clip task");
+            return;
+        };
+
+        let Ok(reporter) = ProgressReporter::new(self.db.clone(), &self.emitter, &task.id).await
+        else {
+            log::error!("Failed to create auto whole-clip reporter");
+            let _ = self
+                .db
+                .update_task(&task.id, "failed", "Failed to create reporter", None)
+                .await;
+            return;
+        };
+
+        log::info!("Create auto whole-clip task: {} {}", task.id, task.task_type);
+
+        let self_clone = self.clone();
+        let task_id = task.id.clone();
+        let room_id = room_id.to_string();
+        let _ = self
+            .task_manager
+            .add_task(Task::new(
+                task_id.clone(),
+                TaskPriority::Normal,
+                async move {
+                    if let Err(e) = self_clone
+                        .generate_whole_clip(
+                            Some(&reporter),
+                            GenerateWholeClipParams {
+                                encode_danmu,
+                                platform: platform.as_str().to_string(),
+                                room_id,
+                                parent_id,
+                                selected_live_ids: None,
+                                output_name: None,
+                            },
+                        )
+                        .await
+                    {
+                        log::error!("Failed to generate whole clip: {e}");
+                        let _ = reporter
+                            .finish(false, &format!("自动拼接整场视频失败: {e}"))
+                            .await;
+                        let _ = self_clone
+                            .db
+                            .update_task(
+                                &task_id,
+                                "failed",
+                                &format!("自动拼接整场视频失败: {e}"),
+                                None,
+                            )
+                            .await;
+                        return Err(format!("Failed to generate whole clip: {e}"));
+                    }
+
+                    let _ = reporter.finish(true, "同场多段已自动拼接完成").await;
+                    let _ = self_clone
+                        .db
+                        .update_task(&task_id, "success", "同场多段已自动拼接完成", None)
+                        .await;
+                    Ok(())
+                },
+            ))
+            .await;
+    }
+
     async fn handle_live_end(
         &self,
         platform: PlatformType,
         room_id: &str,
         recorder: &RecorderInfo,
     ) {
-        let (auto_generate, auto_subtitle) = {
+        let (auto_generate, auto_subtitle, encode_danmu) = {
             let config = self.config.read().await;
-            (config.auto_generate.enabled, config.auto_subtitle)
+            (
+                config.auto_generate.enabled,
+                config.auto_subtitle,
+                config.auto_generate.encode_danmu,
+            )
         };
-        if !auto_generate && !auto_subtitle {
+
+        let live_id = recorder.live_id.clone();
+        let live_record = match self.db.get_record(room_id, &live_id).await {
+            Ok(record) => record,
+            Err(_) => {
+                log::error!("Live not found in record: {room_id} {live_id}");
+                return;
+            }
+        };
+
+        let multi_segment_count = self
+            .count_nonempty_parent_segments(room_id, &live_record.parent_id)
+            .await;
+        let auto_multi_stitch = multi_segment_count >= 2;
+
+        if !auto_generate && !auto_subtitle && !auto_multi_stitch {
             return;
         }
 
         let recorder_id = format!("{}:{}", platform.as_str(), room_id);
-        log::info!("Start post-record processing for {recorder_id}");
-        let live_id = recorder.live_id.clone();
-        let live_record = self.db.get_record(room_id, &live_id).await;
-        if live_record.is_err() {
-            log::error!("Live not found in record: {room_id} {live_id}");
-            return;
-        }
-
-        let live_record = live_record.unwrap();
+        log::info!(
+            "Start post-record processing for {recorder_id} (segments={multi_segment_count}, auto_generate={auto_generate}, auto_multi_stitch={auto_multi_stitch})"
+        );
 
         if auto_subtitle {
             let subtitle_task = self
@@ -830,100 +978,32 @@ impl RecorderManager {
             }
         }
 
+        if auto_multi_stitch {
+            self.queue_auto_whole_clip(
+                platform,
+                room_id,
+                live_record.parent_id.clone(),
+                false,
+                &format!(
+                    "检测到同场 {multi_segment_count} 段录制，正在自动拼接整场视频"
+                ),
+            )
+            .await;
+            return;
+        }
+
         if !auto_generate {
             return;
         }
 
-        let Ok(task) = self
-            .db
-            .generate_task(
-                "generate_whole_clip",
-                "",
-                &serde_json::json!({
-                    "platform": platform.as_str(),
-                    "room_id": room_id,
-                    "parent_id": live_record.parent_id,
-                })
-                .to_string(),
-            )
-            .await
-        else {
-            log::error!("Failed to generate task");
-            return;
-        };
-
-        let Ok(reporter) = ProgressReporter::new(self.db.clone(), &self.emitter, &task.id).await
-        else {
-            log::error!("Failed to create reporter");
-            let _ = self
-                .db
-                .update_task(&task.id, "failed", "Failed to create reporter", None)
-                .await;
-            return;
-        };
-
-        log::info!("Create task: {} {}", task.id, task.task_type);
-
-        let self_clone = self.clone();
-        let task_id = task.id.clone();
-        let room_id = room_id.to_string();
-        let _ = self
-            .task_manager
-            .add_task(Task::new(
-                task_id.clone(),
-                TaskPriority::Normal,
-                async move {
-                    if let Err(e) = self_clone
-                        .generate_whole_clip(
-                            Some(&reporter),
-                            GenerateWholeClipParams {
-                                encode_danmu: self_clone
-                                    .config
-                                    .read()
-                                    .await
-                                    .auto_generate
-                                    .encode_danmu,
-                                platform: platform.as_str().to_string(),
-                                room_id,
-                                parent_id: live_record.parent_id,
-                                selected_live_ids: None,
-                                output_name: None,
-                            },
-                        )
-                        .await
-                    {
-                        log::error!("Failed to generate whole clip: {e}");
-                        let _ = reporter
-                            .finish(false, &format!("Failed to generate whole clip: {e}"))
-                            .await;
-                        let _ = self_clone
-                            .db
-                            .update_task(
-                                &task_id,
-                                "failed",
-                                &format!("Failed to generate whole clip: {e}"),
-                                None,
-                            )
-                            .await;
-                        return Err(format!("Failed to generate whole clip: {e}"));
-                    }
-
-                    let _ = reporter
-                        .finish(true, "Whole clip generated successfully")
-                        .await;
-                    let _ = self_clone
-                        .db
-                        .update_task(
-                            &task_id,
-                            "success",
-                            "Whole clip generated successfully",
-                            None,
-                        )
-                        .await;
-                    Ok(())
-                },
-            ))
-            .await;
+        self.queue_auto_whole_clip(
+            platform,
+            room_id,
+            live_record.parent_id,
+            encode_danmu,
+            "正在自动生成完整切片",
+        )
+        .await;
     }
 
     pub fn set_migrating(&self, migrating: bool) {

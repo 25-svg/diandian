@@ -37,6 +37,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 #[cfg(windows)]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -45,7 +48,7 @@ use std::sync::{
 use std::time::UNIX_EPOCH;
 
 #[cfg(feature = "gui")]
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 #[cfg(windows)]
 use windows::{
     core::HSTRING,
@@ -2332,6 +2335,75 @@ fn deal_window_subtitle_path(context: &CanonicalVideoTranscriptContext) -> PathB
     context.artifact_dir.join("deal-windows.srt")
 }
 
+fn range_subtitle_paths(
+    context: &CanonicalVideoTranscriptContext,
+    artifact_stem: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        context.artifact_dir.join(format!("{artifact_stem}.srt")),
+        context.artifact_dir.join(format!("{artifact_stem}.partial.srt")),
+        context.artifact_dir.join(format!("{artifact_stem}.json")),
+    )
+}
+
+fn merge_srt_documents(left: &str, right: &str) -> Result<String, String> {
+    let mut items = Vec::new();
+    for (label, content) in [("成交窗", left), ("补转段", right)] {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = srtparse::from_str(trimmed)
+            .map_err(|error| format!("合并{label}逐字稿失败: {error}"))?;
+        items.extend(parsed);
+    }
+    if items.is_empty() {
+        return Ok(String::new());
+    }
+    items.sort_by(|left_item, right_item| {
+        left_item
+            .start_time
+            .hours
+            .cmp(&right_item.start_time.hours)
+            .then(left_item.start_time.minutes.cmp(&right_item.start_time.minutes))
+            .then(left_item.start_time.seconds.cmp(&right_item.start_time.seconds))
+            .then(
+                left_item
+                    .start_time
+                    .milliseconds
+                    .cmp(&right_item.start_time.milliseconds),
+            )
+    });
+    Ok(items
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut item)| {
+            item.pos = index + 1;
+            item_to_srt(&item)
+        })
+        .collect())
+}
+
+async fn promote_deal_windows_to_canonical_subtitle(
+    state: &State,
+    id: i64,
+) -> Result<String, String> {
+    let context = resolve_video_transcript_context(state, id).await?;
+    let deal_path = deal_window_subtitle_path(&context);
+    let deal = if deal_path.is_file() {
+        tokio::fs::read_to_string(&deal_path)
+            .await
+            .map_err(|error| format!("读取成交窗口逐字稿失败: {error}"))?
+    } else {
+        String::new()
+    };
+    if deal.trim().is_empty() {
+        return Err("没有可合并的成交窗口逐字稿。".to_string());
+    }
+    write_legacy_video_subtitle(&context.media_file, &deal).await?;
+    Ok(deal)
+}
+
 fn validate_deal_transcript_windows(ranges: &[DealTranscriptWindowRequest]) -> Result<f64, String> {
     if ranges.is_empty() {
         return Err("没有可转写的成交时间窗口，请先导入成交订单。".to_string());
@@ -2782,22 +2854,64 @@ pub async fn generate_video_deal_window_subtitle(
     event_id: String,
     id: i64,
     ranges: Vec<DealTranscriptWindowRequest>,
+    artifact_stem: Option<String>,
 ) -> Result<String, String> {
+    let stem = artifact_stem
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("deal-windows")
+        .to_string();
+    let is_gap_fill = stem == "gap-windows";
+    if is_gap_fill && ranges.is_empty() {
+        let merged = promote_deal_windows_to_canonical_subtitle(&state, id).await?;
+        let task = TaskRow {
+            id: event_id.clone(),
+            task_type: "generate_video_gap_fill_subtitle".to_string(),
+            status: "success".to_string(),
+            message: "无需补转空洞，已合并成交窗文稿".to_string(),
+            metadata: json!({
+                "video_id": id,
+                "range_count": 0,
+                "artifact_stem": stem,
+            })
+            .to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        state.db.add_task(&task).await?;
+        return Ok(merged);
+    }
+
     let total_duration = validate_deal_transcript_windows(&ranges)?;
     let context = resolve_video_transcript_context(&state, id).await?;
-    let task = TaskRow {
-        id: event_id.clone(),
-        task_type: "generate_video_deal_window_subtitle".to_string(),
-        status: "pending".to_string(),
-        message: format!(
+    let task_type = if is_gap_fill {
+        "generate_video_gap_fill_subtitle"
+    } else {
+        "generate_video_deal_window_subtitle"
+    };
+    let pending_message = if is_gap_fill {
+        format!(
+            "等待补转 {} 个非成交时段，共 {:.1} 分钟",
+            ranges.len(),
+            total_duration / 60.0
+        )
+    } else {
+        format!(
             "等待转写 {} 个成交窗口，共 {:.1} 分钟",
             ranges.len(),
             total_duration / 60.0
-        ),
+        )
+    };
+    let task = TaskRow {
+        id: event_id.clone(),
+        task_type: task_type.to_string(),
+        status: "pending".to_string(),
+        message: pending_message,
         metadata: json!({
             "video_id": id,
             "range_count": ranges.len(),
             "audio_duration_sec": total_duration,
+            "artifact_stem": stem,
         })
         .to_string(),
         created_at: Utc::now().to_rfc3339(),
@@ -2809,7 +2923,13 @@ pub async fn generate_video_deal_window_subtitle(
     #[cfg(feature = "headless")]
     let emitter = EventEmitter::new(state.progress_manager.get_event_sender());
     let reporter = ProgressReporter::new(state.db.clone(), &emitter, &event_id).await?;
-    reporter.update("成交窗口转写正在排队").await;
+    reporter
+        .update(if is_gap_fill {
+            "非成交段补转正在排队"
+        } else {
+            "成交窗口转写正在排队"
+        })
+        .await;
     let _media_permit = state
         .media_execution_gate
         .clone()
@@ -2839,9 +2959,12 @@ pub async fn generate_video_deal_window_subtitle(
     tokio::fs::create_dir_all(&temp_dir)
         .await
         .map_err(|error| format!("创建成交窗口转写目录失败: {error}"))?;
-    let mut combined: Option<crate::subtitle_generator::GenerateResult> = None;
     let mut work_chunks = Vec::new();
     const MAX_ASR_CHUNK_SEC: f64 = 60.0;
+    /// Parallel ffmpeg extract of deal-window WAVs.
+    const DEAL_EXTRACT_CONCURRENCY: usize = 4;
+    /// Match FunASR worker processes (see BSR_FUNASR_WORKERS, default 2).
+    let deal_asr_concurrency = crate::subtitle_generator::funasr::worker_count().max(1);
     for range in &ranges {
         let mut start_sec = range.start_sec;
         while start_sec < range.end_sec {
@@ -2850,60 +2973,148 @@ pub async fn generate_video_deal_window_subtitle(
             start_sec = end_sec;
         }
     }
-    let partial_subtitle_path = context.artifact_dir.join("deal-windows.partial.srt");
+    let (final_subtitle_path, partial_subtitle_path, index_path) =
+        range_subtitle_paths(&context, &stem);
+    let chunk_count = work_chunks.len();
+    let label = if is_gap_fill { "非成交段" } else { "成交窗口" };
 
     let generation_result: Result<String, String> = async {
         tokio::fs::create_dir_all(&context.artifact_dir)
             .await
             .map_err(|error| format!("创建成交逐字稿目录失败: {error}"))?;
         let _ = tokio::fs::remove_file(&partial_subtitle_path).await;
+
+        // Phase 1: extract all WAV segments in parallel.
+        let extract_sem = Arc::new(Semaphore::new(DEAL_EXTRACT_CONCURRENCY.max(1)));
+        let mut extract_set = JoinSet::new();
         for (index, (start_sec, end_sec)) in work_chunks.iter().copied().enumerate() {
+            let permit = extract_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| format!("成交音频提取调度失败: {error}"))?;
+            let media_file = context.media_file.clone();
+            let segment_path = temp_dir.join(format!("window-{index:03}.wav"));
+            extract_set.spawn(async move {
+                let _permit = permit;
+                ffmpeg::extract_audio_segment(
+                    &media_file,
+                    start_sec,
+                    end_sec - start_sec,
+                    &segment_path,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "提取成交音频 {}/{}（{start_sec:.0}-{end_sec:.0} 秒）失败: {error}",
+                        index + 1,
+                        chunk_count
+                    )
+                })?;
+                Ok::<(usize, f64, PathBuf), String>((index, start_sec, segment_path))
+            });
+        }
+        let mut extracted: Vec<Option<(f64, PathBuf)>> = vec![None; chunk_count];
+        let mut extract_done = 0usize;
+        while let Some(joined) = extract_set.join_next().await {
+            let (index, start_sec, segment_path) = joined
+                .map_err(|error| format!("成交音频提取任务异常: {error}"))??;
+            extracted[index] = Some((start_sec, segment_path));
+            extract_done += 1;
             reporter
                 .update(&format!(
-                    "正在转写成交音频 {}/{}（{:.0}-{:.0} 秒）",
-                    index + 1,
-                    work_chunks.len(),
-                    start_sec,
-                    end_sec
+                    "并行提取成交音频 {extract_done}/{chunk_count}"
                 ))
                 .await;
-            let segment_path = temp_dir.join(format!("window-{index:03}.wav"));
-            ffmpeg::extract_audio_segment(
-                &context.media_file,
-                start_sec,
-                end_sec - start_sec,
-                &segment_path,
-            )
-            .await?;
+        }
 
-            // FunASR correction is deliberately skipped here. AI analysis runs
-            // after all windows are ready; per-window correction only adds wait.
-            let asr_api_key = if generator_type == "funasr" {
-                ""
-            } else {
-                openai_api_key.as_str()
-            };
-            let result = ffmpeg::generate_video_subtitle(
-                None,
-                &segment_path,
-                &generator_type,
-                &whisper_model,
-                &whisper_prompt,
-                asr_api_key,
-                &openai_api_endpoint,
-                &language_hint,
-            )
-            .await?;
-            if let Some(output) = combined.as_mut() {
-                output.concat_with_offset_ms(&result, (start_sec * 1000.0).round() as u64);
-            } else {
-                let mut output = crate::subtitle_generator::GenerateResult {
-                    generator_type: result.generator_type.clone(),
-                    subtitle_id: result.subtitle_id.clone(),
-                    subtitle_content: Vec::new(),
-                };
-                output.concat_with_offset_ms(&result, (start_sec * 1000.0).round() as u64);
-                combined = Some(output);
+        // Phase 2: ASR in parallel across FunASR worker processes.
+        let asr_sem = Arc::new(Semaphore::new(deal_asr_concurrency));
+        let mut asr_set = JoinSet::new();
+        // FunASR correction is deliberately skipped here. AI analysis runs
+        // after all windows are ready; per-window correction only adds wait.
+        let asr_api_key = if generator_type == "funasr" {
+            String::new()
+        } else {
+            openai_api_key.clone()
+        };
+        for (index, item) in extracted.into_iter().enumerate() {
+            let (start_sec, segment_path) = item.ok_or_else(|| {
+                format!("成交音频分段 {}/{} 提取结果缺失", index + 1, chunk_count)
+            })?;
+            let permit = asr_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| format!("成交 ASR 调度失败: {error}"))?;
+            let generator_type = generator_type.clone();
+            let whisper_model = whisper_model.clone();
+            let whisper_prompt = whisper_prompt.clone();
+            let openai_api_endpoint = openai_api_endpoint.clone();
+            let language_hint = language_hint.clone();
+            let asr_api_key = asr_api_key.clone();
+            asr_set.spawn(async move {
+                let _permit = permit;
+                let result = ffmpeg::generate_video_subtitle(
+                    None,
+                    &segment_path,
+                    &generator_type,
+                    &whisper_model,
+                    &whisper_prompt,
+                    &asr_api_key,
+                    &openai_api_endpoint,
+                    &language_hint,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "并行转写成交音频 {}/{}（{start_sec:.0} 秒起）失败: {error}",
+                        index + 1,
+                        chunk_count
+                    )
+                })?;
+                Ok::<(usize, f64, crate::subtitle_generator::GenerateResult), String>((
+                    index, start_sec, result,
+                ))
+            });
+        }
+
+        let mut asr_results: Vec<Option<(f64, crate::subtitle_generator::GenerateResult)>> =
+            vec![None; chunk_count];
+        let mut asr_done = 0usize;
+        while let Some(joined) = asr_set.join_next().await {
+            let (index, start_sec, result) = joined
+                .map_err(|error| format!("成交 ASR 任务异常: {error}"))??;
+            asr_results[index] = Some((start_sec, result));
+            asr_done += 1;
+            reporter
+                .update(&format!(
+                    "并行转写成交音频 {asr_done}/{chunk_count}"
+                ))
+                .await;
+
+            let mut ordered: Vec<(f64, &crate::subtitle_generator::GenerateResult)> = asr_results
+                .iter()
+                .filter_map(|item| item.as_ref().map(|(start, result)| (*start, result)))
+                .collect();
+            ordered.sort_by(|left, right| {
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut combined: Option<crate::subtitle_generator::GenerateResult> = None;
+            for (start, result) in ordered {
+                if let Some(output) = combined.as_mut() {
+                    output.concat_with_offset_ms(result, (start * 1000.0).round() as u64);
+                } else {
+                    let mut output = crate::subtitle_generator::GenerateResult {
+                        generator_type: result.generator_type.clone(),
+                        subtitle_id: result.subtitle_id.clone(),
+                        subtitle_content: Vec::new(),
+                    };
+                    output.concat_with_offset_ms(result, (start * 1000.0).round() as u64);
+                    combined = Some(output);
+                }
             }
             let partial_subtitle = combined
                 .as_ref()
@@ -2916,9 +3127,33 @@ pub async fn generate_video_deal_window_subtitle(
                 })
                 .unwrap_or_default();
             if !partial_subtitle.trim().is_empty() {
-                tokio::fs::write(&partial_subtitle_path, partial_subtitle)
+                tokio::fs::write(&partial_subtitle_path, &partial_subtitle)
                     .await
                     .map_err(|error| format!("保存部分成交窗口逐字稿失败: {error}"))?;
+            }
+        }
+
+        let mut ordered_final: Vec<(f64, crate::subtitle_generator::GenerateResult)> = asr_results
+            .into_iter()
+            .flatten()
+            .collect();
+        ordered_final.sort_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut combined: Option<crate::subtitle_generator::GenerateResult> = None;
+        for (start_sec, result) in ordered_final {
+            if let Some(output) = combined.as_mut() {
+                output.concat_with_offset_ms(&result, (start_sec * 1000.0).round() as u64);
+            } else {
+                let mut output = crate::subtitle_generator::GenerateResult {
+                    generator_type: result.generator_type.clone(),
+                    subtitle_id: result.subtitle_id.clone(),
+                    subtitle_content: Vec::new(),
+                };
+                output.concat_with_offset_ms(&result, (start_sec * 1000.0).round() as u64);
+                combined = Some(output);
             }
         }
 
@@ -2933,19 +3168,35 @@ pub async fn generate_video_deal_window_subtitle(
             })
             .unwrap_or_default();
         if subtitle.trim().is_empty() {
-            return Err("成交时间窗口中没有识别到可用人声。".to_string());
+            return Err(format!("{label}中没有识别到可用人声。"));
         }
-        tokio::fs::write(deal_window_subtitle_path(&context), &subtitle)
+        tokio::fs::write(&final_subtitle_path, &subtitle)
             .await
-            .map_err(|error| format!("保存成交窗口逐字稿失败: {error}"))?;
+            .map_err(|error| format!("保存{label}逐字稿失败: {error}"))?;
         tokio::fs::write(
-            context.artifact_dir.join("deal-windows.json"),
+            &index_path,
             serde_json::to_vec_pretty(&ranges)
-                .map_err(|error| format!("保存成交窗口索引失败: {error}"))?,
+                .map_err(|error| format!("保存{label}索引失败: {error}"))?,
         )
         .await
-        .map_err(|error| format!("保存成交窗口索引失败: {error}"))?;
+        .map_err(|error| format!("保存{label}索引失败: {error}"))?;
         let _ = tokio::fs::remove_file(&partial_subtitle_path).await;
+
+        if is_gap_fill {
+            let deal = if deal_window_subtitle_path(&context).is_file() {
+                tokio::fs::read_to_string(deal_window_subtitle_path(&context))
+                    .await
+                    .map_err(|error| format!("读取成交窗口逐字稿失败: {error}"))?
+            } else {
+                String::new()
+            };
+            let merged = merge_srt_documents(&deal, &subtitle)?;
+            if merged.trim().is_empty() {
+                return Err("合并成交窗与补转段后没有可用文稿。".to_string());
+            }
+            write_legacy_video_subtitle(&context.media_file, &merged).await?;
+            return Ok(merged);
+        }
         Ok(subtitle)
     }
     .await;
@@ -2953,21 +3204,27 @@ pub async fn generate_video_deal_window_subtitle(
         log::warn!("清理成交窗口转写临时目录失败 {:?}: {error}", temp_dir);
     }
 
+    let success_message = if is_gap_fill {
+        "非成交段补转完成，已写入同一份文稿"
+    } else {
+        "成交窗口逐字稿生成完成"
+    };
     match generation_result {
         Ok(subtitle) => {
-            reporter.finish(true, "成交窗口逐字稿生成完成").await;
+            reporter.finish(true, success_message).await;
             state
                 .db
                 .update_task(
                     &event_id,
                     "success",
-                    "成交窗口逐字稿生成完成",
+                    success_message,
                     Some(
                         json!({
                             "video_id": id,
                             "range_count": ranges.len(),
                             "audio_duration_sec": total_duration,
                             "service": generator_type,
+                            "artifact_stem": stem,
                         })
                         .to_string()
                         .as_str(),
@@ -2977,17 +3234,11 @@ pub async fn generate_video_deal_window_subtitle(
             Ok(subtitle)
         }
         Err(error) => {
-            reporter
-                .finish(false, &format!("成交窗口逐字稿生成失败: {error}"))
-                .await;
+            let failure = format!("{label}逐字稿生成失败: {error}");
+            reporter.finish(false, &failure).await;
             state
                 .db
-                .update_task(
-                    &event_id,
-                    "failed",
-                    &format!("成交窗口逐字稿生成失败: {error}"),
-                    None,
-                )
+                .update_task(&event_id, "failed", &failure, None)
                 .await?;
             Err(error)
         }
@@ -4202,6 +4453,41 @@ pub async fn queue_deal_auto_clips(
                                 "start": range.start,
                                 "end": range.end,
                             }));
+                            let partial_metadata = json!({
+                                "parent_video_id": parent_video.id,
+                                "range_count": range_count,
+                                "generated_clips": generated_clips,
+                                "failed_clips": failures,
+                            })
+                            .to_string();
+                            let _ = state_clone
+                                .db
+                                .update_task(
+                                    &worker_task_id,
+                                    "processing",
+                                    &format!(
+                                        "已生成 {succeeded}/{range_count} 条完整成交链路视频，后台继续切片"
+                                    ),
+                                    Some(&partial_metadata),
+                                )
+                                .await;
+                            #[cfg(feature = "gui")]
+                            {
+                                let _ = state_clone.app_handle.emit(
+                                    "deal-auto-clip-ready",
+                                    json!({
+                                        "taskId": worker_task_id,
+                                        "parentVideoId": parent_video.id,
+                                        "index": index,
+                                        "videoId": video.id,
+                                        "title": video.title,
+                                        "start": range.start,
+                                        "end": range.end,
+                                        "succeeded": succeeded,
+                                        "rangeCount": range_count,
+                                    }),
+                                );
+                            }
                         }
                         Err(error) => {
                             log::error!("Deal auto clip failed for {}: {error}", range.title);
