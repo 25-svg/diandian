@@ -3,7 +3,7 @@ import {
   friendlyNasError,
   normalizeNasArchiveView,
   type VideoArchiveRow,
-} from "./nasStorage.ts";
+} from "./nasStorage.js";
 
 function archive(status: VideoArchiveRow["status"], lastError = ""): VideoArchiveRow {
   return {

@@ -3,7 +3,10 @@
 
 mod anchor_detection;
 mod audio_utils;
+mod autostart;
+mod compass_analysis;
 mod compass_auto_download;
+mod compass_capture;
 mod config;
 mod constants;
 mod danmu2ass;
@@ -19,6 +22,7 @@ mod knowledge_writer;
 mod live_dashboard_binding;
 mod live_dashboard_download_filter;
 mod live_data_import;
+mod live_transcription;
 mod master_script;
 mod migration;
 mod nas_archive;
@@ -29,6 +33,7 @@ mod security;
 mod state;
 mod static_server;
 mod storage_migration;
+mod storage_readiness;
 mod subtitle_generator;
 mod task;
 #[cfg(feature = "gui")]
@@ -578,6 +583,54 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::live_dashboard::LIVE_DASHBOARD_TIMELINE_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 35,
+            description: "add_recorder_health",
+            sql: database::recorder_health::RECORDER_HEALTH_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 36,
+            description: "add_compass_capture_analysis",
+            sql: database::compass_analysis::COMPASS_ANALYSIS_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 37,
+            description: "add_scenario_training",
+            sql: database::training::TRAINING_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 38,
+            description: "add_recorder_streamer_assignments",
+            sql: database::recorder::RECORDER_STREAMER_ASSIGNMENT_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 39,
+            description: "add_anchor_scoped_knowledge",
+            sql: database::anchor_knowledge::ANCHOR_KNOWLEDGE_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 40,
+            description: "add_record_source_path",
+            sql: database::record::RECORD_SOURCE_PATH_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 41,
+            description: "add_human_machine_scenario_training",
+            sql: database::training::HUMAN_MACHINE_SCENARIO_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 42,
+            description: "add_adaptive_human_machine_turns",
+            sql: database::training::HUMAN_MACHINE_ADAPTIVE_TURNS_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -622,13 +675,17 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
     let config_path = PathBuf::from(&args.config);
     let cache_path = PathBuf::from("./cache");
     let output_path = PathBuf::from("./output");
-    let config = match Config::load(&config_path, &cache_path, &output_path) {
+    let mut config = match Config::load(&config_path, &cache_path, &output_path) {
         Ok(config) => config,
         Err(e) => {
             log::error!("Failed to load config: {e}");
             return Err(e.into());
         }
     };
+    let cache_readiness = storage_readiness::ensure_recording_cache(&mut config)?;
+    if cache_readiness.fell_back {
+        log::warn!("{}", cache_readiness.detail);
+    }
     let config = Arc::new(RwLock::new(config));
     let db = Arc::new(Database::new());
     // connect to sqlite database
@@ -655,7 +712,7 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
 
     db.set(db_pool).await;
     db.configure_sqlite_runtime().await?;
-    db.finish_pending_tasks().await?;
+    let interrupted_tasks = db.finish_pending_tasks().await?;
 
     let progress_manager = Arc::new(ProgressManager::new());
     let emitter = EventEmitter::new(progress_manager.get_event_sender());
@@ -678,6 +735,9 @@ async fn setup_server_state(args: Args) -> Result<State, Box<dyn std::error::Err
         webhook_poster.clone(),
         nas_archive.clone(),
     ));
+    recorder_manager
+        .resume_interrupted_tasks(interrupted_tasks)
+        .await;
     nas_archive.clone().start();
 
     // In headless/Docker, cache and output are served from the API server (API_PORT), so no
@@ -729,13 +789,18 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
     let cache_path = app_dirs.cache_dir.join("cache");
     let output_path = app_dirs.data_dir.join("output");
     log::info!("Loading config from {config_path:?}");
-    let config = match Config::load(&config_path, &cache_path, &output_path) {
+    let mut config = match Config::load(&config_path, &cache_path, &output_path) {
         Ok(config) => config,
         Err(e) => {
             log::error!("Failed to load config, exiting: {e}");
             return Err(e.into());
         }
     };
+
+    let cache_readiness = storage_readiness::ensure_recording_cache(&mut config)?;
+    if cache_readiness.fell_back {
+        log::warn!("{}", cache_readiness.detail);
+    }
 
     let config = Arc::new(RwLock::new(config));
     let config_clone = config.clone();
@@ -750,7 +815,7 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
     };
     db_clone.set(sqlite_pool.unwrap().clone()).await;
     db_clone.configure_sqlite_runtime().await?;
-    db_clone.finish_pending_tasks().await?;
+    let interrupted_tasks = db_clone.finish_pending_tasks().await?;
     let webhook_poster =
         webhook::poster::create_webhook_poster(&config.read().await.webhook_url, None).unwrap();
     let mut task_manager = TaskManager::new();
@@ -773,6 +838,9 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         webhook_poster.clone(),
         nas_archive.clone(),
     ));
+    recorder_manager
+        .resume_interrupted_tasks(interrupted_tasks)
+        .await;
     nas_archive.clone().start();
 
     let static_server = Arc::new(start_static_server(config.clone()).await?);
@@ -866,6 +934,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::config::get_config,
         crate::handlers::config::get_static_port,
         crate::handlers::config::get_storage_migration_status,
+        crate::handlers::config::get_storage_runtime_status,
         crate::handlers::config::set_cache_path,
         crate::handlers::config::set_output_path,
         crate::handlers::config::update_notify,
@@ -885,12 +954,23 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::config::update_powerlive_key,
         crate::handlers::config::test_nas_video_storage,
         crate::handlers::config::update_nas_video_storage,
+        crate::handlers::startup::get_startup_readiness,
+        crate::handlers::startup::update_autostart_enabled,
+        crate::handlers::startup::complete_startup_wizard,
         crate::handlers::knowledge::inspect_knowledge_vault,
         crate::handlers::knowledge::connect_knowledge_vault,
         crate::handlers::knowledge::sync_knowledge_vault,
         crate::handlers::knowledge::get_knowledge_status,
         crate::handlers::knowledge::get_enterprise_product_dictionary,
         crate::handlers::knowledge::open_knowledge_vault,
+        crate::handlers::anchor_knowledge::create_anchor_knowledge_profile,
+        crate::handlers::anchor_knowledge::list_anchor_knowledge_profiles,
+        crate::handlers::anchor_knowledge::create_anchor_knowledge_candidate,
+        crate::handlers::anchor_knowledge::submit_anchor_knowledge_asset,
+        crate::handlers::anchor_knowledge::review_anchor_knowledge_asset,
+        crate::handlers::anchor_knowledge::search_anchor_knowledge,
+        crate::handlers::anchor_knowledge::get_anchor_knowledge_asset,
+        crate::handlers::anchor_knowledge::rebuild_anchor_knowledge_search_index,
         crate::handlers::live_dashboard::import_live_dashboard_xlsx,
         crate::handlers::live_dashboard::list_live_dashboard_sessions,
         crate::handlers::live_dashboard::get_live_dashboard_detail,
@@ -898,7 +978,15 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::live_dashboard::set_live_dashboard_download_dir,
         crate::compass_auto_download::query_compass_live_sessions,
         crate::compass_auto_download::start_compass_live_downloads,
+        crate::compass_auto_download::start_compass_full_capture,
+        crate::compass_auto_download::open_embedded_compass_capture,
+        crate::compass_auto_download::update_embedded_compass_bounds,
+        crate::compass_auto_download::close_embedded_compass,
         crate::compass_auto_download::close_compass_auto_download,
+        crate::compass_capture::list_compass_captures,
+        crate::compass_capture::get_compass_capture_catalog,
+        crate::compass_analysis::analyze_compass_capture,
+        crate::compass_analysis::get_compass_capture_analysis,
         crate::idm_naming_assistant::prepare_idm_download_filename,
         crate::handlers::live_dashboard_binding::resolve_live_dashboard_for_record,
         crate::handlers::live_dashboard_binding::bind_live_dashboard_session,
@@ -907,6 +995,8 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::doudian_orders::import_raw_doudian_payment_events,
         crate::handlers::doudian_orders::get_doudian_order_config,
         crate::handlers::doudian_orders::update_doudian_order_config,
+        crate::handlers::review_pipeline::retry_auto_review_pipeline,
+        crate::handlers::review_pipeline::get_auto_review_payment_events,
         crate::handlers::master_script::start_master_ingest,
         crate::handlers::master_script::create_master_sample_batch,
         crate::handlers::master_script::list_master_sample_batches,
@@ -936,6 +1026,9 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::message::read_message,
         crate::handlers::message::delete_message,
         crate::handlers::recorder::get_recorder_list,
+        crate::handlers::recorder::get_recorder_health,
+        crate::handlers::recorder::get_known_streamer_names,
+        crate::handlers::recorder::set_room_streamer,
         crate::handlers::recorder::add_recorder,
         crate::handlers::recorder::remove_recorder,
         crate::handlers::recorder::get_room_info,
@@ -971,6 +1064,16 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::review_sample::seed_builtin_review_samples,
         crate::handlers::review_sample::save_review_sample,
         crate::handlers::review_sample::delete_review_sample,
+        crate::handlers::training::list_training_roles,
+        crate::handlers::training::start_training_session,
+        crate::handlers::training::submit_training_answer,
+        crate::handlers::training::next_training_question,
+        crate::handlers::training::complete_training_session,
+        crate::handlers::training::abandon_training_session,
+        crate::handlers::training::start_human_machine_scenario,
+        crate::handlers::training::submit_human_machine_turn,
+        crate::handlers::training::get_active_human_machine_scenario,
+        crate::handlers::training::abandon_human_machine_scenario,
         crate::handlers::video::clip_range,
         crate::handlers::video::upload_procedure,
         crate::handlers::video::cancel,
@@ -1070,9 +1173,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     builder
         .setup(|app| {
+            crate::compass_capture::register_compass_capture_listeners(app.handle());
             tauri::async_runtime::block_on(async {
                 let state = setup_app_state(app).await?;
                 let _ = tray::create_tray(app.handle());
+                let autostart_enabled = state.config.read().await.autostart_enabled;
+                let autostart_result = crate::autostart::set_enabled(autostart_enabled);
+                if let Err(error) = autostart_result {
+                    log::warn!("Unable to apply Windows autostart preference: {error}");
+                }
+                if std::env::args().any(|argument| argument == "--minimized") {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
 
                 // check ffmpeg status
                 match ffmpeg::check_ffmpeg().await {
@@ -1082,6 +1196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let resume_state = state.clone();
                 let live_dashboard_state = state.clone();
+                let review_pipeline_state = state.clone();
                 app.manage(state);
                 tauri::async_runtime::spawn(async move {
                     crate::handlers::master_script::resume_processing_master_sample_batches(
@@ -1092,6 +1207,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tauri::async_runtime::spawn(async move {
                     crate::handlers::live_dashboard::start_live_dashboard_download_poller(
                         live_dashboard_state,
+                    )
+                    .await;
+                });
+                tauri::async_runtime::spawn(async move {
+                    crate::handlers::review_pipeline::start_auto_review_pipeline(
+                        review_pipeline_state,
                     )
                     .await;
                 });

@@ -27,13 +27,17 @@ assert.equal(top.length, 2);
 assert.match(top[0]?.name ?? "", /70-200/i);
 assert.equal(top[0]?.mentionCount, 2);
 assert.equal(top[0]?.orderCount, 2);
+assert.equal(top[0]?.metric, "mention");
 assert.match(top[1]?.name ?? "", /35mm/i);
 assert.equal(top[1]?.mentionCount, 1);
 assert.equal(top[1]?.orderCount, 1);
-assert.deepEqual(extractLiveTopProducts([], events), []);
-assert.deepEqual(extractLiveTopProducts(entries, []), []);
+assert.deepEqual(extractLiveTopProducts([], []), []);
 assert.equal(extractLiveTopProducts(entries, events, 1).length, 1);
 assert.equal(cleanLiveProductName("99新 Sony/索尼 FE 70-200mm"), "Sony/索尼 FE 70-200mm");
+assert.equal(
+  cleanLiveProductName("【金典拍拍】99新 Sony/索尼 FE 70-200mm"),
+  "Sony/索尼 FE 70-200mm",
+);
 const catalog = buildLiveProductCatalog(events);
 assert.equal(catalog.length, 3);
 assert.ok(catalog.every((product) => product.aliases.length > 0));
@@ -47,5 +51,26 @@ const ambiguousCatalog = buildLiveProductCatalog([
   { offsetSec: 2, payAmountFen: 1, productName: "98新 索尼 FE 35mm F1.8" },
 ]);
 assert.ok(ambiguousCatalog.every((product) => !product.aliases.includes("35")));
+
+const noMentionEntries: WorkspaceTranscriptEntry[] = [
+  { id: 1, start: 0, end: 10, text: "家人们今天福利特别多，喜欢的扣一" },
+];
+const fallback = extractLiveTopProducts(noMentionEntries, events);
+assert.equal(fallback.length, 3);
+assert.equal(fallback[0]?.metric, "order");
+assert.equal(fallback[0]?.orderCount, 2);
+assert.match(fallback[0]?.name ?? "", /70-200/i);
+
+const brandHit = extractLiveTopProducts(
+  [{ id: 1, start: 0, end: 5, text: "这台索尼70200今天特价" }],
+  [{ offsetSec: 1, payAmountFen: 1, productName: "99新 Sony/索尼 FE 70-200mm F/2.8 GM 二代" }],
+);
+assert.equal(brandHit.length, 1);
+assert.equal(brandHit[0]?.metric, "mention");
+assert.ok((brandHit[0]?.mentionCount ?? 0) >= 1);
+
+const orderOnly = extractLiveTopProducts([], events);
+assert.equal(orderOnly.length, 3);
+assert.ok(orderOnly.every((product) => product.metric === "order"));
 
 console.log("live top products tests passed");

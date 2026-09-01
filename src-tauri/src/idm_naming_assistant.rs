@@ -3,7 +3,6 @@ use regex::Regex;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "gui")]
 use crate::state::State;
 use crate::state_type;
 #[cfg(feature = "gui")]
@@ -55,7 +54,10 @@ fn is_canonical_idm_video_stem(stem: &str) -> bool {
     ["金典拍拍科创专卖店", "金典拍拍相机专卖店"]
         .into_iter()
         .any(|shop| {
-            let Some(rest) = stem.strip_prefix(shop).and_then(|value| value.strip_prefix('_')) else {
+            let Some(rest) = stem
+                .strip_prefix(shop)
+                .and_then(|value| value.strip_prefix('_'))
+            else {
                 return false;
             };
             if is_timestamp_stem(rest) {
@@ -67,34 +69,51 @@ fn is_canonical_idm_video_stem(stem: &str) -> bool {
         })
 }
 
+const COMPASS_SHOPS: [&str; 2] = ["金典拍拍科创专卖店", "金典拍拍相机专卖店"];
+
 pub fn parse_compass_page_base_name(text: &str) -> Option<String> {
-    let shop = ["金典拍拍科创专卖店", "金典拍拍相机专卖店"]
-        .into_iter()
-        .find(|candidate| text.contains(candidate))?;
     let timestamp = parse_compass_start_timestamp(text)?;
+    let shop = pick_shop_near_start_time(text)?;
     match parse_compass_anchor_name(text, shop) {
         Some(anchor) => Some(format!("{shop}_{anchor}_{timestamp}")),
         None => Some(format!("{shop}_{timestamp}")),
     }
 }
 
+fn pick_shop_near_start_time(text: &str) -> Option<&'static str> {
+    let time_pos = text.find("开播时间")?;
+    let mut best: Option<(&'static str, usize)> = None;
+    for shop in COMPASS_SHOPS {
+        let mut from = 0;
+        while let Some(relative) = text[from..].find(shop) {
+            let pos = from + relative;
+            let distance = pos.abs_diff(time_pos);
+            if best.map_or(true, |(_, best_distance)| distance < best_distance) {
+                best = Some((shop, distance));
+            }
+            from = pos + shop.len();
+        }
+    }
+    best.map(|(shop, _)| shop)
+}
+
 fn parse_compass_start_timestamp(text: &str) -> Option<String> {
     let labeled = Regex::new(
-        r"开播时间[:：]?\s*(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2})",
+        r"开播时间[:：]?\s*(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2})(?:[:：](\d{1,2}))?",
     )
     .ok()?;
-    let captures = labeled.captures(text).or_else(|| {
-        Regex::new(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2})")
-            .ok()?
-            .captures(text)
-    })?;
+    let captures = labeled.captures(text)?;
     let year = captures.get(1)?.as_str();
     let month = captures.get(2)?.as_str().parse::<u32>().ok()?;
     let day = captures.get(3)?.as_str().parse::<u32>().ok()?;
     let hour = captures.get(4)?.as_str().parse::<u32>().ok()?;
     let minute = captures.get(5)?.as_str().parse::<u32>().ok()?;
+    let second = captures
+        .get(6)
+        .and_then(|value| value.as_str().parse::<u32>().ok())
+        .unwrap_or(0);
     Some(format!(
-        "{year}-{month:02}-{day:02}_{hour:02}-{minute:02}-00"
+        "{year}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}"
     ))
 }
 
@@ -188,15 +207,15 @@ mod windows_idm {
 
     fn looks_like_compass_window(hwnd: HWND) -> bool {
         let title = window_text(hwnd);
-        let class = class_name(hwnd);
+        if title.contains("典典直播切片") || title.contains("bili-shadowreplay") {
+            return false;
+        }
         title.contains("罗盘")
             || title.contains("直播大屏")
             || title.contains("抖音电商")
-            || title.contains("金典拍拍")
-            || title.to_ascii_lowercase().contains("compass")
-            || class.contains("Chrome")
-            || class.contains("Mozilla")
-            || class.eq_ignore_ascii_case("ApplicationFrameWindow")
+            || title.contains("巨量引擎")
+            || title.contains("BSR_COMPASS")
+            || title.to_ascii_lowercase().contains("compass.jinritemai")
     }
 
     fn looks_like_idm_dialog(hwnd: HWND) -> bool {
@@ -305,6 +324,20 @@ mod windows_idm {
         }
     }
 
+    fn compass_page_score(text: &str) -> i32 {
+        let mut score = 0;
+        if text.contains("开播时间") {
+            score += 10;
+        }
+        if text.contains("下载该视频") || text.contains("下载视频") {
+            score += 5;
+        }
+        if super::COMPASS_SHOPS.iter().any(|shop| text.contains(shop)) {
+            score += 3;
+        }
+        score
+    }
+
     pub(super) fn scrape_compass_page_text() -> String {
         let mut windows = Vec::<HWND>::new();
         unsafe {
@@ -313,7 +346,8 @@ mod windows_idm {
                 LPARAM((&mut windows as *mut Vec<HWND>) as isize),
             );
         }
-        let mut chunks = Vec::new();
+        let mut best = String::new();
+        let mut best_score = 0;
         for hwnd in windows {
             if !looks_like_compass_window(hwnd) {
                 continue;
@@ -321,10 +355,16 @@ mod windows_idm {
             unsafe {
                 let _ = SendMessageW(hwnd, WM_GETOBJECT, None, Some(LPARAM(-4)));
             }
-            chunks.extend(collect_win32_texts(hwnd));
+            let mut chunks = collect_win32_texts(hwnd);
             chunks.extend(collect_uia_texts(hwnd));
+            let text = chunks.join("\n");
+            let score = compass_page_score(&text);
+            if score > best_score {
+                best_score = score;
+                best = text;
+            }
         }
-        chunks.join("\n")
+        best
     }
 
     pub fn apply_compass_page_name_to_idm_dialog() -> Option<String> {
@@ -378,12 +418,7 @@ mod windows_idm {
         let mut wide = value.encode_utf16().collect::<Vec<_>>();
         wide.push(0);
         unsafe {
-            SendMessageW(
-                hwnd,
-                WM_SETTEXT,
-                None,
-                Some(LPARAM(wide.as_ptr() as isize)),
-            );
+            SendMessageW(hwnd, WM_SETTEXT, None, Some(LPARAM(wide.as_ptr() as isize)));
         }
         window_text(hwnd) == value
     }
@@ -435,7 +470,10 @@ mod windows_idm {
                 }
                 let requested = requested_save_path(std::path::Path::new(&current), base_name);
                 let requested_text = requested.to_string_lossy().to_string();
-                if pattern.SetValue(&BSTR::from(requested_text.as_str())).is_ok() {
+                if pattern
+                    .SetValue(&BSTR::from(requested_text.as_str()))
+                    .is_ok()
+                {
                     return Some(requested_text);
                 }
             }
@@ -527,7 +565,9 @@ fn rename_new_download_to_canonical(
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         if modified + std::time::Duration::from_secs(15) < armed_at {
             continue;
         }
@@ -578,7 +618,12 @@ pub async fn prepare_idm_download_filename(
     {
         use tauri::Emitter;
         let app = state.app_handle.clone();
-        let download_dir = state.config.read().await.live_dashboard_download_dir.clone();
+        let download_dir = state
+            .config
+            .read()
+            .await
+            .live_dashboard_download_dir
+            .clone();
         let generation = WATCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let armed_at = std::time::SystemTime::now();
         std::thread::spawn(move || {
@@ -594,9 +639,12 @@ pub async fn prepare_idm_download_filename(
                     );
                     return;
                 }
-                if let Some(path) =
-                    rename_new_download_to_canonical(&download_dir, &base_name, armed_at, &mut last_sizes)
-                {
+                if let Some(path) = rename_new_download_to_canonical(
+                    &download_dir,
+                    &base_name,
+                    armed_at,
+                    &mut last_sizes,
+                ) {
                     let _ = app.emit(
                         "idm-download-name-applied",
                         serde_json::json!({ "path": path, "baseName": base_name }),
@@ -658,9 +706,12 @@ pub fn start_idm_compass_rename_watcher() {
                 }
             }
             if !last_dir.is_empty() && !last_base.is_empty() {
-                if let Some(path) =
-                    rename_new_download_to_canonical(&last_dir, &last_base, armed_at, &mut last_sizes)
-                {
+                if let Some(path) = rename_new_download_to_canonical(
+                    &last_dir,
+                    &last_base,
+                    armed_at,
+                    &mut last_sizes,
+                ) {
                     log::info!("IDM 下载文件已按规范改名：{path}");
                 }
             }
@@ -716,5 +767,20 @@ mod tests {
             parse_compass_page_base_name(no_anchor).as_deref(),
             Some("金典拍拍相机专卖店_2026-08-12_09-00-00")
         );
+    }
+
+    #[test]
+    fn uses_shop_next_to_start_time_instead_of_the_first_hardcoded_shop() {
+        let page = "店铺切换\n金典拍拍科创专卖店\n金典拍拍相机专卖店微单相机专场\n开播时间 2026/08/04 20:58 开播\n下载该视频";
+        assert_eq!(
+            parse_compass_page_base_name(page).as_deref(),
+            Some("金典拍拍相机专卖店_2026-08-04_20-58-00")
+        );
+    }
+
+    #[test]
+    fn ignores_calendar_dates_without_start_time_label() {
+        let page = "金典拍拍相机专卖店\n2026/08/01 09:00\n直播列表";
+        assert_eq!(parse_compass_page_base_name(page), None);
     }
 }

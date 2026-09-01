@@ -2,7 +2,9 @@ export type PaymentEvent = {
   offsetSec: number;
   payAmountFen: number | null;
   productName?: string;
+  productId?: string;
   orderId?: string;
+  orderStatus?: string;
   /** Masked receiver / nick for streamer review, e.g. "张*". */
   buyerLabel?: string;
 };
@@ -11,6 +13,21 @@ export type PaymentEventsSummary = {
   eventCount: number;
   totalPayAmountYuan: number;
   liveStartedAt?: string;
+  shopId?: string;
+  shopName?: string;
+  expectedEventCount?: number;
+  expectedPayAmountYuan?: number;
+  candidateEventCount?: number;
+  candidateTotalPayAmountYuan?: number;
+  currentValidEventCount?: number;
+  currentValidAmountYuan?: number;
+  closedOrRefundedEventCount?: number;
+  closedOrRefundedAmountYuan?: number;
+  attributedClosedOrRefundedEventCount?: number;
+  attributedClosedOrRefundedAmountYuan?: number;
+  unmatchedEventCount?: number;
+  unmatchedAmountYuan?: number;
+  confidence?: string;
 };
 
 export type PaymentEventsBundle = {
@@ -87,7 +104,9 @@ function normalizePaymentEvent(raw: unknown): PaymentEvent | null {
     offsetSec,
     payAmountFen: payAmountFen == null ? null : Math.max(0, Math.trunc(payAmountFen)),
     productName: readString(record.product_name ?? record.productName) || undefined,
+    productId: readString(record.product_id ?? record.productId) || undefined,
     orderId: readString(record.order_id ?? record.orderId) || undefined,
+    orderStatus: readString(record.order_status ?? record.orderStatus) || undefined,
     buyerLabel: readString(
       record.buyer_label
         ?? record.buyerLabel
@@ -125,6 +144,47 @@ export function parsePaymentEventsPayload(raw: unknown): PaymentEventsBundle | n
           summaryRecord.total_pay_amount_yuan ?? summaryRecord.totalPayAmountYuan,
         ) ?? roundYuan(events.reduce((total, event) => total + (event.payAmountFen ?? 0), 0)),
         liveStartedAt: readString(summaryRecord.live_started_at ?? summaryRecord.liveStartedAt) || undefined,
+        shopId: readString(summaryRecord.shop_id ?? summaryRecord.shopId) || undefined,
+        shopName: readString(summaryRecord.shop_name ?? summaryRecord.shopName) || undefined,
+        expectedEventCount: readNumber(
+          summaryRecord.expected_event_count ?? summaryRecord.expectedEventCount,
+        ) ?? undefined,
+        expectedPayAmountYuan: readNumber(
+          summaryRecord.expected_pay_amount_yuan ?? summaryRecord.expectedPayAmountYuan,
+        ) ?? undefined,
+        candidateEventCount: readNumber(
+          summaryRecord.candidate_event_count ?? summaryRecord.candidateEventCount,
+        ) ?? undefined,
+        candidateTotalPayAmountYuan: readNumber(
+          summaryRecord.candidate_total_pay_amount_yuan ?? summaryRecord.candidateTotalPayAmountYuan,
+        ) ?? undefined,
+        currentValidEventCount: readNumber(
+          summaryRecord.current_valid_event_count ?? summaryRecord.currentValidEventCount,
+        ) ?? undefined,
+        currentValidAmountYuan: readNumber(
+          summaryRecord.current_valid_amount_yuan ?? summaryRecord.currentValidAmountYuan,
+        ) ?? undefined,
+        closedOrRefundedEventCount: readNumber(
+          summaryRecord.closed_or_refunded_event_count ?? summaryRecord.closedOrRefundedEventCount,
+        ) ?? undefined,
+        closedOrRefundedAmountYuan: readNumber(
+          summaryRecord.closed_or_refunded_amount_yuan ?? summaryRecord.closedOrRefundedAmountYuan,
+        ) ?? undefined,
+        attributedClosedOrRefundedEventCount: readNumber(
+          summaryRecord.attributed_closed_or_refunded_event_count
+            ?? summaryRecord.attributedClosedOrRefundedEventCount,
+        ) ?? undefined,
+        attributedClosedOrRefundedAmountYuan: readNumber(
+          summaryRecord.attributed_closed_or_refunded_amount_yuan
+            ?? summaryRecord.attributedClosedOrRefundedAmountYuan,
+        ) ?? undefined,
+        unmatchedEventCount: readNumber(
+          summaryRecord.unmatched_event_count ?? summaryRecord.unmatchedEventCount,
+        ) ?? undefined,
+        unmatchedAmountYuan: readNumber(
+          summaryRecord.unmatched_amount_yuan ?? summaryRecord.unmatchedAmountYuan,
+        ) ?? undefined,
+        confidence: readString(summaryRecord.confidence) || undefined,
       }
     : summarizePaymentEvents(events);
 
@@ -303,6 +363,10 @@ export function buildPeakDealMinuteLabel(buckets: readonly DealMinuteBucket[]): 
 
 export function paymentEventsStorageKey(sourceKey: string): string {
   return `bsr:payment-events:v1:${sourceKey}`;
+}
+
+export function paymentEventsHistoryStorageKey(sourceKey: string): string {
+  return `bsr:payment-events-history:v1:${sourceKey}`;
 }
 
 /** Stable list row key: orderId alone is not unique in real order.searchList exports. */

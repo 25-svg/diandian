@@ -79,6 +79,10 @@ impl Default for DoudianOrderConfig {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
     pub cache: String,
+    /// User-selected cache target. Runtime recording must stop when this path
+    /// is unavailable; it must never fall back to a local recording directory.
+    #[serde(skip)]
+    pub preferred_cache: String,
     pub output: String,
     pub live_start_notify: bool,
     pub live_end_notify: bool,
@@ -138,6 +142,10 @@ pub struct Config {
     pub auto_download_enabled: bool,
     #[serde(default)]
     pub doudian_order: DoudianOrderConfig,
+    #[serde(default = "default_autostart_enabled")]
+    pub autostart_enabled: bool,
+    #[serde(default)]
+    pub startup_wizard_completed: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -220,6 +228,10 @@ fn default_live_dashboard_download_dir() -> String {
         .unwrap_or_default()
 }
 
+fn default_autostart_enabled() -> bool {
+    true
+}
+
 impl Config {
     pub fn load(
         config_path: &PathBuf,
@@ -229,6 +241,7 @@ impl Config {
         if let Ok(content) = std::fs::read_to_string(config_path) {
             if let Ok(mut config) = toml::from_str::<Config>(&content) {
                 config.config_path = config_path.to_str().unwrap().into();
+                config.preferred_cache = config.cache.clone();
                 config.update_interval = Arc::new(AtomicU64::new(config.status_check_interval));
                 if config.volcengine_resource_id.trim().is_empty()
                     || config.volcengine_resource_id == "volc.bigasr.auc_turbo"
@@ -249,6 +262,7 @@ impl Config {
 
         let config = Config {
             cache: default_cache.to_str().unwrap().into(),
+            preferred_cache: default_cache.to_str().unwrap().into(),
             output: default_output.to_str().unwrap().into(),
             live_start_notify: true,
             live_end_notify: true,
@@ -281,6 +295,8 @@ impl Config {
             live_dashboard_download_dir: default_live_dashboard_download_dir(),
             auto_download_enabled: false,
             doudian_order: DoudianOrderConfig::default(),
+            autostart_enabled: default_autostart_enabled(),
+            startup_wizard_completed: false,
         };
 
         config.save();
@@ -289,15 +305,32 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let content = toml::to_string(&self).unwrap();
+        let mut persisted = self.clone();
+        if !persisted.preferred_cache.trim().is_empty() {
+            persisted.cache = persisted.preferred_cache.clone();
+        }
+        let content = toml::to_string(&persisted).unwrap();
         if let Err(e) = std::fs::write(self.config_path.clone(), content) {
             log::error!("Failed to save config: {} {}", e, self.config_path);
         }
     }
 
+    pub fn preferred_cache_path(&self) -> &str {
+        if self.preferred_cache.trim().is_empty() {
+            &self.cache
+        } else {
+            &self.preferred_cache
+        }
+    }
+
+    pub fn set_runtime_cache_path(&mut self, path: &str) {
+        self.cache = path.to_string();
+    }
+
     #[allow(dead_code)]
     pub fn set_cache_path(&mut self, path: &str) {
         self.cache = path.to_string();
+        self.preferred_cache = path.to_string();
         self.save();
     }
 

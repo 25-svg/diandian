@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::danmu2ass;
 use crate::database::record::RecordRow;
 use crate::database::recorder::RecorderRow;
+use crate::database::task::TaskRow;
 use crate::database::video::VideoRow;
 use crate::database::{Database, DatabaseError};
 use crate::ffmpeg::{encode_video_danmu, transcode, Range};
@@ -11,7 +12,7 @@ use crate::subtitle_generator::{item_to_srt, GenerateResult, SubtitleGeneratorTy
 use crate::task::{Task, TaskManager, TaskPriority};
 use crate::webhook::events::{self, Payload};
 use crate::webhook::poster::WebhookPoster;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use m3u8_rs::{MediaPlaylist, MediaPlaylistType, Playlist};
 use recorder::account::Account;
 use recorder::danmu::{DanmuEntry, DanmuStorage};
@@ -33,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 #[cfg(feature = "gui")]
 use tauri_plugin_notification::NotificationExt;
 use thiserror::Error;
@@ -52,6 +54,227 @@ async fn clone_lock_value<T: Clone>(lock: &RwLock<T>) -> T {
 pub struct RecorderList {
     pub count: usize,
     pub recorders: Vec<RecorderInfo>,
+}
+
+const RECORDING_START_ERROR_CODE: &str = "REC-LIVE-NOT-RECORDING";
+const RECORDING_FILE_STALLED_ERROR_CODE: &str = "REC-FILE-NOT-GROWING";
+const RECORDER_INIT_ERROR_CODE: &str = "REC-INITIALIZE-FAILED";
+const RECORDER_LOGIN_ERROR_CODE: &str = "REC-LOGIN-REQUIRED";
+const RECORDING_STALL_CHECKS: u8 = 9;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingGrowthState {
+    live_id: String,
+    last_size: u64,
+    unchanged_checks: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingGrowthDecision {
+    Starting,
+    Growing,
+    Stalled,
+}
+
+fn evaluate_recording_growth(
+    previous: Option<&RecordingGrowthState>,
+    live_id: &str,
+    current_size: u64,
+) -> (RecordingGrowthState, RecordingGrowthDecision) {
+    let mut state = match previous {
+        Some(previous) if previous.live_id == live_id => previous.clone(),
+        _ => RecordingGrowthState {
+            live_id: live_id.to_string(),
+            last_size: current_size,
+            unchanged_checks: 0,
+        },
+    };
+
+    if previous.map(|item| item.live_id.as_str()) != Some(live_id) {
+        return (state, RecordingGrowthDecision::Starting);
+    }
+
+    if current_size != state.last_size {
+        state.last_size = current_size;
+        state.unchanged_checks = 0;
+        return (state, RecordingGrowthDecision::Growing);
+    }
+
+    state.unchanged_checks = state.unchanged_checks.saturating_add(1);
+    if state.unchanged_checks >= RECORDING_STALL_CHECKS {
+        return (state, RecordingGrowthDecision::Stalled);
+    }
+    if state.last_size == 0 {
+        (state, RecordingGrowthDecision::Starting)
+    } else {
+        (state, RecordingGrowthDecision::Growing)
+    }
+}
+
+fn retry_delay(completed_retries: u8) -> Option<Duration> {
+    [60, 300, 1800]
+        .get(completed_retries as usize)
+        .copied()
+        .map(Duration::from_secs)
+}
+
+fn retry_timestamp(delay: Duration) -> String {
+    (Utc::now() + chrono::Duration::seconds(delay.as_secs() as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+#[derive(Debug, Clone)]
+struct RetryState {
+    completed_retries: u8,
+    next_retry_at: Instant,
+    terminal: bool,
+}
+
+impl RetryState {
+    fn first_failure(now: Instant) -> Self {
+        Self {
+            completed_retries: 0,
+            next_retry_at: now + retry_delay(0).expect("first retry delay"),
+            terminal: false,
+        }
+    }
+
+    fn after_failed_retry(&mut self, now: Instant) -> Option<Duration> {
+        self.completed_retries = self.completed_retries.saturating_add(1);
+        let Some(delay) = retry_delay(self.completed_retries) else {
+            self.terminal = true;
+            return None;
+        };
+        self.next_retry_at = now + delay;
+        Some(delay)
+    }
+}
+
+#[cfg(test)]
+mod recorder_retry_tests {
+    use super::{
+        evaluate_recording_growth, retry_delay, RecorderManager, RecordingGrowthDecision,
+        RecordingGrowthState, RetryState, RECORDING_STALL_CHECKS,
+    };
+    use recorder::platforms::PlatformType;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn recording_start_retry_schedule_is_one_five_thirty_minutes() {
+        assert_eq!(retry_delay(0), Some(Duration::from_secs(60)));
+        assert_eq!(retry_delay(1), Some(Duration::from_secs(300)));
+        assert_eq!(retry_delay(2), Some(Duration::from_secs(1800)));
+        assert_eq!(retry_delay(3), None);
+    }
+
+    #[test]
+    fn retry_state_becomes_terminal_after_three_retries() {
+        let now = Instant::now();
+        let mut state = RetryState::first_failure(now);
+        assert_eq!(state.completed_retries, 0);
+        assert_eq!(
+            state.after_failed_retry(now),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            state.after_failed_retry(now),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(state.after_failed_retry(now), None);
+        assert_eq!(state.completed_retries, 3);
+        assert!(state.terminal);
+    }
+
+    #[tokio::test]
+    async fn discovers_legacy_archive_one_level_below_cache_root() {
+        let root =
+            std::env::temp_dir().join(format!("bsr-legacy-archive-path-{}", uuid::Uuid::new_v4()));
+        let expected = root
+            .join("直播大屏·专业版")
+            .join("douyin")
+            .join("room-1")
+            .join("live-1");
+        std::fs::create_dir_all(&expected).unwrap();
+
+        let found = RecorderManager::first_archive_dir_below(
+            &root,
+            PlatformType::Douyin,
+            "room-1",
+            "live-1",
+        )
+        .await;
+
+        assert_eq!(found, Some(expected));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recording_is_only_confirmed_after_bytes_change() {
+        let (starting, decision) = evaluate_recording_growth(None, "live-1", 0);
+        assert_eq!(decision, RecordingGrowthDecision::Starting);
+
+        let (growing, decision) = evaluate_recording_growth(Some(&starting), "live-1", 2048);
+        assert_eq!(decision, RecordingGrowthDecision::Growing);
+        assert_eq!(growing.last_size, 2048);
+    }
+
+    #[test]
+    fn unchanged_recording_is_marked_stalled_after_grace_period() {
+        let mut state = RecordingGrowthState {
+            live_id: "live-1".to_string(),
+            last_size: 2048,
+            unchanged_checks: 0,
+        };
+        let mut decision = RecordingGrowthDecision::Growing;
+        for _ in 0..RECORDING_STALL_CHECKS {
+            (state, decision) = evaluate_recording_growth(Some(&state), "live-1", 2048);
+        }
+        assert_eq!(decision, RecordingGrowthDecision::Stalled);
+    }
+}
+
+#[cfg(test)]
+mod playback_playlist_tests {
+    use super::RecorderManager;
+    use m3u8_rs::MediaPlaylistType;
+
+    fn invalid_douyin_playlist() -> m3u8_rs::MediaPlaylist {
+        let source = b"#EXTM3U\n#EXT-X-TARGETDURATION:0\n#EXTINF:3.999667,\nsegment-1.ts\n";
+        m3u8_rs::parse_media_playlist(source)
+            .expect("playlist should parse")
+            .1
+    }
+
+    #[test]
+    fn playback_manifest_repairs_zero_target_duration() {
+        let mut playlist = invalid_douyin_playlist();
+
+        RecorderManager::prepare_playlist_for_playback(&mut playlist, false);
+
+        assert_eq!(playlist.target_duration, 4.0);
+        assert!(!playlist.end_list);
+    }
+
+    #[test]
+    fn finished_playback_manifest_is_served_as_vod() {
+        let mut playlist = invalid_douyin_playlist();
+
+        RecorderManager::prepare_playlist_for_playback(&mut playlist, true);
+
+        assert_eq!(playlist.target_duration, 4.0);
+        assert!(playlist.end_list);
+        assert_eq!(playlist.playlist_type, Some(MediaPlaylistType::Vod));
+
+        let mut bytes = Vec::new();
+        playlist
+            .write_to(&mut bytes)
+            .expect("playlist should serialize");
+        let rendered = String::from_utf8(bytes).expect("playlist should be UTF-8");
+        assert!(rendered.contains("#EXT-X-TARGETDURATION:4"));
+        assert!(rendered.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(rendered.contains("#EXT-X-ENDLIST"));
+    }
 }
 
 async fn remove_archive_cache_dir(path: &Path) -> Result<(), RecorderManagerError> {
@@ -461,10 +684,15 @@ pub struct RecorderManager {
     task_manager: Arc<TaskManager>,
     recorders: Arc<RwLock<HashMap<String, RecorderType>>>,
     to_remove: Arc<RwLock<HashSet<String>>>,
+    initialization_retries: Arc<RwLock<HashMap<String, RetryState>>>,
+    live_start_retries: Arc<RwLock<HashMap<String, RetryState>>>,
+    recording_stall_retries: Arc<RwLock<HashMap<String, RetryState>>>,
+    recording_growth: Arc<RwLock<HashMap<String, RecordingGrowthState>>>,
     event_tx: broadcast::Sender<RecorderEvent>,
     is_migrating: Arc<AtomicBool>,
     subtitle_generation_locks: Arc<ArchiveSubtitleLocks>,
     media_execution_gate: Arc<Semaphore>,
+    live_transcription: crate::live_transcription::LiveTranscriptionCoordinator,
     webhook_poster: WebhookPoster,
     nas_archive: Arc<crate::nas_archive::NasArchiveService>,
 }
@@ -510,6 +738,161 @@ impl From<RecorderManagerError> for String {
 }
 
 impl RecorderManager {
+    fn archive_dir_under_root(
+        root: &Path,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> PathBuf {
+        root.join(platform.as_str()).join(room_id).join(live_id)
+    }
+
+    async fn first_archive_dir_below(
+        container: &Path,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> Option<PathBuf> {
+        let mut entries = tokio::fs::read_dir(container).await.ok()?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let candidate = Self::archive_dir_under_root(&entry.path(), platform, room_id, live_id);
+            if tokio::fs::metadata(&candidate)
+                .await
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    async fn persist_archive_source_path(&self, room_id: &str, live_id: &str, archive_dir: &Path) {
+        if let Err(error) = self
+            .db
+            .update_record_source_path(room_id, live_id, &archive_dir.to_string_lossy())
+            .await
+        {
+            log::warn!("Failed to remember archive source path for {room_id}:{live_id}: {error}");
+        }
+    }
+
+    /// Resolve an archive independently from the currently selected cache root.
+    ///
+    /// New recordings remember their concrete directory. Legacy recordings are
+    /// recovered from the active/preferred cache, the application default cache,
+    /// or one level below/sibling to those roots. The successful legacy match is
+    /// persisted so later playback, clipping and transcription do not rescan.
+    pub async fn resolve_archive_dir(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> PathBuf {
+        let config = self.config.read().await;
+        let active_root = PathBuf::from(&config.cache);
+        let preferred_root = PathBuf::from(config.preferred_cache_path());
+        drop(config);
+
+        if let Ok(record) = self.db.get_record(room_id, live_id).await {
+            if !record.source_path.trim().is_empty() {
+                let remembered = PathBuf::from(record.source_path.trim());
+                if tokio::fs::metadata(&remembered)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+                {
+                    return remembered;
+                }
+            }
+        }
+
+        let mut roots = vec![active_root.clone(), preferred_root];
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let appdata = PathBuf::from(appdata);
+            roots.push(
+                appdata
+                    .join("cn.vjoi.bili-shadowreplay")
+                    .join("recording-cache"),
+            );
+            roots.push(
+                appdata
+                    .join("cn.vjoi.bilishadowreplay")
+                    .join("recording-cache"),
+            );
+        }
+        roots.dedup();
+
+        for root in &roots {
+            let candidate = Self::archive_dir_under_root(root, platform, room_id, live_id);
+            if tokio::fs::metadata(&candidate)
+                .await
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
+                self.persist_archive_source_path(room_id, live_id, &candidate)
+                    .await;
+                return candidate;
+            }
+        }
+
+        let mut containers = Vec::new();
+        for root in &roots {
+            containers.push(root.clone());
+            if let Some(parent) = root.parent() {
+                containers.push(parent.to_path_buf());
+            }
+        }
+        containers.dedup();
+        for container in containers {
+            if let Some(candidate) =
+                Self::first_archive_dir_below(&container, platform, room_id, live_id).await
+            {
+                log::info!(
+                    "Recovered legacy archive source path for {room_id}:{live_id}: {}",
+                    candidate.display()
+                );
+                self.persist_archive_source_path(room_id, live_id, &candidate)
+                    .await;
+                return candidate;
+            }
+        }
+
+        Self::archive_dir_under_root(&active_root, platform, room_id, live_id)
+    }
+
+    async fn remember_current_archive_dir(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) {
+        let cache = self.config.read().await.cache.clone();
+        let archive_dir =
+            Self::archive_dir_under_root(Path::new(&cache), platform, room_id, live_id);
+        self.persist_archive_source_path(room_id, live_id, &archive_dir)
+            .await;
+    }
+
+    async fn resolve_archive_cache_path(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> CachePath {
+        let archive_dir = self.resolve_archive_dir(platform, room_id, live_id).await;
+        let root = archive_dir
+            .ancestors()
+            .nth(3)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| archive_dir.clone());
+        CachePath::new(root, platform, room_id, live_id)
+    }
+
     pub fn new(
         #[cfg(not(feature = "headless"))] app_handle: AppHandle,
         emitter: EventEmitter,
@@ -526,14 +909,21 @@ impl RecorderManager {
             app_handle,
             emitter,
             db,
-            config,
+            config: config.clone(),
             task_manager,
             recorders: Arc::new(RwLock::new(HashMap::new())),
             to_remove: Arc::new(RwLock::new(HashSet::new())),
+            initialization_retries: Arc::new(RwLock::new(HashMap::new())),
+            live_start_retries: Arc::new(RwLock::new(HashMap::new())),
+            recording_stall_retries: Arc::new(RwLock::new(HashMap::new())),
+            recording_growth: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             is_migrating: Arc::new(AtomicBool::new(false)),
             subtitle_generation_locks: Arc::new(Mutex::new(HashMap::new())),
             media_execution_gate,
+            live_transcription: crate::live_transcription::LiveTranscriptionCoordinator::new(
+                config.clone(),
+            ),
             webhook_poster,
             nas_archive,
         };
@@ -549,6 +939,11 @@ impl RecorderManager {
             manager_clone.monitor_recorders().await;
         });
 
+        let manager_clone = manager.clone();
+        tokio::spawn(async move {
+            manager_clone.watchdog_recording_starts().await;
+        });
+
         manager
     }
 
@@ -561,6 +956,27 @@ impl RecorderManager {
         while let Ok(event) = rx.recv().await {
             match event {
                 RecorderEvent::LiveStart { recorder } => {
+                    let recorder_id = format!(
+                        "{}:{}",
+                        recorder.room_info.platform, recorder.room_info.room_id
+                    );
+                    self.live_start_retries.write().await.remove(&recorder_id);
+                    self.set_recorder_health(
+                        &recorder.room_info.platform,
+                        &recorder.room_info.room_id,
+                        "live_waiting",
+                        "",
+                        "已检测到开播，正在启动录制",
+                        0,
+                        None,
+                    )
+                    .await;
+                    log::info!(
+                        "[recorder_lifecycle platform={} room_id={} live_id={}] live_started",
+                        recorder.room_info.platform,
+                        recorder.room_info.room_id,
+                        recorder.live_id
+                    );
                     let event = events::new_webhook_event(
                         events::LIVE_STARTED,
                         Payload::Room(recorder.clone()),
@@ -585,6 +1001,40 @@ impl RecorderManager {
                     room_id,
                     recorder,
                 } => {
+                    self.live_transcription
+                        .finish(platform.as_str(), &room_id, &recorder.live_id)
+                        .await;
+                    self.live_start_retries.write().await.remove(&format!(
+                        "{}:{}",
+                        platform.as_str(),
+                        room_id
+                    ));
+                    self.recording_growth.write().await.remove(&format!(
+                        "{}:{}",
+                        platform.as_str(),
+                        room_id
+                    ));
+                    self.recording_stall_retries.write().await.remove(&format!(
+                        "{}:{}",
+                        platform.as_str(),
+                        room_id
+                    ));
+                    self.set_recorder_health(
+                        platform.as_str(),
+                        &room_id,
+                        "ready",
+                        "",
+                        "直播已结束，后台监控正常",
+                        0,
+                        None,
+                    )
+                    .await;
+                    log::info!(
+                        "[recorder_lifecycle platform={} room_id={} live_id={}] live_ended",
+                        platform.as_str(),
+                        room_id,
+                        recorder.live_id
+                    );
                     let event = events::new_webhook_event(
                         events::LIVE_ENDED,
                         Payload::Room(recorder.clone()),
@@ -612,7 +1062,27 @@ impl RecorderManager {
                     // add record entry into db
                     let platform = PlatformType::from_str(&recorder.room_info.platform).unwrap();
                     let room_id = recorder.room_info.room_id.clone();
-                    log::info!("Record start: {recorder:?}");
+                    self.live_start_retries.write().await.remove(&format!(
+                        "{}:{}",
+                        platform.as_str(),
+                        room_id
+                    ));
+                    self.set_recorder_health(
+                        platform.as_str(),
+                        &room_id,
+                        "recording_starting",
+                        "",
+                        "录制进程已启动，正在确认录像文件写入",
+                        0,
+                        None,
+                    )
+                    .await;
+                    log::info!(
+                        "[recorder_lifecycle platform={} room_id={} live_id={}] recording_started",
+                        platform.as_str(),
+                        room_id,
+                        recorder.live_id
+                    );
                     if let Err(e) = self
                         .db
                         .add_record(
@@ -626,15 +1096,19 @@ impl RecorderManager {
                         .await
                     {
                         log::error!("Failed to add record entry into db: {e}");
+                    } else {
+                        self.remember_current_archive_dir(platform, &room_id, &recorder.live_id)
+                            .await;
                     }
-                    crate::handlers::anchor_detection::start_live_anchor_detection(
-                        self.clone(),
-                        self.db.clone(),
-                        self.config.clone(),
-                        platform.as_str().to_string(),
-                        room_id.clone(),
-                        recorder.live_id.clone(),
-                    );
+                    self.apply_room_streamer_or_start_detection(
+                        platform,
+                        &room_id,
+                        &recorder.live_id,
+                    )
+                    .await;
+                    self.live_transcription
+                        .start(platform.as_str(), &room_id, &recorder.live_id)
+                        .await;
                     let event =
                         events::new_webhook_event(events::RECORD_STARTED, Payload::Room(recorder));
                     let _ = self.webhook_poster.post_event(&event).await;
@@ -653,7 +1127,37 @@ impl RecorderManager {
                     }
                 }
                 RecorderEvent::RecordEnd { recorder } => {
-                    log::info!("Record end: {recorder:?}");
+                    self.live_transcription
+                        .finish(
+                            &recorder.room_info.platform,
+                            &recorder.room_info.room_id,
+                            &recorder.live_id,
+                        )
+                        .await;
+                    self.recording_growth.write().await.remove(&format!(
+                        "{}:{}",
+                        recorder.room_info.platform, recorder.room_info.room_id
+                    ));
+                    self.recording_stall_retries.write().await.remove(&format!(
+                        "{}:{}",
+                        recorder.room_info.platform, recorder.room_info.room_id
+                    ));
+                    self.set_recorder_health(
+                        &recorder.room_info.platform,
+                        &recorder.room_info.room_id,
+                        "ready",
+                        "",
+                        "本段录制已结束，继续监控直播状态",
+                        0,
+                        None,
+                    )
+                    .await;
+                    log::info!(
+                        "[recorder_lifecycle platform={} room_id={} live_id={}] recording_ended",
+                        recorder.room_info.platform,
+                        recorder.room_info.room_id,
+                        recorder.live_id
+                    );
                     let event = events::new_webhook_event(
                         events::RECORD_ENDED,
                         Payload::Room(recorder.clone()),
@@ -697,15 +1201,10 @@ impl RecorderManager {
             }
         };
         if record.size == 0 {
+            let platform = PlatformType::from_str(&recorder.room_info.platform)
+                .unwrap_or(PlatformType::BiliBili);
+            let cache_folder = self.resolve_archive_dir(platform, &room_id, &live_id).await;
             let _ = self.db.remove_record(&live_id).await;
-            let cache_folder = Path::new(self.config.read().await.cache.as_str())
-                .join(
-                    PlatformType::from_str(&recorder.room_info.platform)
-                        .unwrap_or(PlatformType::BiliBili)
-                        .as_str(),
-                )
-                .join(room_id)
-                .join(live_id);
             let _ = tokio::fs::remove_dir_all(&cache_folder).await;
             log::info!("Empty record folder removed: {cache_folder:?}");
         }
@@ -719,9 +1218,7 @@ impl RecorderManager {
                 .filter(|archive| archive.size > 0 || archive.length > 0.0)
                 .count(),
             Err(error) => {
-                log::error!(
-                    "Failed to count parent segments for {room_id}/{parent_id}: {error}"
-                );
+                log::error!("Failed to count parent segments for {room_id}/{parent_id}: {error}");
                 0
             }
         }
@@ -794,7 +1291,11 @@ impl RecorderManager {
             return;
         };
 
-        log::info!("Create auto whole-clip task: {} {}", task.id, task.task_type);
+        log::info!(
+            "Create auto whole-clip task: {} {}",
+            task.id,
+            task.task_type
+        );
 
         let self_clone = self.clone();
         let task_id = task.id.clone();
@@ -884,7 +1385,10 @@ impl RecorderManager {
             "Start post-record processing for {recorder_id} (segments={multi_segment_count}, auto_generate={auto_generate}, auto_multi_stitch={auto_multi_stitch})"
         );
 
-        if auto_subtitle {
+        // Company recordings are handled by the durable review pipeline. It
+        // still produces a transcript when order matching fails, so queuing the
+        // legacy subtitle job here would only transcribe the same archive twice.
+        if auto_subtitle && live_record.archive_kind != "company" {
             let subtitle_task = self
                 .db
                 .generate_task(
@@ -984,9 +1488,7 @@ impl RecorderManager {
                 room_id,
                 live_record.parent_id.clone(),
                 false,
-                &format!(
-                    "检测到同场 {multi_segment_count} 段录制，正在自动拼接整场视频"
-                ),
+                &format!("检测到同场 {multi_segment_count} 段录制，正在自动拼接整场视频"),
             )
             .await;
             return;
@@ -1009,6 +1511,642 @@ impl RecorderManager {
     pub fn set_migrating(&self, migrating: bool) {
         self.is_migrating
             .store(migrating, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub async fn has_active_recording(&self) -> bool {
+        let guard = self.recorders.read().await;
+        for recorder in guard.values() {
+            let info = recorder.info().await;
+            if is_indexable_active_recording(info.recording, &info.live_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resume only idempotent, chunk-cached ASR work after an application
+    /// restart. Rendering and AI clip tasks remain review-required because
+    /// blindly repeating them could create duplicate user-visible files.
+    pub async fn resume_interrupted_tasks(&self, tasks: Vec<TaskRow>) {
+        for task in tasks {
+            if task.task_type != "generate_archive_subtitle" {
+                continue;
+            }
+            let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&task.metadata) else {
+                continue;
+            };
+            let Some(platform) = metadata
+                .get("platform")
+                .and_then(|value| value.as_str())
+                .and_then(|value| PlatformType::from_str(value).ok())
+            else {
+                continue;
+            };
+            let Some(room_id) = metadata.get("room_id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(live_id) = metadata.get("live_id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+
+            let task_id = task.id.clone();
+            if let Err(error) = self
+                .db
+                .update_task(&task_id, "pending", "程序重启后正在恢复整场逐字稿", None)
+                .await
+            {
+                log::error!("Failed to prepare interrupted ASR task {task_id}: {error}");
+                continue;
+            }
+            let Ok(reporter) =
+                ProgressReporter::new(self.db.clone(), &self.emitter, &task_id).await
+            else {
+                let _ = self
+                    .db
+                    .update_task(
+                        &task_id,
+                        "failed",
+                        "恢复逐字稿任务失败：无法创建进度记录",
+                        None,
+                    )
+                    .await;
+                continue;
+            };
+            let manager = self.clone();
+            let room_id = room_id.to_string();
+            let live_id = live_id.to_string();
+            let scheduled_task_id = task_id.clone();
+            if let Err(error) = self
+                .task_manager
+                .add_task(Task::new(task_id, TaskPriority::Normal, async move {
+                    let _ = manager
+                        .db
+                        .update_task(
+                            &scheduled_task_id,
+                            "processing",
+                            "正在从已完成分段继续生成整场逐字稿",
+                            None,
+                        )
+                        .await;
+                    match manager
+                        .generate_archive_subtitle(platform, &room_id, &live_id, Some(&reporter))
+                        .await
+                    {
+                        Ok(_) => {
+                            reporter.finish(true, "整场逐字稿恢复完成").await;
+                            let _ = manager
+                                .db
+                                .update_task(
+                                    &scheduled_task_id,
+                                    "success",
+                                    "整场逐字稿恢复完成",
+                                    None,
+                                )
+                                .await;
+                            Ok(())
+                        }
+                        Err(error) => {
+                            let message = format!("恢复整场逐字稿失败：{error}");
+                            reporter.finish(false, &message).await;
+                            let _ = manager
+                                .db
+                                .update_task(&scheduled_task_id, "failed", &message, None)
+                                .await;
+                            Err(message)
+                        }
+                    }
+                }))
+                .await
+            {
+                let _ = self
+                    .db
+                    .update_task(
+                        &task.id,
+                        "failed",
+                        &format!("恢复逐字稿任务进入队列失败：{error}"),
+                        None,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    pub async fn wait_for_recording_idle(&self) {
+        let mut logged = false;
+        while self.has_active_recording().await {
+            if !logged {
+                log::info!(
+                    "[media_scheduler code=REC-RESOURCE-PROTECTED] active recording has priority; heavy media work is waiting"
+                );
+                logged = true;
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+
+    async fn set_recorder_health(
+        &self,
+        platform: &str,
+        room_id: &str,
+        status: &str,
+        error_code: &str,
+        message: &str,
+        retry_count: u8,
+        next_retry_at: Option<&str>,
+    ) {
+        if let Err(error) = self
+            .db
+            .upsert_recorder_health(
+                platform,
+                room_id,
+                status,
+                error_code,
+                message,
+                i64::from(retry_count),
+                next_retry_at,
+            )
+            .await
+        {
+            log::error!(
+                "[recorder_health platform={platform} room_id={room_id}] persist failed: {error}"
+            );
+        }
+    }
+
+    fn notify_recorder_issue(&self, title: &str, body: &str) {
+        #[cfg(feature = "gui")]
+        if let Err(error) = self
+            .app_handle
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+        {
+            log::warn!("Failed to show recorder health notification: {error}");
+        }
+    }
+
+    async fn can_attempt_initialization(&self, recorder_id: &str, now: Instant) -> bool {
+        self.initialization_retries
+            .read()
+            .await
+            .get(recorder_id)
+            .map(|state| !state.terminal && state.next_retry_at <= now)
+            .unwrap_or(true)
+    }
+
+    async fn record_initialization_failure(
+        &self,
+        recorder_id: &str,
+        platform: PlatformType,
+        room_id: &str,
+        error: &str,
+    ) {
+        let now = Instant::now();
+        let (retry_count, delay, terminal) = {
+            let mut retries = self.initialization_retries.write().await;
+            if let Some(state) = retries.get_mut(recorder_id) {
+                let delay = state.after_failed_retry(now);
+                (state.completed_retries, delay, state.terminal)
+            } else {
+                let state = RetryState::first_failure(now);
+                let delay = retry_delay(0);
+                retries.insert(recorder_id.to_string(), state);
+                (0, delay, false)
+            }
+        };
+        let next_retry_at = delay.map(retry_timestamp);
+        let (status, message) = if terminal {
+            (
+                "needs_attention",
+                format!("录制服务连续启动失败，需要处理：{error}"),
+            )
+        } else {
+            let minutes = delay.map(|value| value.as_secs() / 60).unwrap_or(0);
+            (
+                "retry_wait",
+                format!("录制服务启动失败，{minutes} 分钟后自动重试：{error}"),
+            )
+        };
+        log::error!(
+            "[recorder_init platform={} room_id={} retry_count={retry_count} code={RECORDER_INIT_ERROR_CODE}] {error}",
+            platform.as_str(),
+            room_id
+        );
+        self.set_recorder_health(
+            platform.as_str(),
+            room_id,
+            status,
+            RECORDER_INIT_ERROR_CODE,
+            &message,
+            retry_count,
+            next_retry_at.as_deref(),
+        )
+        .await;
+        self.notify_recorder_issue(
+            if terminal {
+                "典典直播切片 - 录制服务需要处理"
+            } else {
+                "典典直播切片 - 录制服务启动失败"
+            },
+            &format!("直播间 {room_id}：{message}"),
+        );
+    }
+
+    async fn restart_managed_recorder(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+    ) -> Result<(), String> {
+        let recorder_id = format!("{}:{}", platform.as_str(), room_id);
+        let row = self
+            .db
+            .get_recorders()
+            .await
+            .map_err(String::from)?
+            .into_iter()
+            .find(|row| row.platform == platform.as_str() && row.room_id == room_id)
+            .ok_or_else(|| format!("直播间 {room_id} 已不在监控列表"))?;
+        let account = self
+            .db
+            .get_account_by_platform(platform.as_str())
+            .await
+            .map_err(|_| format!("{} 账号已失效或不存在，请重新扫码", platform.as_str()))?
+            .to_account();
+
+        let recorder = {
+            let mut recorders = self.recorders.write().await;
+            recorders.remove(&recorder_id)
+        };
+        if let Some(recorder) = recorder {
+            recorder.stop().await;
+        }
+        self.add_recorder(&account, platform, room_id, &row.extra, row.auto_start)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn watchdog_recording_starts(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if self.is_migrating.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let cache_readiness = {
+                let mut config = self.config.write().await;
+                crate::storage_readiness::ensure_recording_cache(&mut config)
+            };
+            let recorders = {
+                let guard = self.recorders.read().await;
+                let mut values = Vec::with_capacity(guard.len());
+                for recorder in guard.values() {
+                    values.push(recorder.info().await);
+                }
+                values
+            };
+
+            let cache_readiness = match cache_readiness {
+                Ok(value) => value,
+                Err(error) => {
+                    for info in &recorders {
+                        self.set_recorder_health(
+                            &info.room_info.platform,
+                            &info.room_info.room_id,
+                            "needs_attention",
+                            "REC-STORAGE-UNAVAILABLE",
+                            &error,
+                            0,
+                            None,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+            };
+            if cache_readiness.fell_back {
+                log::warn!("{}", cache_readiness.detail);
+                self.notify_recorder_issue(
+                    "典典直播切片 - 已切换本机录制目录",
+                    &cache_readiness.detail,
+                );
+            }
+
+            for info in recorders {
+                let platform = info.room_info.platform.clone();
+                let room_id = info.room_info.room_id.clone();
+                let recorder_id = format!("{platform}:{room_id}");
+                if !info.enabled {
+                    self.live_start_retries.write().await.remove(&recorder_id);
+                    self.set_recorder_health(
+                        &platform,
+                        &room_id,
+                        "disabled",
+                        "",
+                        "直播间监控已关闭",
+                        0,
+                        None,
+                    )
+                    .await;
+                    continue;
+                }
+                if cache_readiness.fell_back {
+                    let Ok(platform_type) = PlatformType::from_str(&platform) else {
+                        continue;
+                    };
+                    self.recording_growth.write().await.remove(&recorder_id);
+                    match self.restart_managed_recorder(platform_type, &room_id).await {
+                        Ok(()) => {
+                            self.set_recorder_health(
+                                &platform,
+                                &room_id,
+                                "live_waiting",
+                                "REC-STORAGE-FALLBACK",
+                                "原录制目录不可用，已切换本机目录并重启录制服务",
+                                0,
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.set_recorder_health(
+                                &platform,
+                                &room_id,
+                                "needs_attention",
+                                "REC-STORAGE-FALLBACK-RESTART",
+                                &format!("已切换本机目录，但录制服务重启失败：{error}"),
+                                0,
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                    continue;
+                }
+                if info.recording {
+                    let Ok(platform_type) = PlatformType::from_str(&platform) else {
+                        continue;
+                    };
+                    let work_dir = cache_readiness
+                        .active_path
+                        .join(platform_type.as_str())
+                        .join(&room_id)
+                        .join(&info.live_id);
+                    let measured_size = measure_recording_cache(&work_dir)
+                        .await
+                        .map(|(_, size)| size);
+                    let measurement_error = measured_size.as_ref().err().map(ToString::to_string);
+                    let current_size = measured_size.as_ref().copied().unwrap_or(0);
+                    let (growth, decision) = {
+                        let previous = self.recording_growth.read().await;
+                        evaluate_recording_growth(
+                            previous.get(&recorder_id),
+                            &info.live_id,
+                            current_size,
+                        )
+                    };
+                    self.recording_growth
+                        .write()
+                        .await
+                        .insert(recorder_id.clone(), growth);
+
+                    match decision {
+                        RecordingGrowthDecision::Starting => {
+                            self.set_recorder_health(
+                                &platform,
+                                &room_id,
+                                "recording_starting",
+                                "",
+                                "录制进程已启动，正在确认录像文件写入",
+                                0,
+                                None,
+                            )
+                            .await;
+                        }
+                        RecordingGrowthDecision::Growing => {
+                            self.live_start_retries.write().await.remove(&recorder_id);
+                            self.recording_stall_retries
+                                .write()
+                                .await
+                                .remove(&recorder_id);
+                            self.set_recorder_health(
+                                &platform,
+                                &room_id,
+                                "recording",
+                                "",
+                                &format!(
+                                    "录像文件持续写入（已写入 {:.1} MB）",
+                                    current_size as f64 / 1024.0 / 1024.0
+                                ),
+                                0,
+                                None,
+                            )
+                            .await;
+                        }
+                        RecordingGrowthDecision::Stalled => {
+                            let detail = measurement_error
+                                .map(|error| format!("读取录像目录失败：{error}"))
+                                .unwrap_or_else(|| "录像文件连续约 45 秒没有增长".to_string());
+                            let now = Instant::now();
+                            let existing = self
+                                .recording_stall_retries
+                                .read()
+                                .await
+                                .get(&recorder_id)
+                                .cloned();
+                            let (retry_count, next_delay, terminal, should_restart) = match existing
+                            {
+                                Some(state) if state.terminal => {
+                                    (state.completed_retries, None, true, false)
+                                }
+                                Some(state) if state.next_retry_at > now => {
+                                    let wait = state.next_retry_at.saturating_duration_since(now);
+                                    (state.completed_retries, Some(wait), false, false)
+                                }
+                                Some(mut state) => {
+                                    let delay = state.after_failed_retry(now);
+                                    let values =
+                                        (state.completed_retries, delay, state.terminal, true);
+                                    self.recording_stall_retries
+                                        .write()
+                                        .await
+                                        .insert(recorder_id.clone(), state);
+                                    values
+                                }
+                                None => {
+                                    let state = RetryState::first_failure(now);
+                                    let delay = retry_delay(0);
+                                    self.recording_stall_retries
+                                        .write()
+                                        .await
+                                        .insert(recorder_id.clone(), state);
+                                    (0, delay, false, true)
+                                }
+                            };
+                            if terminal {
+                                self.set_recorder_health(
+                                    &platform,
+                                    &room_id,
+                                    "needs_attention",
+                                    RECORDING_FILE_STALLED_ERROR_CODE,
+                                    &format!(
+                                        "{detail}；三次自动恢复后仍失败，请检查网络或录制目录"
+                                    ),
+                                    retry_count,
+                                    None,
+                                )
+                                .await;
+                                continue;
+                            }
+                            let next_retry_at = next_delay.map(retry_timestamp);
+                            let wait_minutes = next_delay
+                                .map(|delay| ((delay.as_secs() + 59) / 60).max(1))
+                                .unwrap_or(1);
+                            self.set_recorder_health(
+                                &platform,
+                                &room_id,
+                                "retry_wait",
+                                RECORDING_FILE_STALLED_ERROR_CODE,
+                                &format!(
+                                    "{detail}；{}",
+                                    if should_restart {
+                                        "正在重启录制服务".to_string()
+                                    } else {
+                                        format!("约 {wait_minutes} 分钟后再次自动恢复")
+                                    }
+                                ),
+                                retry_count,
+                                next_retry_at.as_deref(),
+                            )
+                            .await;
+                            if !should_restart {
+                                continue;
+                            }
+                            self.notify_recorder_issue(
+                                "典典直播切片 - 录像写入已停止",
+                                &format!("直播间 {room_id}：{detail}，系统正在自动恢复"),
+                            );
+                            self.recording_growth.write().await.remove(&recorder_id);
+                            if let Err(error) =
+                                self.restart_managed_recorder(platform_type, &room_id).await
+                            {
+                                self.set_recorder_health(
+                                    &platform,
+                                    &room_id,
+                                    "retry_wait",
+                                    RECORDING_FILE_STALLED_ERROR_CODE,
+                                    &format!(
+                                        "{detail}；本次自动重启失败：{error}，系统仍会继续重试"
+                                    ),
+                                    retry_count,
+                                    next_retry_at.as_deref(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if !info.room_info.status {
+                    self.live_start_retries.write().await.remove(&recorder_id);
+                    self.set_recorder_health(
+                        &platform,
+                        &room_id,
+                        "ready",
+                        "",
+                        "后台监控正常，等待开播",
+                        0,
+                        None,
+                    )
+                    .await;
+                    continue;
+                }
+
+                let now = Instant::now();
+                let existing = self
+                    .live_start_retries
+                    .read()
+                    .await
+                    .get(&recorder_id)
+                    .cloned();
+                let Some(mut retry_state) = existing else {
+                    let state = RetryState::first_failure(now);
+                    let next_retry = retry_timestamp(retry_delay(0).expect("first retry delay"));
+                    self.live_start_retries
+                        .write()
+                        .await
+                        .insert(recorder_id.clone(), state);
+                    self.set_recorder_health(
+                        &platform,
+                        &room_id,
+                        "live_waiting",
+                        RECORDING_START_ERROR_CODE,
+                        "已检测到直播，正在等待录制启动",
+                        0,
+                        Some(&next_retry),
+                    )
+                    .await;
+                    continue;
+                };
+                if retry_state.terminal || retry_state.next_retry_at > now {
+                    continue;
+                }
+
+                let platform_type = match PlatformType::from_str(&platform) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::error!("Invalid recorder platform {platform}: {error}");
+                        continue;
+                    }
+                };
+                let restart_result = self.restart_managed_recorder(platform_type, &room_id).await;
+                let next_delay = retry_state.after_failed_retry(now);
+                let retry_count = retry_state.completed_retries;
+                let terminal = retry_state.terminal;
+                self.live_start_retries
+                    .write()
+                    .await
+                    .insert(recorder_id.clone(), retry_state);
+                let detail = restart_result
+                    .err()
+                    .unwrap_or_else(|| "已重新启动录制服务".to_string());
+                let next_retry_at = next_delay.map(retry_timestamp);
+                let (status, message) = if terminal {
+                    (
+                        "needs_attention",
+                        format!("三次自动重试后仍未开始录制，需要处理。{detail}"),
+                    )
+                } else {
+                    let minutes = next_delay.map(|value| value.as_secs() / 60).unwrap_or(0);
+                    (
+                        "retry_wait",
+                        format!("第 {retry_count} 次自动重试已执行；若仍失败，{minutes} 分钟后继续。{detail}"),
+                    )
+                };
+                log::warn!(
+                    "[recorder_watchdog platform={platform} room_id={room_id} retry_count={retry_count} code={RECORDING_START_ERROR_CODE}] {message}"
+                );
+                self.set_recorder_health(
+                    &platform,
+                    &room_id,
+                    status,
+                    RECORDING_START_ERROR_CODE,
+                    &message,
+                    retry_count,
+                    next_retry_at.as_deref(),
+                )
+                .await;
+                self.notify_recorder_issue(
+                    if terminal {
+                        "典典直播切片 - 录制需要处理"
+                    } else {
+                        "典典直播切片 - 正在自动恢复录制"
+                    },
+                    &format!("直播间 {room_id}：{message}"),
+                );
+            }
+        }
     }
 
     async fn monitor_recorders(&self) {
@@ -1049,6 +2187,13 @@ impl RecorderManager {
                 if self.is_migrating.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
+                let recorder_id = format!("{}:{}", platform.as_str(), room_id);
+                if !self
+                    .can_attempt_initialization(&recorder_id, Instant::now())
+                    .await
+                {
+                    continue;
+                }
                 let (auto_start, extra) = recorder_map.get(&(platform, room_id.clone())).unwrap();
                 let account = self
                     .db
@@ -1060,6 +2205,16 @@ impl RecorderManager {
                     && account.is_err()
                 {
                     log::warn!("Failed to find an account for {platform:?} {room_id}");
+                    self.set_recorder_health(
+                        platform.as_str(),
+                        &room_id,
+                        "login_required",
+                        RECORDER_LOGIN_ERROR_CODE,
+                        "登录已失效或账号不存在，请重新扫码；后台仍会继续检查",
+                        0,
+                        None,
+                    )
+                    .await;
                     continue;
                 }
                 let account = if let Ok(account) = account {
@@ -1078,6 +2233,32 @@ impl RecorderManager {
                         room_id,
                         e
                     );
+                    self.record_initialization_failure(
+                        &recorder_id,
+                        platform,
+                        &room_id,
+                        &e.to_string(),
+                    )
+                    .await;
+                } else {
+                    self.initialization_retries
+                        .write()
+                        .await
+                        .remove(&recorder_id);
+                    self.set_recorder_health(
+                        platform.as_str(),
+                        &room_id,
+                        if *auto_start { "ready" } else { "disabled" },
+                        "",
+                        if *auto_start {
+                            "录制服务已启动，等待开播"
+                        } else {
+                            "直播间监控已关闭"
+                        },
+                        0,
+                        None,
+                    )
+                    .await;
                 }
             }
             interval.tick().await;
@@ -1205,6 +2386,15 @@ impl RecorderManager {
 
         // remove from db
         let recorder = self.db.remove_recorder(room_id).await?;
+        let _ = self
+            .db
+            .delete_recorder_health(platform.as_str(), room_id)
+            .await;
+        self.initialization_retries
+            .write()
+            .await
+            .remove(&recorder_id);
+        self.live_start_retries.write().await.remove(&recorder_id);
 
         // add to to_remove
         log::debug!("Add to to_remove: {recorder_id}");
@@ -1233,12 +2423,9 @@ impl RecorderManager {
         room_id: &str,
         live_id: &str,
     ) -> Result<Vec<u8>, RecorderManagerError> {
-        let cache_path = self.config.read().await.cache.clone();
-        let cache_path = Path::new(&cache_path);
-        let playlist_path = cache_path
-            .join(platform.as_str())
-            .join(room_id)
-            .join(live_id)
+        let playlist_path = self
+            .resolve_archive_dir(platform, room_id, live_id)
+            .await
             .join("playlist.m3u8");
         if !playlist_path.exists() {
             return Err(RecorderManagerError::IoError(std::io::Error::new(
@@ -1281,6 +2468,29 @@ impl RecorderManager {
         false
     }
 
+    fn prepare_playlist_for_playback(playlist: &mut MediaPlaylist, finished: bool) {
+        // Some Douyin recordings are persisted with TARGETDURATION=0. That is
+        // not a valid HLS manifest and leaves Shaka waiting at 0:00 even though
+        // every TS segment exists. Derive a legal integer target duration from
+        // the actual segments when serving the playlist; keep source files
+        // untouched so recording and ASR behavior do not change.
+        let required_target_duration = playlist
+            .segments
+            .iter()
+            .map(|segment| segment.duration.ceil())
+            .fold(1.0_f32, f32::max);
+        if !playlist.target_duration.is_finite()
+            || playlist.target_duration < required_target_duration
+        {
+            playlist.target_duration = required_target_duration;
+        }
+
+        if finished {
+            playlist.end_list = true;
+            playlist.playlist_type = Some(MediaPlaylistType::Vod);
+        }
+    }
+
     async fn load_playlist(
         &self,
         platform: PlatformType,
@@ -1289,10 +2499,8 @@ impl RecorderManager {
     ) -> Result<MediaPlaylist, RecorderManagerError> {
         let bytes = self.load_playlist_bytes(platform, room_id, live_id).await?;
         if let Result::Ok((_, mut pl)) = m3u8_rs::parse_media_playlist(&bytes) {
-            if self.is_outdated_playlist(platform, room_id, live_id).await {
-                pl.end_list = true;
-                pl.playlist_type = Some(MediaPlaylistType::Vod);
-            }
+            let finished = self.is_outdated_playlist(platform, room_id, live_id).await;
+            Self::prepare_playlist_for_playback(&mut pl, finished);
             return Ok(pl);
         }
         Err(RecorderManagerError::M3u8ParseFailed {
@@ -1371,12 +2579,9 @@ impl RecorderManager {
         room_id: &str,
         live_id: &str,
     ) -> Result<Vec<DanmuEntry>, RecorderManagerError> {
-        let cache_path = self.config.read().await.cache.clone();
-        let cache_path = Path::new(&cache_path);
-        let danmus_path = cache_path
-            .join(platform.as_str())
-            .join(room_id)
-            .join(live_id)
+        let danmus_path = self
+            .resolve_archive_dir(platform, room_id, live_id)
+            .await
             .join("danmu.txt");
         if !danmus_path.exists() {
             return Ok(Vec::new());
@@ -1398,8 +2603,6 @@ impl RecorderManager {
         room_id: &str,
         parent_id: &str,
     ) -> Vec<RelatedPlaylist> {
-        let cache_path = self.config.read().await.cache.clone();
-        let cache_path = Path::new(&cache_path);
         let archives = self.db.get_archives_by_parent_id(room_id, parent_id).await;
         if let Err(e) = archives {
             log::error!(
@@ -1411,23 +2614,16 @@ impl RecorderManager {
             return Vec::new();
         }
 
-        let archives: Vec<(String, String)> = archives
-            .unwrap()
-            .iter()
-            .map(|a| (a.title.clone(), a.live_id.clone()))
-            .collect();
-
+        let archives = archives.unwrap();
         let playlists = archives
             .iter()
-            .map(async |a| {
-                let work_dir =
-                    CachePath::new(cache_path.to_path_buf(), *platform, room_id, a.1.as_str());
-
-                RelatedPlaylist {
-                    live_id: a.1.clone(),
-                    title: a.0.clone(),
-                    path: work_dir.with_filename("playlist.m3u8").full_path(),
-                }
+            .map(async |archive| RelatedPlaylist {
+                live_id: archive.live_id.clone(),
+                title: archive.title.clone(),
+                path: self
+                    .resolve_archive_dir(*platform, room_id, &archive.live_id)
+                    .await
+                    .join("playlist.m3u8"),
             })
             .collect::<Vec<_>>();
 
@@ -1442,12 +2638,14 @@ impl RecorderManager {
         clip_file: PathBuf,
         params: &ClipRangeParams,
     ) -> Result<PathBuf, RecorderManagerError> {
-        let cache_path = self.config.read().await.cache.clone();
-        let cache_path = Path::new(&cache_path);
-        let playlist_path = cache_path
-            .join(params.platform.clone())
-            .join(params.room_id.clone())
-            .join(params.live_id.clone())
+        let platform = PlatformType::from_str(&params.platform).map_err(|_| {
+            RecorderManagerError::InvalidPlatformType {
+                platform: params.platform.clone(),
+            }
+        })?;
+        let playlist_path = self
+            .resolve_archive_dir(platform, &params.room_id, &params.live_id)
+            .await
             .join("playlist.m3u8");
 
         if !playlist_path.exists() {
@@ -1610,12 +2808,9 @@ impl RecorderManager {
         }
         let ass_content =
             danmu2ass::danmu_to_ass(danmus, self.config.read().await.danmu_ass_options.clone());
-        let work_dir = CachePath::new(
-            self.config.read().await.cache.clone().into(),
-            platform,
-            room_id,
-            live_id,
-        );
+        let work_dir = self
+            .resolve_archive_cache_path(platform, room_id, live_id)
+            .await;
         let ass_file_path = work_dir.with_filename("danmu.ass");
         if let Err(e) = write(&ass_file_path.full_path(), ass_content).await {
             log::error!(
@@ -1636,10 +2831,30 @@ impl RecorderManager {
             recorders: Vec::new(),
         };
 
+        let assignments = self
+            .db
+            .list_recorder_streamer_assignments()
+            .await
+            .unwrap_or_else(|error| {
+                log::error!("Failed to list recorder streamer assignments: {error}");
+                Vec::new()
+            });
+        let assignment_map = assignments
+            .into_iter()
+            .map(|assignment| {
+                (
+                    format!("{}:{}", assignment.platform, assignment.room_id),
+                    assignment.streamer_name,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
         // initialized recorder set
         let mut recorder_set = HashSet::new();
         for recorder_ref in self.recorders.read().await.iter() {
-            let recorder_info = recorder_ref.1.info().await;
+            let mut recorder_info = recorder_ref.1.info().await;
+            self.enrich_current_streamer(&mut recorder_info, &assignment_map)
+                .await;
             summary.recorders.push(recorder_info.clone());
             recorder_set.insert(recorder_info.room_info.room_id);
         }
@@ -1658,11 +2873,13 @@ impl RecorderManager {
         for recorder in recorders {
             // check if recorder is in recorder_set
             if !recorder_set.contains(&recorder.room_id.to_string()) {
-                summary.recorders.push(RecorderInfo {
+                let mut recorder_info = RecorderInfo {
                     platform_live_id: "".to_string(),
                     live_id: "".to_string(),
                     recording: false,
                     enabled: false,
+                    current_streamer: String::new(),
+                    current_streamer_source: String::new(),
                     room_info: RoomInfo {
                         platform: recorder.platform.as_str().to_string(),
                         status: false,
@@ -1675,7 +2892,10 @@ impl RecorderManager {
                         user_name: "".to_string(),
                         user_avatar: "".to_string(),
                     },
-                });
+                };
+                self.enrich_current_streamer(&mut recorder_info, &assignment_map)
+                    .await;
+                summary.recorders.push(recorder_info);
             }
         }
 
@@ -1683,6 +2903,138 @@ impl RecorderManager {
             .recorders
             .sort_by(|a, b| a.room_info.room_id.cmp(&b.room_info.room_id));
         summary
+    }
+
+    async fn enrich_current_streamer(
+        &self,
+        recorder: &mut RecorderInfo,
+        assignment_map: &HashMap<String, String>,
+    ) {
+        let key = format!(
+            "{}:{}",
+            recorder.room_info.platform, recorder.room_info.room_id
+        );
+        if let Some(streamer_name) = assignment_map.get(&key) {
+            recorder.current_streamer = streamer_name.clone();
+            recorder.current_streamer_source = "manual".to_string();
+            return;
+        }
+
+        if recorder.recording && !recorder.live_id.trim().is_empty() {
+            if let Ok(record) = self
+                .db
+                .get_record(&recorder.room_info.room_id, &recorder.live_id)
+                .await
+            {
+                if !record.anchor_name.trim().is_empty()
+                    && (record.anchor_source == "manual"
+                        || record.anchor_detection_status == "confirmed")
+                {
+                    recorder.current_streamer = record.anchor_name;
+                    recorder.current_streamer_source = if record.anchor_source == "manual" {
+                        "manual".to_string()
+                    } else {
+                        "auto".to_string()
+                    };
+                }
+            }
+        }
+    }
+
+    pub async fn set_room_streamer_assignment(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        streamer_name: Option<&str>,
+    ) -> Result<(), RecorderManagerError> {
+        let exists =
+            self.db.get_recorders().await?.iter().any(|recorder| {
+                recorder.platform == platform.as_str() && recorder.room_id == room_id
+            });
+        if !exists {
+            return Err(RecorderManagerError::NotFound {
+                room_id: room_id.to_string(),
+            });
+        }
+
+        match streamer_name {
+            Some(name) => {
+                self.db
+                    .set_recorder_streamer_assignment(platform, room_id, name)
+                    .await?;
+            }
+            None => {
+                self.db
+                    .remove_recorder_streamer_assignment(platform, room_id)
+                    .await?;
+            }
+        }
+
+        let Some(active) = self.get_recorder_info(platform, room_id).await else {
+            return Ok(());
+        };
+        if !active.recording || active.live_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        if let Some(name) = streamer_name {
+            self.db
+                .save_record_anchor_manual(&active.live_id, name)
+                .await?;
+        } else {
+            self.db.clear_record_anchor_manual(&active.live_id).await?;
+            crate::handlers::anchor_detection::start_live_anchor_detection(
+                self.clone(),
+                self.db.clone(),
+                self.config.clone(),
+                platform.as_str().to_string(),
+                room_id.to_string(),
+                active.live_id,
+            );
+        }
+        Ok(())
+    }
+
+    async fn apply_room_streamer_or_start_detection(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) {
+        match self
+            .db
+            .get_recorder_streamer_assignment(platform, room_id)
+            .await
+        {
+            Ok(Some(assignment)) => {
+                if let Err(error) = self
+                    .db
+                    .save_record_anchor_manual(live_id, &assignment.streamer_name)
+                    .await
+                {
+                    log::error!(
+                        "Failed to apply assigned streamer to live record {live_id}: {error}"
+                    );
+                }
+            }
+            Ok(None) => {
+                crate::handlers::anchor_detection::start_live_anchor_detection(
+                    self.clone(),
+                    self.db.clone(),
+                    self.config.clone(),
+                    platform.as_str().to_string(),
+                    room_id.to_string(),
+                    live_id.to_string(),
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "Failed to read assigned streamer for {}:{}: {error}",
+                    platform.as_str(),
+                    room_id
+                );
+            }
+        }
     }
 
     pub async fn get_recorder_info(
@@ -1745,6 +3097,14 @@ impl RecorderManager {
                             None,
                         )
                         .await?;
+                    self.remember_current_archive_dir(platform, room_id, &recorder.live_id)
+                        .await;
+                    self.apply_room_streamer_or_start_detection(
+                        platform,
+                        room_id,
+                        &recorder.live_id,
+                    )
+                    .await;
                 }
                 if let Err(error) = self
                     .sync_active_recording_stats(platform, room_id, &recorder.live_id)
@@ -1766,11 +3126,7 @@ impl RecorderManager {
         room_id: &str,
         live_id: &str,
     ) -> Result<(), RecorderManagerError> {
-        let cache_root = self.config.read().await.cache.clone();
-        let work_dir = Path::new(&cache_root)
-            .join(platform.as_str())
-            .join(room_id)
-            .join(live_id);
+        let work_dir = self.resolve_archive_dir(platform, room_id, live_id).await;
         let (cache_length, cache_size) = measure_recording_cache(&work_dir).await?;
         if cache_length <= 0.0 && cache_size == 0 {
             return Ok(());
@@ -1804,12 +3160,9 @@ impl RecorderManager {
         live_id: &str,
     ) -> Result<String, RecorderManagerError> {
         // read subtitle file under work_dir
-        let work_dir = CachePath::new(
-            self.config.read().await.cache.clone().into(),
-            platform,
-            room_id,
-            live_id,
-        );
+        let work_dir = self
+            .resolve_archive_cache_path(platform, room_id, live_id)
+            .await;
         let subtitle_file_path = work_dir.with_filename("subtitle.srt");
         let subtitle_file = File::open(subtitle_file_path.full_path()).await;
         if subtitle_file.is_err() {
@@ -1824,6 +3177,20 @@ impl RecorderManager {
         Ok(subtitle_content)
     }
 
+    /// Wait for this archive's recording-time ASR to flush its final tail. A
+    /// missing, failed, or timed-out live session returns false so callers can
+    /// safely fall back to the existing full-session transcription path.
+    pub async fn wait_for_live_transcription(
+        &self,
+        platform: PlatformType,
+        room_id: &str,
+        live_id: &str,
+    ) -> bool {
+        self.live_transcription
+            .wait_until_finalized(platform.as_str(), room_id, live_id)
+            .await
+    }
+
     pub async fn save_archive_fact_card(
         &self,
         platform: PlatformType,
@@ -1831,12 +3198,9 @@ impl RecorderManager {
         live_id: &str,
         fact_card: serde_json::Value,
     ) -> Result<(), RecorderManagerError> {
-        let work_dir = CachePath::new(
-            self.config.read().await.cache.clone().into(),
-            platform,
-            room_id,
-            live_id,
-        );
+        let work_dir = self
+            .resolve_archive_cache_path(platform, room_id, live_id)
+            .await;
         let bytes = serde_json::to_vec_pretty(&fact_card).map_err(|error| {
             RecorderManagerError::SubtitleGenerationFailed {
                 error: format!("参数卡格式错误: {error}"),
@@ -1854,13 +3218,29 @@ impl RecorderManager {
         live_id: &str,
         reporter: Option<&ProgressReporter>,
     ) -> Result<String, RecorderManagerError> {
+        if self
+            .wait_for_live_transcription(platform, room_id, live_id)
+            .await
+        {
+            if let Ok(subtitle) = self.get_archive_subtitle(platform, room_id, live_id).await {
+                if !subtitle.trim().is_empty() {
+                    if let Some(reporter) = reporter {
+                        reporter.update("录制中逐字稿已完成，直接复用").await;
+                    }
+                    return Ok(subtitle);
+                }
+            }
+        }
         let archive_key = format!("{}:{room_id}:{live_id}", platform.as_str());
         let generation_lock =
             archive_subtitle_lock(&self.subtitle_generation_locks, &archive_key).await;
         let _generation_guard = generation_lock.lock().await;
+        // Completed archives may be transcribed while other rooms are live.
+        // The shared media permit still serializes heavyweight media work, but
+        // live recording must not make another host's finished replay unusable.
         if let Some(reporter) = reporter {
             reporter
-                .update("等待其他视频处理完成，字幕任务将按顺序执行")
+                .update("正在等待媒体处理通道，随后开始整场逐字稿")
                 .await;
         }
         let _media_permit = self
@@ -1871,14 +3251,14 @@ impl RecorderManager {
             .map_err(|_| RecorderManagerError::SubtitleGenerationFailed {
                 error: "media execution gate is closed".to_string(),
             })?;
+        if let Some(reporter) = reporter {
+            reporter.update("正在提取音频并生成整场逐字稿").await;
+        }
 
         // generate subtitle file under work_dir
-        let work_dir = CachePath::new(
-            self.config.read().await.cache.clone().into(),
-            platform,
-            room_id,
-            live_id,
-        );
+        let work_dir = self
+            .resolve_archive_cache_path(platform, room_id, live_id)
+            .await;
         let subtitle_file_path = work_dir.with_filename("subtitle.srt");
         // first generate a tmp clip file
         // generate a tmp m3u8 index file
@@ -2277,12 +3657,9 @@ impl RecorderManager {
             .generate_archive_subtitle(platform, room_id, live_id, reporter)
             .await?;
 
-        let work_dir = CachePath::new(
-            self.config.read().await.cache.clone().into(),
-            platform,
-            room_id,
-            live_id,
-        );
+        let work_dir = self
+            .resolve_archive_cache_path(platform, room_id, live_id)
+            .await;
         let subtitle_path = work_dir.with_filename("subtitle.srt");
         let candidate_path = work_dir.with_filename("subtitle.refresh-candidate.srt");
         tokio::fs::write(candidate_path.full_path(), generated.as_bytes()).await?;
@@ -2350,10 +3727,7 @@ impl RecorderManager {
             }
         }
         log::info!("Deleting archive {room_id}:{live_id}");
-        let cache_folder = Path::new(self.config.read().await.cache.as_str())
-            .join(platform.as_str())
-            .join(room_id)
-            .join(live_id);
+        let cache_folder = self.resolve_archive_dir(platform, room_id, live_id).await;
         let staged_cache = stage_archive_cache_dir(&cache_folder).await?;
         let index_result: Result<Option<RecordRow>, RecorderManagerError> = async {
             let deleted_task_count = self
@@ -2422,6 +3796,7 @@ impl RecorderManager {
             anchor_detected_at: String::new(),
             archive_kind: "competitor".to_string(),
             classification_source: "auto_rule".to_string(),
+            source_path: String::new(),
         })
     }
 
@@ -2455,7 +3830,6 @@ impl RecorderManager {
     }
 
     pub async fn handle_hls_request(&self, uri: &str) -> Result<Vec<u8>, RecorderManagerError> {
-        let cache_path = self.config.read().await.cache.clone();
         let path = uri.split('?').next().unwrap_or(uri);
         let params = uri.split('?').nth(1).unwrap_or("");
         let path_segs: Vec<&str> = path.split('/').collect();
@@ -2538,11 +3912,13 @@ impl RecorderManager {
             // try to find requested ts file in recorder's cache
             // cache files are stored in {cache_dir}/{room_id}/{timestamp}/{ts_file}
             // remove path params
-            let path = path.split('?').next().unwrap_or(path);
-            let ts_file = format!("{}/{}", cache_path, path.replace("%7C", "|"));
+            let ts_file = self
+                .resolve_archive_dir(platform, room_id, live_id)
+                .await
+                .join(remaining_path.replace("%7C", "|"));
             let ts_file_content = tokio::fs::read(&ts_file).await;
             if ts_file_content.is_err() {
-                log::warn!("Segment file not found: {ts_file}");
+                log::warn!("Segment file not found: {}", ts_file.display());
                 return Err(RecorderManagerError::HLSError {
                     err: "Segment file not found".into(),
                 });

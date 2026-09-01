@@ -832,11 +832,12 @@ pub async fn get_archive_metadata(
         .map_err(|e| format!("Failed to get archive: {}", e))?;
 
     // Get file path and metadata
-    let cache_dir = PathBuf::from(&state.config.read().await.cache);
-    let file_path = cache_dir
-        .join(&platform)
-        .join(&room_id)
-        .join(&live_id)
+    let platform_type = PlatformType::from_str(&platform)
+        .map_err(|_| format!("Unsupported archive platform: {platform}"))?;
+    let file_path = state
+        .recorder_manager
+        .resolve_archive_dir(platform_type, &room_id, &live_id)
+        .await
         .join("output.mp4");
 
     let (file_size, video_metadata) = if file_path.exists() {

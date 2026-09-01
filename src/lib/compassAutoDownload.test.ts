@@ -8,8 +8,11 @@ import {
   compassSessionKey,
   inferCompassDateFromVideo,
   inferCompassShopFromTexts,
+  resolveCompassShopFromAccount,
+  parseCompassIdentityFromName,
   markCompassSessionImported,
   normalizeCompassDate,
+  normalizeCompassStartedAt,
   type CompassSession,
 } from "./compassAutoDownload.js";
 
@@ -18,11 +21,46 @@ assert.equal(canStartCompassDownload(true), false, "a running batch must not be 
 assert.equal(inferCompassShopFromTexts(["金典拍拍科创专卖店_2026-08-01"]), "金典拍拍科创专卖店");
 assert.equal(inferCompassShopFromTexts(["金典拍拍相机专卖店直播"]), "金典拍拍相机专卖店");
 assert.equal(
+  resolveCompassShopFromAccount(["金典拍拍科创专卖店", "富士相机专场直播！"]),
+  "金典拍拍科创专卖店",
+);
+assert.equal(resolveCompassShopFromAccount(["桃子", "富士相机专场直播！"]), null);
+assert.deepEqual(
+  parseCompassIdentityFromName("金典拍拍相机专卖店_2026-08-12_16-30-00.mp4"),
+  { shopName: "金典拍拍相机专卖店", startedAt: "2026-08-12T16:30:00+08:00" },
+);
+assert.equal(parseCompassIdentityFromName("富士相机专场直播！"), null);
+assert.equal(
+  normalizeCompassStartedAt("2026-08-30T05:34:26.405528500+00:00"),
+  "2026-08-30T13:34:26+08:00",
+  "database UTC clocks must match the China-local Compass session time",
+);
+assert.equal(
+  normalizeCompassStartedAt("2026-08-30T20:30:00Z"),
+  "2026-08-31T04:30:00+08:00",
+  "China-local conversion must also carry across the date boundary",
+);
+assert.equal(
+  normalizeCompassStartedAt("2026-08-30T13:34:26+08:00"),
+  "2026-08-30T13:34:26+08:00",
+);
+assert.equal(
+  normalizeCompassStartedAt("2026-08-30 13:34:26"),
+  "2026-08-30T13:34:26+08:00",
+  "zone-less archive clocks are already China local time",
+);
+assert.equal(normalizeCompassStartedAt("invalid"), null);
+assert.equal(
   inferCompassDateFromVideo({
     createdAt: "2026-08-12T10:02:00",
     texts: ["金典拍拍相机专卖店_2026-08-12_09-00-00.ts"],
   }),
   "2026-08-12",
+);
+assert.equal(
+  inferCompassDateFromVideo({ createdAt: "2026-08-30T20:30:00Z" }),
+  "2026-08-31",
+  "Compass target date must be derived after China-local conversion",
 );
 assert.deepEqual(COMPASS_TARGET_SHOPS.map((shop) => shop.value), [
   "金典拍拍科创专卖店",
@@ -78,5 +116,9 @@ assert.equal(imported[1]?.status, "skipped");
 assert.equal(compassStatusLabel("waiting"), "等待处理");
 assert.equal(compassStatusLabel("manual-filter-needed"), "需要手动选择日期");
 assert.equal(compassStatusLabel("shop-mismatch"), "店铺不一致");
+assert.equal(compassStatusLabel("capturing-metric"), "正在采集指标曲线");
+assert.equal(compassStatusLabel("capturing-section"), "正在采集页面模块");
+assert.equal(compassStatusLabel("capturing-products"), "正在采集商品列表");
+assert.equal(compassStatusLabel("capture-session-finished"), "当前场次采集完成");
 
 console.log("compass auto-download tests passed");

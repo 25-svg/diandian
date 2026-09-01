@@ -2,7 +2,7 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
 declare global {
   interface Window {
-    __TAURI_INTERNALS__?: unknown;
+    __TAURI_INTERNALS__?: any;
   }
 }
 

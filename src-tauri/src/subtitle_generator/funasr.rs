@@ -438,11 +438,7 @@ fn find_service_command(port: u16) -> Result<(PathBuf, Vec<String>, PathBuf), St
         ] {
             let sidecar = runtime.join("funasr-service.exe");
             if sidecar.is_file() {
-                return Ok((
-                    sidecar,
-                    vec!["--port".into(), port.to_string()],
-                    runtime,
-                ));
+                return Ok((sidecar, vec!["--port".into(), port.to_string()], runtime));
             }
         }
     }
@@ -465,6 +461,11 @@ fn find_service_command(port: u16) -> Result<(PathBuf, Vec<String>, PathBuf), St
         "FunASR runtime not found. Expected funasr-service.exe or the development .funasr-venv"
             .to_string(),
     )
+}
+
+pub fn inspect_runtime() -> Result<String, String> {
+    let (command, _, _) = find_service_command(BASE_PORT)?;
+    Ok(command.to_string_lossy().to_string())
 }
 
 fn candidate_roots() -> Vec<PathBuf> {

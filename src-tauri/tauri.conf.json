@@ -3,7 +3,7 @@
     "beforeDevCommand": "yarn dev",
     "beforeBuildCommand": "yarn build",
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:8054/index.html"
+    "devUrl": "http://127.0.0.1:8054/index.html"
   },
   "bundle": {
     "active": true,

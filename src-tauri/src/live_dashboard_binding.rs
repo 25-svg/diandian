@@ -71,7 +71,64 @@ pub fn infer_shop_name_from_texts(values: &[&str]) -> Option<&'static str> {
 }
 
 pub fn session_matches_shop(session: &LiveDashboardSessionRow, shop: &str) -> bool {
-    normalize_match_text(&session.shop_name).contains(&normalize_match_text(shop))
+    shop_names_match(&session.shop_name, shop)
+}
+
+/// Match a base platform shop name against an Excel label that may append a
+/// live-room / campaign suffix.  Direction matters: distinct base shops must
+/// never match merely because they share the same brand prefix.
+pub fn shop_names_match(excel_shop: &str, platform_shop: &str) -> bool {
+    let excel = normalize_match_text(excel_shop);
+    let platform = normalize_match_text(platform_shop);
+    !excel.is_empty() && !platform.is_empty() && excel.contains(&platform)
+}
+
+/// True when a previously bound Excel is the wrong shop or the wrong day
+/// relative to a standardized imported filename like `店铺_YYYY-MM-DD_HH-MM-SS`.
+pub fn imported_bound_session_conflicts_with_video(
+    title: &str,
+    file: &str,
+    note: &str,
+    session: &LiveDashboardSessionRow,
+) -> bool {
+    let source_values = [title, file, note];
+    if infer_shop_name_from_texts(&source_values)
+        .is_some_and(|shop| !session_matches_shop(session, shop))
+    {
+        return true;
+    }
+    let Some(video_time) = infer_live_started_at_from_texts(&source_values)
+        .as_deref()
+        .and_then(parse_timestamp)
+    else {
+        return false;
+    };
+    parse_timestamp(&session.started_at)
+        .is_some_and(|session_time| session_time.date_naive() != video_time.date_naive())
+}
+
+/// Existing automatic bindings must still describe the same calendar day as
+/// the recorded live. Old versions could bind a similarly-sized Excel session
+/// from another day; reusing that binding would query and attribute wrong
+/// orders.
+pub fn bound_session_conflicts_with_record(
+    record: &RecordForLiveDashboardBinding,
+    session: &LiveDashboardSessionRow,
+) -> bool {
+    if infer_shop_name_from_texts(&[&record.title])
+        .is_some_and(|shop| !session_matches_shop(session, shop))
+    {
+        return true;
+    }
+    match (
+        parse_timestamp(&record.created_at),
+        parse_timestamp(&session.started_at),
+    ) {
+        (Some(record_time), Some(session_time)) => {
+            record_time.date_naive() != session_time.date_naive()
+        }
+        _ => false,
+    }
 }
 
 pub fn imported_video_candidate_sessions(
@@ -319,9 +376,12 @@ fn unique_duration_match(
             };
             return Some((same_day[0].clone(), method));
         }
-        if !same_day.is_empty() {
-            hits = same_day;
+        if same_day.is_empty() {
+            // Filename / record clock is authoritative. Do not bind an 8/1
+            // Excel to an 8/12 video just because the durations look similar.
+            return None;
         }
+        hits = same_day;
     }
     if hits.len() == 1 {
         let method = if !room_id.is_empty() && room_id == hits[0].account_key.trim() {
@@ -355,13 +415,16 @@ fn rank_sessions_by_clock_and_duration(
             let time_delta_seconds = clock
                 .map(|value| (started - value).num_seconds().abs())
                 .unwrap_or(i64::MAX / 4);
-            let duration_delta = video_len.and_then(|length| {
-                session_span_secs(session).map(|span| (span - length).abs())
-            });
+            let duration_delta = video_len
+                .and_then(|length| session_span_secs(session).map(|span| (span - length).abs()));
             let same_day = clock.is_some_and(|value| started.date_naive() == value.date_naive());
             let duration_close =
                 duration_delta.is_some_and(|delta| delta <= DURATION_CANDIDATE_SECS);
-            if !same_day && !duration_close && time_delta_seconds > CANDIDATE_WINDOW_SECS {
+            if clock.is_some() {
+                if !same_day && time_delta_seconds > CANDIDATE_WINDOW_SECS {
+                    return None;
+                }
+            } else if !same_day && !duration_close && time_delta_seconds > CANDIDATE_WINDOW_SECS {
                 return None;
             }
             let normalized_shop_name = normalize_match_text(&session.shop_name);
@@ -382,9 +445,9 @@ fn rank_sessions_by_clock_and_duration(
         let right_duration = video_len
             .and_then(|length| session_span_secs(&right.session).map(|span| (span - length).abs()))
             .unwrap_or(i64::MAX / 4);
-        left_duration
-            .cmp(&right_duration)
-            .then(left.time_delta_seconds.cmp(&right.time_delta_seconds))
+        left.time_delta_seconds
+            .cmp(&right.time_delta_seconds)
+            .then(left_duration.cmp(&right_duration))
     });
     candidates.truncate(12);
     candidates
@@ -476,6 +539,18 @@ mod tests {
             source_file: "valid-live-dashboard.xlsx".into(),
             imported_at: "2026-07-28T08:20:00Z".into(),
         }
+    }
+
+    #[test]
+    fn shop_name_suffix_matches_its_base_shop_but_not_another_shop() {
+        assert!(shop_names_match(
+            "金典拍拍科创专卖店-复古相机专场",
+            "金典拍拍科创专卖店"
+        ));
+        assert!(!shop_names_match(
+            "金典拍拍科创专卖店-复古相机专场",
+            "金典拍拍相机专卖店"
+        ));
     }
 
     #[test]
@@ -635,5 +710,55 @@ mod tests {
             result.automatic.as_ref().map(|(session, _)| session.id),
             Some(1)
         );
+    }
+
+    #[test]
+    fn imported_video_does_not_bind_other_day_excel_just_because_duration_matches() {
+        let mut other_day = session(1, "camera", "2026-08-01T16:17:00");
+        other_day.ended_at = "2026-08-01T18:36:00".into();
+
+        let result = match_imported_video_by_duration(
+            "金典拍拍相机专卖店_2026-08-12_16-30-00",
+            r"D:\videos\金典拍拍相机专卖店_2026-08-12_16-30-00.mp4",
+            "",
+            "2026-08-13T09:00:00",
+            Some(2 * 3600 + 19 * 60),
+            &[other_day.clone()],
+        );
+        assert!(result.automatic.is_none());
+        assert!(result.candidates.is_empty());
+        assert!(imported_bound_session_conflicts_with_video(
+            "金典拍拍相机专卖店_2026-08-12_16-30-00",
+            r"D:\videos\金典拍拍相机专卖店_2026-08-12_16-30-00.mp4",
+            "",
+            &other_day,
+        ));
+    }
+
+    #[test]
+    fn imported_bound_session_keeps_same_day_same_shop() {
+        let mut same_day = session(1, "camera", "2026-08-12T16:30:12");
+        same_day.ended_at = "2026-08-12T18:49:00".into();
+        assert!(!imported_bound_session_conflicts_with_video(
+            "金典拍拍相机专卖店_2026-08-12_16-30-00",
+            r"D:\videos\金典拍拍相机专卖店_2026-08-12_16-30-00.mp4",
+            "",
+            &same_day,
+        ));
+    }
+
+    #[test]
+    fn recorded_live_rejects_an_existing_auto_binding_from_another_day() {
+        let record = RecordForLiveDashboardBinding {
+            platform: "douyin".into(),
+            room_id: "whjdxjh".into(),
+            title: "索尼相机破".into(),
+            created_at: "2026-08-13T06:04:16+00:00".into(),
+            length_secs: Some(4806),
+        };
+        let mut wrong_day = session(1, "20083101300", "2026-08-01T13:19:38");
+        wrong_day.ended_at = "2026-08-01T14:58:54".into();
+
+        assert!(bound_session_conflicts_with_record(&record, &wrong_day));
     }
 }

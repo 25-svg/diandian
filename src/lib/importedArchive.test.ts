@@ -1,12 +1,13 @@
-import { describe, expect, it } from "vitest";
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
 import {
   buildImportedArchiveLiveId,
   getImportedVideoId,
   importedArchiveKindFromVideo,
   isImportedArchive,
   videoToImportedArchive,
-} from "./importedArchive";
-import type { VideoItem } from "./interface";
+} from "./importedArchive.js";
+import type { VideoItem } from "./interface.js";
 
 function sampleVideo(overrides: Partial<VideoItem> = {}): VideoItem {
   return {
@@ -38,19 +39,20 @@ function sampleVideo(overrides: Partial<VideoItem> = {}): VideoItem {
 describe("importedArchive", () => {
   it("maps imported videos into archive rows", () => {
     const archive = videoToImportedArchive(sampleVideo());
-    expect(archive.live_id).toBe(buildImportedArchiveLiveId(42));
-    expect(archive.platform).toBe("imported");
-    expect(archive.archive_kind).toBe("company");
-    expect(archive.imported_video_id).toBe(42);
-    expect(isImportedArchive(archive)).toBe(true);
-    expect(getImportedVideoId(archive)).toBe(42);
+    assert.equal(archive.live_id, buildImportedArchiveLiveId(42));
+    assert.equal(archive.platform, "imported");
+    assert.equal(archive.archive_kind, "company");
+    assert.equal(archive.imported_video_id, 42);
+    assert.equal(isImportedArchive(archive), true);
+    assert.equal(getImportedVideoId(archive), 42);
   });
 
   it("classifies competitor imports by note purpose", () => {
-    expect(
+    assert.equal(
       importedArchiveKindFromVideo(
         JSON.stringify({ analysisPurpose: "competitor_benchmark" }),
       ),
-    ).toBe("competitor");
+      "competitor",
+    );
   });
 });

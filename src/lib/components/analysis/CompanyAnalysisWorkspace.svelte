@@ -6,9 +6,11 @@
   import AiScriptReviewPanel from "./AiScriptReviewPanel.svelte";
   import LiveDataBoardPanel from "./LiveDataBoardPanel.svelte";
   import LiveHighFrequencyWordsPanel from "./LiveHighFrequencyWordsPanel.svelte";
+  import LiveMetricDiagnosisPanel from "./LiveMetricDiagnosisPanel.svelte";
+  import EmbeddedCompassPanel from "./EmbeddedCompassPanel.svelte";
   import LiveTopProductsPanel from "./LiveTopProductsPanel.svelte";
   import ClipReviewWorkspace from "../ClipReviewWorkspace.svelte";
-  import type { PaymentEvent } from "../../orderDealTimeline";
+  import type { PaymentEvent, PaymentEventsSummary } from "../../orderDealTimeline";
   import type { ClipReviewRequest } from "../../clipReview";
   import type {
     CompanyAnalysisTab,
@@ -25,10 +27,12 @@
     type LiveDataBoardSession,
   } from "../../liveDashboard";
   import type { ScriptIssueAnnotation } from "../../scriptQuality";
+  import type { SessionRhythmReview } from "../../sessionRhythm";
   import type { DealTranscriptWindow } from "../../dealTranscriptWindows";
 
   export let activeTab: CompanyAnalysisTab = "align";
   export let events: PaymentEvent[] = [];
+  export let sessionDurationSec = 0;
   export let videoId: number | null = null;
   export let archiveSource = false;
   export let transcriptEntries: WorkspaceTranscriptEntry[] = [];
@@ -43,6 +47,7 @@
   export let scriptQualityError = "";
   export let scriptQualitySummary = "";
   export let scriptQualityAnnotations: ScriptIssueAnnotation[] = [];
+  export let rhythmReview: SessionRhythmReview | null = null;
   export let selectedScriptCueId: number | null = null;
   /** Absolute playback seconds for 整场复盘 playhead sync. */
   export let playbackPositionSec = 0;
@@ -75,6 +80,7 @@
   /** Align-tab controls (orders + video sync). */
   export let alignOrderCount = 0;
   export let alignTotalPayYuan = 0;
+  export let alignOrderSummary: PaymentEventsSummary | null = null;
   export let alignLoading = false;
   export let alignError = "";
   export let alignCanPullOrders = false;
@@ -86,16 +92,25 @@
   export let excelCanDownload = false;
   export let excelDownloading = false;
   export let excelDownloadHint = "";
+  export let excelError = "";
 
   /** Default collapsed so analysis UI stays focused; expand when needed. */
   let dataBoardExpanded = true;
   let autoOpenedForBind = false;
   /** Only one bottom view at a time. */
-  let bottomBoardTab: "data" | "words" = "data";
+  let bottomBoardTab: "official" | "diagnosis" | "data" | "words" = "diagnosis";
 
   $: clipReviewMode = activeTab === "clip_review";
-  $: showBottomBoard = showDataBoard && !clipReviewMode;
-  $: needsManualBind = showBottomBoard && showDashboardBind && !dashboardSession && dashboardCandidates.length > 0 && !dashboardLoading;
+  // 整场复盘需要完整高度呈现「视频 + 文稿 + 节奏/建议」三栏；
+  // 数据看板保留在对齐/成交话术，不与复盘主任务争抢高度。
+  $: showBottomBoard = showDataBoard && !clipReviewMode && (activeTab !== "ai_review" || bottomBoardTab === "diagnosis");
+  $: needsManualBind = showDataBoard
+    && !clipReviewMode
+    && activeTab !== "ai_review"
+    && showDashboardBind
+    && !dashboardSession
+    && dashboardCandidates.length > 0
+    && !dashboardLoading;
   $: if (needsManualBind && !autoOpenedForBind) {
     dataBoardExpanded = true;
     bottomBoardTab = "data";
@@ -109,7 +124,7 @@
     selectScriptCue: number;
     autoClip: void;
     retrySpeechRefine: void;
-    openDashboard: void;
+    metricSeek: number;
     bindDashboardSession: void;
     rebindDashboardSession: void;
     closeClipReview: void;
@@ -192,6 +207,7 @@
         <AlignSessionPanel
           orderCount={alignOrderCount}
           totalPayYuan={alignTotalPayYuan}
+          orderSummary={alignOrderSummary}
           loading={alignLoading}
           error={alignError}
           canPullOrders={alignCanPullOrders}
@@ -225,6 +241,7 @@
           {excelCanDownload}
           {excelDownloading}
           {excelDownloadHint}
+          {excelError}
           on:downloadExcel={() => dispatch("downloadExcel")}
         />
       {:else if activeTab === "deal_speech"}
@@ -269,6 +286,8 @@
       {:else}
         <AiScriptReviewPanel
           {transcriptEntries}
+          {events}
+          durationSec={sessionDurationSec}
           {dealWindows}
           {dealSentenceCount}
           {needsFullTranscriptBackfill}
@@ -277,6 +296,7 @@
           analyzeError={scriptQualityError}
           qualitySummary={scriptQualitySummary}
           annotations={scriptQualityAnnotations}
+          {rhythmReview}
           selectedCueId={selectedScriptCueId}
           {playbackPositionSec}
           on:seek={(event) => dispatch("seek", event.detail)}
@@ -303,10 +323,28 @@
             <ChevronRight size={14} />
           {/if}
           <span>数据看板</span>
-          <small>{dataBoardExpanded ? "收起" : "展开 · 显示数据面板/高频词"}</small>
+          <small>{dataBoardExpanded ? "收起" : "展开 · 显示官方罗盘/流量诊断/数据/高频词"}</small>
         </button>
         {#if dataBoardExpanded}
           <div class="bottom-tabs" role="tablist" aria-label="数据看板视图">
+            <button
+              type="button"
+              role="tab"
+              class:active={bottomBoardTab === "official"}
+              aria-selected={bottomBoardTab === "official"}
+              on:click={() => { bottomBoardTab = "official"; }}
+            >
+              官方罗盘
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={bottomBoardTab === "diagnosis"}
+              aria-selected={bottomBoardTab === "diagnosis"}
+              on:click={() => { bottomBoardTab = "diagnosis"; }}
+            >
+              流量诊断
+            </button>
             <button
               type="button"
               role="tab"
@@ -329,6 +367,18 @@
         {/if}
       </div>
       {#if dataBoardExpanded}
+        {#if bottomBoardTab === "diagnosis"}
+          <div id="company-data-board-body" class="diagnosis-board-body">
+            <LiveMetricDiagnosisPanel
+              session={dashboardSession}
+              on:seek={(event) => dispatch("metricSeek", event.detail)}
+            />
+          </div>
+        {:else if bottomBoardTab === "official"}
+          <div id="company-data-board-body" class="official-board-body">
+            <EmbeddedCompassPanel session={dashboardSession} />
+          </div>
+        {:else}
         <div class="data-board-expanded-grid">
           <LiveTopProductsPanel {events} {transcriptEntries} {transcriptBackfilling} />
           <div id="company-data-board-body" class="data-board-body">
@@ -343,7 +393,6 @@
                 {orderSummary}
                 {showDashboardBind}
                 compactHeader={true}
-                on:openDashboard={() => dispatch("openDashboard")}
                 on:bindSession={() => dispatch("bindDashboardSession")}
                 on:rebindSession={() => dispatch("rebindDashboardSession")}
               />
@@ -357,8 +406,7 @@
             {/if}
           </div>
         </div>
-      {:else}
-        <LiveTopProductsPanel {events} {transcriptEntries} {transcriptBackfilling} />
+        {/if}
       {/if}
     </div>
   {/if}
@@ -563,6 +611,24 @@
     display: flex;
     flex-direction: column;
     padding: 0;
+    border: 1px solid #e5efff;
+    border-radius: 10px;
+    background: #fff;
+  }
+  .diagnosis-board-body {
+    min-width: 0;
+    min-height: 0;
+    flex: 1 1 auto;
+    overflow: auto;
+    border: 1px solid #e5efff;
+    border-radius: 10px;
+    background: #fff;
+  }
+  .official-board-body {
+    min-width: 0;
+    min-height: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
     border: 1px solid #e5efff;
     border-radius: 10px;
     background: #fff;

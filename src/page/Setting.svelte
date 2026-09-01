@@ -17,7 +17,7 @@
     DiscAlbum,
     SquareBottomDashedScissors,
   } from "lucide-svelte";
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
 
   let setting_model: Config = {
     cache: "",
@@ -55,6 +55,8 @@
       archive_imports: true,
       delete_local_after_archive: true,
     },
+    autostart_enabled: true,
+    startup_wizard_completed: false,
     status_check_interval: 30, // 默认30秒
     whisper_language: "",
 
@@ -72,6 +74,21 @@
   let outputChanging = false;
   let storageMessage = "";
   let storageError = "";
+  type StorageRuntimeStatus = {
+    preferredCache: string;
+    activeCache: string;
+    usingFallback: boolean;
+    preferredAvailable: boolean;
+    detail: string;
+  };
+  let storageRuntimeStatus: StorageRuntimeStatus = {
+    preferredCache: "",
+    activeCache: "",
+    usingFallback: false,
+    preferredAvailable: false,
+    detail: "",
+  };
+  let storageRuntimePoll: ReturnType<typeof setInterval> | null = null;
   let endpoint = localStorage.getItem("endpoint") || "";
   let endpointValue = endpoint;
 
@@ -131,6 +148,68 @@
       clipNotify: setting_model.clip_notify,
       postNotify: setting_model.post_notify,
     });
+  }
+
+  async function syncStorageRuntimeStatus(autoRecover = false) {
+    try {
+      storageRuntimeStatus = await invoke<StorageRuntimeStatus>(
+        "get_storage_runtime_status",
+      );
+      if (
+        autoRecover
+        && storageRuntimeStatus.usingFallback
+        && storageRuntimeStatus.preferredAvailable
+        && !cacheChanging
+        && !outputChanging
+      ) {
+        await restorePreferredCache(true);
+      }
+    } catch {
+      storageRuntimeStatus = {
+        preferredCache: setting_model.cache,
+        activeCache: setting_model.cache,
+        usingFallback: false,
+        preferredAvailable: false,
+        detail: "",
+      };
+    }
+  }
+
+  async function restorePreferredCache(automatic = false) {
+    if (
+      cacheChanging
+      || outputChanging
+      || !storageRuntimeStatus.preferredCache
+    ) {
+      return;
+    }
+    cacheChanging = true;
+    storageError = "";
+    storageMessage = automatic
+      ? "首选缓存路径已恢复，正在自动迁回临时缓存…"
+      : "正在迁回首选缓存路径…";
+    try {
+      await invoke("set_cache_path", {
+        cachePath: storageRuntimeStatus.preferredCache,
+      });
+      await get_config();
+      storageMessage = "已恢复首选缓存路径";
+    } catch (error) {
+      storageMessage = "";
+      storageError = `恢复首选缓存路径失败：${formatStorageError(error)}`;
+    } finally {
+      cacheChanging = false;
+      await syncStorageRuntimeStatus(false);
+    }
+  }
+
+  async function update_autostart() {
+    try {
+      await invoke("update_autostart_enabled", { enabled: setting_model.autostart_enabled });
+    } catch (error) {
+      setting_model.autostart_enabled = !setting_model.autostart_enabled;
+      alert(`开机自启设置失败：${formatStorageError(error)}`);
+    }
   }
 
   async function handleCacheChange() {
@@ -197,6 +276,7 @@
       storageError = formatStorageError(e);
     } finally {
       cacheChanging = false;
+      await syncStorageRuntimeStatus(false);
     }
   }
 
@@ -242,6 +322,17 @@
   onMount(async () => {
     await get_config();
     await syncStorageMigrationStatus();
+    await syncStorageRuntimeStatus(true);
+    storageRuntimePoll = setInterval(() => {
+      void syncStorageRuntimeStatus(true);
+    }, 10_000);
+  });
+
+  onDestroy(() => {
+    if (storageRuntimePoll) {
+      clearInterval(storageRuntimePoll);
+      storageRuntimePoll = null;
+    }
   });
 </script>
 
@@ -258,6 +349,29 @@
           <div
             class="mac-card divide-y divide-[color:var(--mac-separator)]"
           >
+            <div class="p-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h3 class="text-sm font-medium text-gray-900 dark:text-white">
+                    Windows 开机自动运行
+                  </h3>
+                  <p class="text-sm text-gray-500 dark:text-gray-400">
+                    登录 Windows 后自动进入托盘，后台检测直播并优先保证录制
+                  </p>
+                </div>
+                <label class="relative inline-block w-11 h-6">
+                  <input
+                    type="checkbox"
+                    class="peer opacity-0 w-0 h-0"
+                    bind:checked={setting_model.autostart_enabled}
+                    on:change={update_autostart}
+                  />
+                  <span
+                    class="switch-slider absolute cursor-pointer top-0 left-0 right-0 bottom-0 bg-gray-300 dark:bg-gray-600 rounded-full transition-all duration-300 before:absolute before:h-4 before:w-4 before:left-1 before:bottom-1 before:bg-white before:rounded-full before:transition-all before:duration-300 peer-checked:bg-[color:var(--mac-green-solid)] peer-checked:before:translate-x-5"
+                  ></span>
+                </label>
+              </div>
+            </div>
             <div class="p-4">
               <div class="flex items-center justify-between">
                 <div>
@@ -358,7 +472,7 @@
                 class="mac-card divide-y divide-[color:var(--mac-separator)]"
               >
                 {#if cacheChanging || outputChanging}
-                  <div class="p-4 text-sm text-blue-700 bg-blue-50">
+                  <div class="p-4 text-sm text-blue-700 bg-blue-50" role="status" aria-live="polite">
                     {#if cacheChanging && outputChanging}
                       缓存与切片目录正在迁移，请勿关闭程序。
                     {:else if cacheChanging}
@@ -366,6 +480,34 @@
                     {:else}
                       切片目录正在迁移（D 盘 → NAS 可能较慢），请勿关闭程序。
                     {/if}
+                  </div>
+                {/if}
+                {#if storageRuntimeStatus.usingFallback}
+                  <div class="p-4 bg-amber-50 text-amber-900" role="status" aria-live="polite" aria-atomic="true">
+                    <div class="flex items-start justify-between gap-4">
+                      <div class="flex items-start gap-3 min-w-0">
+                        <AlertTriangle class="w-5 h-5 mt-0.5 flex-shrink-0 text-amber-600" aria-hidden="true" />
+                        <div class="space-y-1 min-w-0">
+                          <p class="text-sm font-semibold">正在使用本机临时缓存</p>
+                          <p class="text-sm">{storageRuntimeStatus.detail}</p>
+                          <p class="text-xs break-all">
+                            首选路径：{storageRuntimeStatus.preferredCache}
+                          </p>
+                          <p class="text-xs break-all">
+                            当前使用：{storageRuntimeStatus.activeCache}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        class="mac-btn flex-shrink-0"
+                        disabled={!storageRuntimeStatus.preferredAvailable || cacheChanging || outputChanging}
+                        title={storageRuntimeStatus.preferredAvailable ? "将临时缓存迁回首选路径" : "首选路径当前仍不可用"}
+                        on:click={() => restorePreferredCache(false)}
+                      >
+                        {storageRuntimeStatus.preferredAvailable ? "立即恢复" : "等待恢复"}
+                      </button>
+                    </div>
                   </div>
                 {/if}
                 {#if storageMessage}
@@ -385,7 +527,7 @@
                       <h3
                         class="text-sm font-medium text-gray-900 dark:text-white"
                       >
-                        缓存路径
+                        首选缓存路径
                       </h3>
                       <p class="text-sm text-gray-500 dark:text-gray-400">
                         {setting_model.cache}

@@ -38,6 +38,8 @@ export interface RecorderInfo {
   live_id: string;
   recording: boolean;
   enabled: boolean;
+  current_streamer: string;
+  current_streamer_source: "manual" | "auto" | "";
 }
 
 export interface RecorderList {
@@ -215,6 +217,37 @@ export interface Config {
   powerlive_key: string;
   knowledge_vault_path: string;
   nas_video_storage: NasVideoStorageConfig;
+  autostart_enabled: boolean;
+  startup_wizard_completed: boolean;
+}
+
+export interface RecorderHealthRow {
+  platform: string;
+  roomId: string;
+  status: "initializing" | "ready" | "live_waiting" | "recording_starting" | "recording" | "retry_wait" | "needs_attention" | "disabled" | "login_required";
+  errorCode: string;
+  message: string;
+  retryCount: number;
+  nextRetryAt: string | null;
+  updatedAt: string;
+}
+
+export interface StartupReadiness {
+  wizardCompleted: boolean;
+  autostartEnabled: boolean;
+  accountCount: number;
+  recorderCount: number;
+  ffmpegOk: boolean;
+  ffmpegDetail: string;
+  funasrOk: boolean;
+  funasrDetail: string;
+  cacheOk: boolean;
+  cacheDetail: string;
+  outputOk: boolean;
+  outputDetail: string;
+  nasConfigured: boolean;
+  doudianConfigured: boolean;
+  readyForRecording: boolean;
 }
 
 export interface NasVideoStorageConfig {

@@ -7,6 +7,7 @@ import {
   clampDealClipRange,
   clusterDealOrderEvents,
   dealClipContextCacheKey,
+  dealAutoClipDisabledReason,
   DEAL_CLIP_CONTEXT_POST_SEC,
   DEAL_CLIP_CONTEXT_PRE_SEC,
   DEAL_CLIP_MAX_DURATION_SEC,
@@ -17,6 +18,40 @@ import {
   selectDealClipContext,
   type DealClipRange,
 } from "./dealOrderAutoClip.js";
+
+assert.equal(
+  dealAutoClipDisabledReason({
+    analysisMode: "company_deal",
+    hasVideo: true,
+    paymentEventCount: 2,
+    transcriptEntryCount: 99,
+    isTranscribing: false,
+  }),
+  "",
+  "orders + transcript + video must enable auto clip without relying on legacy video status",
+);
+assert.equal(
+  dealAutoClipDisabledReason({
+    analysisMode: "company_deal",
+    hasVideo: false,
+    hasArchiveSource: true,
+    paymentEventCount: 2,
+    transcriptEntryCount: 99,
+    isTranscribing: false,
+  }),
+  "",
+  "recorder TS archives must be eligible for direct clip export",
+);
+assert.match(
+  dealAutoClipDisabledReason({
+    analysisMode: "company_deal",
+    hasVideo: true,
+    paymentEventCount: 2,
+    transcriptEntryCount: 20,
+    isTranscribing: true,
+  }),
+  /仍在转写/,
+);
 
 const events: PaymentEvent[] = [
   { offsetSec: 45, payAmountFen: 10000, productName: "佳能 R7" },

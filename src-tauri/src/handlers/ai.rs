@@ -9,7 +9,15 @@ use std::collections::HashSet;
 use tauri::State as TauriState;
 
 const MINIMAX_URL: &str = "https://api.minimaxi.com/anthropic/v1/messages";
-const MINIMAX_MODEL: &str = "MiniMax-VL-01";
+const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
+
+fn configured_minimax_model() -> String {
+    std::env::var("BILI_SHADOWREPLAY_MINIMAX_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_MINIMAX_MODEL.to_string())
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MiniMaxMessage {
@@ -124,7 +132,7 @@ pub(crate) async fn request_minimax_text(
     max_tokens: u32,
 ) -> Result<String, String> {
     let request_body = json!({
-        "model": MINIMAX_MODEL,
+        "model": configured_minimax_model(),
         "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": messages,
@@ -368,6 +376,11 @@ fn is_high_risk_fact_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_minimax_model_is_m3() {
+        assert_eq!(DEFAULT_MINIMAX_MODEL, "MiniMax-M3");
+    }
 
     fn proposal(source: &str, corrected: &str) -> ProposedCorrection {
         ProposedCorrection {

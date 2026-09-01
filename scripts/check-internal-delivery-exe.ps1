@@ -44,6 +44,7 @@ try {
         (Join-Path $extractPath "app\vcruntime140.dll"),
         (Join-Path $extractPath "app\vcruntime140_1.dll"),
         (Join-Path $extractPath "app\funasr-runtime\funasr-service.exe"),
+        (Join-Path $extractPath "app\doudian-runtime\doudian-fetch-payment-events.exe"),
         (Join-Path $extractPath "runtime\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"),
         (Join-Path $extractPath "seed\data_v2.db"),
         (Join-Path $extractPath "seed\ggml-small-q5_1.bin")
@@ -66,6 +67,7 @@ try {
     }
     foreach ($installedFile in @(
         (Join-Path $testInstallRoot "storage\应用\funasr-runtime\funasr-service.exe"),
+        (Join-Path $testInstallRoot "storage\应用\doudian-runtime\doudian-fetch-payment-events.exe"),
         (Join-Path $testInstallRoot "storage\应用\vcruntime140.dll"),
         (Join-Path $testInstallRoot "storage\应用\vcruntime140_1.dll"),
         (Join-Path $testInstallRoot "appdata\cn.vjoi.bili-shadowreplay\models\whisper\ggml-small-q5_1.bin")

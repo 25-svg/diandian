@@ -21,6 +21,29 @@ export const DEAL_CHAIN_CLUSTER_GAP_SEC = 5 * 60;
 export const DEAL_CLIP_DEFAULT_PRE_SEC = 90;
 export const DEAL_CLIP_DEFAULT_POST_SEC = 30;
 
+export type DealAutoClipAvailability = {
+  analysisMode: string;
+  hasVideo: boolean;
+  hasArchiveSource?: boolean;
+  paymentEventCount: number;
+  transcriptEntryCount: number;
+  isTranscribing: boolean;
+};
+
+/**
+ * Frontend readiness only. Source existence/readability is checked again by
+ * the backend queue preflight, so legacy video status values must not keep a
+ * completed imported recording permanently disabled.
+ */
+export function dealAutoClipDisabledReason(input: DealAutoClipAvailability): string {
+  if (input.analysisMode !== "company_deal") return "当前分析模式不支持成交自动切片";
+  if (!input.hasVideo && !input.hasArchiveSource) return "尚未加载可切片的视频";
+  if (input.paymentEventCount <= 0) return "请先拉取或导入成交订单";
+  if (input.transcriptEntryCount <= 0) return "请先完成成交窗口转写";
+  if (input.isTranscribing) return "成交窗口仍在转写，完成后即可切片";
+  return "";
+}
+
 export type DealClipContext = {
   peak: DealMinuteBucket;
   payAnchorSec: number;
@@ -109,14 +132,17 @@ function representativeProductNames(events: readonly PaymentEvent[]): string[] {
 export function buildDealClipContexts(
   events: readonly PaymentEvent[],
   transcriptEntries: readonly WorkspaceTranscriptEntry[],
+  options?: { preSec?: number; postSec?: number },
 ): DealClipContext[] {
+  const preSec = options?.preSec ?? DEAL_CLIP_CONTEXT_PRE_SEC;
+  const postSec = options?.postSec ?? DEAL_CLIP_CONTEXT_POST_SEC;
   return clusterDealOrderEvents(events).map((cluster) => {
     const clusterEvents = cluster.events;
     const payAnchorSec = clusterEvents[0]!.offsetSec;
     const payEndSec = clusterEvents[clusterEvents.length - 1]!.offsetSec;
     const window = {
-      start: Math.max(0, Math.floor(payAnchorSec) - DEAL_CLIP_CONTEXT_PRE_SEC),
-      end: Math.floor(payEndSec) + DEAL_CLIP_CONTEXT_POST_SEC,
+      start: Math.max(0, Math.floor(payAnchorSec) - preSec),
+      end: Math.floor(payEndSec) + postSec,
     };
     const peak: DealMinuteBucket = {
       minuteIndex: Math.floor(payAnchorSec / 60),

@@ -18,7 +18,7 @@
     settings.provider = provider;
     if (provider === "minimax") {
       settings.endpoint = "https://api.minimaxi.com/anthropic";
-      settings.model = "MiniMax-VL-01";
+      settings.model = "MiniMax-M3";
     } else if (provider === "openai" && settings.endpoint.includes("minimaxi.com")) {
       settings.endpoint = "https://api.openai.com/v1";
       settings.model = "";
@@ -171,7 +171,7 @@
             placeholder={settings.provider === 'ollama'
               ? 'llama2, mistral, qwen...'
               : settings.provider === 'minimax'
-                ? 'MiniMax-VL-01'
+                ? 'MiniMax-M3'
                 : 'gpt-4, gpt-3.5-turbo...'}
             class="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent text-sm"
           />

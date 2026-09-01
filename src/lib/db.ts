@@ -41,6 +41,7 @@ export interface RecordItem {
   anchor_detected_at: string;
   archive_kind: "company" | "competitor";
   classification_source: "auto_rule" | "manual";
+  source_path: string;
   /** Present when this row represents an externally imported video in 录播档案. */
   imported_video_id?: number;
 }

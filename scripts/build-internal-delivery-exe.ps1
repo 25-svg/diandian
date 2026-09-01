@@ -87,8 +87,17 @@ try {
         $outputStream.Dispose()
     }
 
-    $hash = Get-FileHash -LiteralPath $resolvedOutput -Algorithm SHA256
-    $hashLine = $hash.Hash + "  " + [System.IO.Path]::GetFileName($resolvedOutput)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hashStream = [System.IO.File]::OpenRead($resolvedOutput)
+    try {
+        $hashBytes = $sha256.ComputeHash($hashStream)
+    }
+    finally {
+        $hashStream.Dispose()
+        $sha256.Dispose()
+    }
+    $hashHex = ([System.BitConverter]::ToString($hashBytes)).Replace("-", "")
+    $hashLine = $hashHex + "  " + [System.IO.Path]::GetFileName($resolvedOutput)
     [System.IO.File]::WriteAllText(
         ($resolvedOutput + "-SHA256.txt"),
         $hashLine + [Environment]::NewLine,

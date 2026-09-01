@@ -181,7 +181,7 @@ function createAgent(config: AgentConfig) {
     agentModel = new ChatAnthropic({
       apiKey: config.apiKey,
       anthropicApiUrl: config.baseURL || 'https://api.minimaxi.com/anthropic',
-      model: config.model || 'MiniMax-VL-01',
+      model: config.model || 'MiniMax-M3',
       maxTokens: 4096,
       clientOptions: {
         fetch: aiFetch as typeof fetch,
@@ -207,7 +207,7 @@ function createAgent(config: AgentConfig) {
     });
   }
 
-  // MiniMax-VL-01 is used through the Anthropic-compatible endpoint in the
+  // MiniMax-M3 is used through the Anthropic-compatible endpoint in the
   // user's existing plan. Keep this path text-only: sending the application's
   // large nested tool schema can be rejected by the model before it answers
   // even a simple prompt. Recording and clipping remain explicit UI actions.

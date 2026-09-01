@@ -39,6 +39,9 @@ export default defineConfig(async ({ mode }) => {
     clearScreen: false,
     // tauri expects a fixed port, fail if that port is not available
     server: {
+      // Keep the dev server on IPv4 loopback. The desktop WebView can resolve
+      // `localhost` to 127.0.0.1 while Vite otherwise listens only on ::1.
+      host: "127.0.0.1",
       port: 8054,
       strictPort: true,
       watch: {

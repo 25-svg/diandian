@@ -430,13 +430,22 @@ mod master_script_database_tests {
             .insert_support_candidate(queued_candidate(master.id, section.id, 85))
             .await
             .unwrap();
+        assert!(matches!(
+            db.decide_support_candidate(candidate.id, "merged").await,
+            Err(DatabaseError::InvalidMasterScriptState(_))
+        ));
         let approved = db
             .decide_support_candidate(candidate.id, "approved")
             .await
             .unwrap();
         assert_eq!(approved.status, "approved");
+        let merged = db
+            .decide_support_candidate(candidate.id, "merged")
+            .await
+            .unwrap();
+        assert_eq!(merged.status, "merged");
         assert!(matches!(
-            db.decide_support_candidate(candidate.id, "merged").await,
+            db.decide_support_candidate(candidate.id, "rejected").await,
             Err(DatabaseError::InvalidMasterScriptState(_))
         ));
     }

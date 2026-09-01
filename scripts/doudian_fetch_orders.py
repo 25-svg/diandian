@@ -26,6 +26,8 @@ See docs/integrations/douyin/order-searchList-pay-time-guide.md
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sys
 from datetime import datetime, timezone, timedelta
@@ -36,6 +38,37 @@ CN_TZ = timezone(timedelta(hours=8))
 DEFAULT_ENV = Path(r"d:\Desktop\.env")
 DEFAULT_TOKEN = Path(r"d:\Desktop\doudian_token.env")
 DEFAULT_SDK = Path(r"d:\Desktop\doudian-sdk-python-1.1.0-20260724091610\sdk-python")
+TOKEN_EXPIRED_SUB_CODES = frozenset(
+    {
+        "isv.access-token-expired",
+        "isv.access-token-no-existed",
+    }
+)
+
+
+class DoudianApiError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        method: str,
+        code: Any,
+        msg: Any,
+        sub_code: Any,
+        sub_msg: Any,
+    ) -> None:
+        self.method = method
+        self.code = code
+        self.msg = msg
+        self.sub_code = str(sub_code or "")
+        self.sub_msg = sub_msg
+        super().__init__(
+            f"{method} failed: code={code} msg={msg} "
+            f"sub_code={self.sub_code} sub_msg={sub_msg}"
+        )
+
+    @property
+    def is_access_token_expired(self) -> bool:
+        return self.sub_code in TOKEN_EXPIRED_SUB_CODES
 
 
 def load_kv_file(path: Path) -> dict[str, str]:
@@ -208,11 +241,17 @@ def fetch_orders(
             status.order_status = order_status
             request.params.combine_status = [status]
 
-        response = request.execute(StaticAccessToken(access_token))
+        # This SDK version prints its signature source (including credentials)
+        # to stdout. Keep it out of application logs and JSON output.
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = request.execute(StaticAccessToken(access_token))
         if not response.isSuccess():
-            raise RuntimeError(
-                f"order.searchList failed: code={response.code} msg={response.msg} "
-                f"sub_code={response.sub_code} sub_msg={response.sub_msg}"
+            raise DoudianApiError(
+                method="order.searchList",
+                code=response.code,
+                msg=response.msg,
+                sub_code=response.sub_code,
+                sub_msg=response.sub_msg,
             )
 
         data = response.data or {}

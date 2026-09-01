@@ -30,6 +30,10 @@ pub struct RecorderInfo {
     pub live_id: String,
     pub recording: bool,
     pub enabled: bool,
+    #[serde(default)]
+    pub current_streamer: String,
+    #[serde(default)]
+    pub current_streamer_source: String,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]

@@ -73,6 +73,8 @@ mod tests {
             live_id: "lid".to_string(),
             recording: true,
             enabled: true,
+            current_streamer: String::new(),
+            current_streamer_source: String::new(),
         });
         let event = new_webhook_event(LIVE_STARTED, payload);
         assert_eq!(event.event, "live.started");
@@ -89,6 +91,8 @@ mod tests {
             live_id: "".to_string(),
             recording: false,
             enabled: false,
+            current_streamer: String::new(),
+            current_streamer_source: String::new(),
         });
         let payload2 = Payload::Room(RecorderInfo {
             room_info: recorder::RoomInfo::default(),
@@ -97,6 +101,8 @@ mod tests {
             live_id: "".to_string(),
             recording: false,
             enabled: false,
+            current_streamer: String::new(),
+            current_streamer_source: String::new(),
         });
         let e1 = new_webhook_event(LIVE_STARTED, payload1);
         let e2 = new_webhook_event(LIVE_STARTED, payload2);
@@ -112,6 +118,8 @@ mod tests {
             live_id: "".to_string(),
             recording: false,
             enabled: false,
+            current_streamer: String::new(),
+            current_streamer_source: String::new(),
         });
         let event = new_webhook_event(RECORD_STARTED, payload);
         let json = serde_json::to_string(&event).unwrap();

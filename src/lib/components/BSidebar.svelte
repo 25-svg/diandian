@@ -8,9 +8,11 @@
     Users,
     Video,
     History,
+    GraduationCap,
+    BookOpenCheck,
     Scissors,
     Sparkles,
-    MonitorUp,
+    Bot,
   } from "lucide-svelte";
   import { hasNewVersion } from "../stores/version";
   import SidebarItem from "./SidebarItem.svelte";
@@ -24,7 +26,9 @@
    * @param {{ detail: String; }} route
    */
   function navigate(route) {
-    dispatch("activeChange", route.detail);
+    activeUrl = String(route.detail);
+    dispatch("activeChange", activeUrl);
+    window.dispatchEvent(new CustomEvent("bsr:navigate", { detail: activeUrl }));
   }
 </script>
 
@@ -40,7 +44,7 @@
   </div>
 
   <div class="nav-label">工作台</div>
-  <nav class="nav-list">
+  <nav class="nav-list" aria-label="主导航">
     <SidebarItem label="总览" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
         <LayoutDashboard class="w-5 h-5" />
@@ -66,9 +70,19 @@
         <List class="w-5 h-5" />
       </div>
     </SidebarItem>
-    <SidebarItem label="直播数据大屏" {activeUrl} on:activeChange={navigate}>
+    <SidebarItem label="情景训练" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
-        <MonitorUp class="w-5 h-5" />
+        <GraduationCap class="w-5 h-5" />
+      </div>
+    </SidebarItem>
+    <SidebarItem label="主播教练" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon">
+        <Bot class="w-5 h-5" />
+      </div>
+    </SidebarItem>
+    <SidebarItem label="主播知识库" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon">
+        <BookOpenCheck class="w-5 h-5" />
       </div>
     </SidebarItem>
     <SidebarItem label="账号" {activeUrl} on:activeChange={navigate}>
@@ -148,6 +162,44 @@
   .sidebar-footer > div:last-child { min-width: 0; display: flex; flex-direction: column; }
   .sidebar-footer strong { display: flex; align-items: center; gap: 4px; color: var(--mac-secondary); font-size: 10px; }
   .sidebar-footer span { margin-top: 2px; color: var(--mac-tertiary); font-size: 9px; }
+
+  @media (max-width: 700px) {
+    .dd-sidebar {
+      width: 100%;
+      height: auto;
+      flex: 0 0 auto;
+      padding: 6px 8px;
+      border-right: 0;
+      border-bottom: 1px solid var(--mac-separator);
+    }
+    .brand,
+    .nav-label,
+    .sidebar-footer {
+      display: none;
+    }
+    .nav-list {
+      width: 100%;
+      padding: 2px;
+      flex-direction: row;
+      gap: 4px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      overscroll-behavior-inline: contain;
+      scroll-padding-inline: 4px;
+    }
+    .dd-sidebar :global(.sidebar-item) {
+      width: auto;
+      min-width: max-content;
+      height: 44px;
+      flex: 0 0 auto;
+      padding: 0 12px;
+      white-space: nowrap;
+    }
+    .dd-sidebar :global(.sidebar-item:focus-visible) {
+      outline: 2px solid var(--mac-blue);
+      outline-offset: -2px;
+    }
+  }
 
   :global(.dark) .dd-sidebar { color: var(--mac-label); background: rgba(28, 28, 30, 0.84); border-right-color: rgba(255, 255, 255, 0.08); }
   :global(.dark) .sidebar-footer { border-color: rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.06); }

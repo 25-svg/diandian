@@ -451,8 +451,7 @@ pub async fn open_douyin_login(state: state_type!()) -> Result<(), String> {
         .app_data_dir()
         .map_err(|e| format!("无法获取应用数据目录: {e}"))?
         .join("douyin-login");
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("无法创建抖音登录数据目录: {e}"))?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("无法创建抖音登录数据目录: {e}"))?;
 
     // Use WebView2 default UA — custom Chrome UA mismatches TLS fingerprint and triggers 403.
     tauri::WebviewWindowBuilder::new(

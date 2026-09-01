@@ -4,7 +4,6 @@
   import { listen } from "@tauri-apps/api/event";
   import {
     ArrowLeft,
-    BarChart3,
     BookOpenCheck,
     Check,
     Clipboard,
@@ -31,6 +30,7 @@
   import {
     buildDealClipContexts,
     buildDealClipUserPrompt,
+    dealAutoClipDisabledReason as resolveDealAutoClipDisabledReason,
     dealClipContextCacheKey,
     DEAL_CLIP_SYSTEM_PROMPT,
     finalizeDealClipFromAi,
@@ -38,19 +38,22 @@
     selectDealClipContext,
     type DealClipRange,
   } from "../lib/dealOrderAutoClip";
-  import { buildClipReviewRequest, buildExistingClipReviewRequest, clipReviewRequestStorageKey, clipTranscriptToSrt, mergeClipReviewRequest, parseGeneratedDealClips, parseSavedClipReviewRequest, rebuildClipReviewRequest, serializeClipReviewRequest, type ClipReviewRange, type ClipReviewRequest } from "../lib/clipReview";
+  import { buildClipReviewRequest, buildExistingClipReviewRequest, clipLocalTranscript, clipReviewRequestStorageKey, clipTranscriptToSrt, mergeClipReviewRequest, parseGeneratedDealClips, parseSavedClipReviewRequest, rebuildClipReviewRequest, serializeClipReviewRequest, type ClipReviewRange, type ClipReviewRequest } from "../lib/clipReview";
   import { get_static_url, invoke, TAURI_ENV } from "../lib/invoker";
   import type { RecordItem } from "../lib/db";
   import { isClipVideo, type VideoItem } from "../lib/interface";
   import { COMMERCE_REVIEW_PROMPT } from "../lib/agent/prompts";
   import { operationalScriptLabel } from "../lib/scriptTaxonomy";
   import { buildImportedArchiveLiveId, isImportedArchive } from "../lib/importedArchive";
-  import { dashboardMetricCards, openLiveDashboard, type LiveDashboardMetrics } from "../lib/liveDashboard";
+  import { dashboardMetricCards, type LiveDashboardMetrics } from "../lib/liveDashboard";
   import {
     inferCompassDateFromVideo,
-    inferCompassShopFromTexts,
+    resolveCompassShopFromAccount,
+    parseCompassIdentityFromTexts,
     compassStatusLabel,
+    normalizeCompassStartedAt,
   } from "../lib/compassAutoDownload";
+  import type { RecorderList } from "../lib/interface";
   import { buildSessionDiagnosis } from "../lib/sessionDiagnosis";
   import {
     buildOptimizationPlan,
@@ -64,6 +67,7 @@
     buildPeakDealMinuteLabel,
     dealReviewSeekOffset,
     parsePaymentEventsPayload,
+    paymentEventsHistoryStorageKey,
     paymentEventsStorageKey,
     type PaymentEvent,
     type PaymentEventsSummary,
@@ -86,6 +90,13 @@
     splitTranscriptForScriptQuality,
     type ScriptIssueAnnotation,
   } from "../lib/scriptQuality";
+  import {
+    buildSessionRhythmAnalysis,
+    buildSessionRhythmUserMessage,
+    parseSessionRhythmReview,
+    sessionRhythmSystemPrompt,
+    type SessionRhythmReview,
+  } from "../lib/sessionRhythm";
   import {
     ANALYSIS_ZOOM_MAX,
     ANALYSIS_ZOOM_MIN,
@@ -170,6 +181,7 @@
   export let refreshToken = 0;
   export let analysisMode: "legacy" | "company_deal" = "legacy";
   export let focusTab: "" | "clip_review" = "";
+  export let initialSeekSeconds: number | null = null;
 
   type TranscriptRefreshResult = {
     subtitle: string;
@@ -202,8 +214,6 @@
     startOffset: number;
     message: string;
   };
-
-  declare const shaka: any;
 
   type TranscriptEntry = {
     id: number;
@@ -257,6 +267,10 @@
     updatedAt: string;
     sourceTitle?: string;
     diagnosis?: ReturnType<typeof buildSessionDiagnosis>;
+    anchorName?: string;
+    anchorIdentityConfirmed?: boolean;
+    commentEvidenceStatus?: "available" | "missing" | "unknown";
+    commentCount?: number;
   };
 
   const dispatch = createEventDispatcher();
@@ -275,8 +289,17 @@
 
   let loadedSourceKey = "";
   let loadedRefreshToken = -1;
+  let appliedInitialSeekKey = "";
   let transcript = "";
   let transcriptEntries: TranscriptEntry[] = [];
+  type EvidenceTranscriptFocus = {
+    sourceKey: string;
+    query: string;
+    summary?: string;
+  };
+  const EVIDENCE_TRANSCRIPT_FOCUS_STORAGE_KEY = "bsr:evidence-transcript-focus:v1";
+  let evidenceTranscriptFocus: EvidenceTranscriptFocus | null = null;
+  let focusedEvidenceTranscriptEntryId: number | null = null;
   let candidates: Candidate[] = [];
   let reviews: Record<string, ReviewResult> = {};
   let selectedCandidateId = "";
@@ -309,6 +332,13 @@
   let copiedAction = "";
   let playerUrl = "";
   let playerNonce = 0;
+  type EmbeddedPlayerFrameStatus = "idle" | "loading" | "ready" | "error";
+  let playerFrameStatus: EmbeddedPlayerFrameStatus = "idle";
+  let playerFrameError = "";
+  let playerFrameLoadingHint = "正在检查录播文件…";
+  let playerFrameShellReady = false;
+  let playerFrame: HTMLIFrameElement | null = null;
+  let playerFrameTimer: number | null = null;
   let videoPlayerUrl = "";
   let playbackFileKey = "";
   let videoElement: HTMLVideoElement | null = null;
@@ -419,6 +449,7 @@
   let scriptQualityError = "";
   let scriptQualitySummary = "";
   let scriptQualityAnnotations: ScriptIssueAnnotation[] = [];
+  let sessionRhythmReview: SessionRhythmReview | null = null;
   let selectedScriptCueId: number | null = null;
   let scriptQualityRequestSequence = 0;
   $: analysisProfile = parseAnalysisProfile(video?.note);
@@ -445,6 +476,104 @@
     } catch {
       analysisZoom = 100;
     }
+  });
+
+  function clearPlayerFrameTimer(): void {
+    if (playerFrameTimer === null) return;
+    window.clearTimeout(playerFrameTimer);
+    playerFrameTimer = null;
+  }
+
+  function beginPlayerFrameLoad(): void {
+    clearPlayerFrameTimer();
+    playerFrameStatus = "loading";
+    playerFrameError = "";
+    playerFrameLoadingHint = "正在检查录播文件…";
+    playerFrameShellReady = false;
+    playerFrameTimer = window.setTimeout(() => {
+      if (playerFrameStatus !== "loading") return;
+      playerFrameStatus = "error";
+      playerFrameError = "录播播放器页面未能启动，请重新连接。";
+    }, 12_000);
+  }
+
+  function markPlayerFrameShellReady(): void {
+    if (playerFrameStatus !== "loading" || playerFrameShellReady) return;
+    playerFrameShellReady = true;
+    playerFrameLoadingHint = "播放器已连接，正在读取整场视频首段…";
+    clearPlayerFrameTimer();
+    playerFrameTimer = window.setTimeout(() => {
+      if (playerFrameStatus !== "loading") return;
+      playerFrameStatus = "error";
+      playerFrameError = "播放器已连接，但视频准备超过 60 秒。请重新连接；若仍失败，请检查录播文件所在磁盘。";
+    }, 60_000);
+  }
+
+  function archivePlaybackErrorMessage(reason: unknown): string {
+    const message = reason instanceof Error ? reason.message : String(reason || "");
+    if (/playlist file not found|not found|os error 2|找不到/i.test(message)) {
+      return "这条档案只保留了记录和文稿，原始录播文件已不在当前缓存中，无法播放。请从备份恢复视频，或选择视频文件仍然存在的录播。";
+    }
+    return `录播视频连接失败：${message || "播放源暂时不可用"}`;
+  }
+
+  function archiveManifestProbeUri(params: URLSearchParams): string {
+    const platform = encodeURIComponent(params.get("platform") || "");
+    const roomId = encodeURIComponent(params.get("room_id") || "");
+    const liveId = encodeURIComponent(params.get("live_id") || "");
+    const start = encodeURIComponent(params.get("start") || "0");
+    const end = encodeURIComponent(params.get("end") || "0");
+    return `/hls/${platform}/${roomId}/${liveId}/playlist.m3u8?start=${start}&end=${end}`;
+  }
+
+  async function setEmbeddedPlayerUrl(params: URLSearchParams): Promise<void> {
+    const requestedNonce = params.get("nonce") || "";
+    beginPlayerFrameLoad();
+    playerUrl = "";
+    try {
+      const manifest = await invoke<number[]>("fetch_hls", {
+        uri: archiveManifestProbeUri(params),
+      });
+      if (requestedNonce !== String(playerNonce)) return;
+      if (!Array.isArray(manifest) || manifest.length === 0) {
+        throw new Error("录播播放清单为空");
+      }
+      playerFrameLoadingHint = "录播文件已找到，正在启动播放器…";
+      playerUrl = `index_live.html?${params.toString()}`;
+    } catch (reason) {
+      if (requestedNonce !== String(playerNonce)) return;
+      clearPlayerFrameTimer();
+      playerFrameStatus = "error";
+      playerFrameError = archivePlaybackErrorMessage(reason);
+    }
+  }
+
+  function handlePlayerFrameMessage(event: MessageEvent): void {
+    if (!playerFrame || event.source !== playerFrame.contentWindow) return;
+    const messageType = event.data?.type;
+    if (messageType === "bsr:embed-shell-ready") {
+      markPlayerFrameShellReady();
+      return;
+    }
+    if (messageType === "bsr:embed-playback-ready") {
+      clearPlayerFrameTimer();
+      playerFrameStatus = "ready";
+      playerFrameError = "";
+      return;
+    }
+    if (messageType === "bsr:embed-playback-error") {
+      clearPlayerFrameTimer();
+      playerFrameStatus = "error";
+      playerFrameError = archivePlaybackErrorMessage(event.data?.message);
+    }
+  }
+
+  onMount(() => {
+    window.addEventListener("message", handlePlayerFrameMessage);
+    return () => {
+      window.removeEventListener("message", handlePlayerFrameMessage);
+      clearPlayerFrameTimer();
+    };
   });
 
   onDestroy(() => {
@@ -590,6 +719,20 @@
       : candidates.filter((item) => !isMasterScoreEligible(item));
   $: currentSource = sourceIdentity(archive, video);
   $: currentSourceKey = currentSource ? analysisSourceKey(currentSource) : "";
+  $: if (currentSourceKey && !evidenceTranscriptFocus) {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(EVIDENCE_TRANSCRIPT_FOCUS_STORAGE_KEY) || "null") as EvidenceTranscriptFocus | null;
+      if (saved?.sourceKey === currentSourceKey && typeof saved.query === "string") {
+        evidenceTranscriptFocus = saved;
+        sessionStorage.removeItem(EVIDENCE_TRANSCRIPT_FOCUS_STORAGE_KEY);
+      }
+    } catch {
+      // Opening a transcript must not depend on temporary focus state.
+    }
+  }
+  $: if (evidenceTranscriptFocus?.sourceKey === currentSourceKey && transcriptEntries.length) {
+    void focusEvidenceTranscript(evidenceTranscriptFocus);
+  }
   $: dealLiveStartedAt = paymentEventsSummary?.liveStartedAt
     || liveDashboardBinding?.session?.startedAt
     || archive?.created_at
@@ -679,6 +822,52 @@
     return `bsr:content-analysis:v3:${sourceKey}`;
   }
 
+  function normalizedEvidenceText(value: string): string {
+    return value
+      .toLocaleLowerCase("zh-CN")
+      .replace(/[^\p{L}\p{N}]/gu, "")
+      .trim();
+  }
+
+  function evidenceNeedles(value: string): string[] {
+    const quoted = Array.from(value.matchAll(/[“"‘']([^“"”’']{3,96})[”"’']/gu))
+      .map((match) => normalizedEvidenceText(match[1]));
+    const normalized = normalizedEvidenceText(value);
+    return [...quoted, normalized.slice(0, 36), normalized]
+      .filter((item) => item.length >= 3)
+      .filter((item, index, values) => values.indexOf(item) === index)
+      .sort((left, right) => right.length - left.length);
+  }
+
+  async function focusEvidenceTranscript(focus: EvidenceTranscriptFocus): Promise<void> {
+    if (focus !== evidenceTranscriptFocus || focus.sourceKey !== currentSourceKey) return;
+    const needles = evidenceNeedles(focus.query);
+    const entry = transcriptEntries.find((item) => {
+      const text = normalizedEvidenceText(item.text);
+      return needles.some((needle) => text.includes(needle) || needle.includes(text));
+    });
+    if (!entry && (isTranscribing || isFullSessionBackfilling)) {
+      stage = "正在载入完整逐字稿，载入后将自动定位评分证据…";
+      return;
+    }
+    evidenceTranscriptFocus = null;
+    focusedEvidenceTranscriptEntryId = entry?.id ?? null;
+    if (!entry) {
+      stage = "已打开评分证据对应的逐字稿；AI 摘要无法精确匹配到单句，请根据证据摘要查看原文。";
+      return;
+    }
+    stage = `已定位评分证据：${formatTime(entry.start)} · ${focus.summary || "引用原文"}`;
+    if (analysisMode === "company_deal") {
+      companyWorkspaceTab = "ai_review";
+      selectedScriptCueId = entry.id;
+      seekFullArchivePlayback(entry.start);
+      return;
+    }
+    workspaceTab = "analysis";
+    await tick();
+    document.getElementById(`analysis-transcript-${entry.id}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
   function sourceTitle(
     selectedArchive: RecordItem | null,
     selectedVideo: VideoItem | null,
@@ -711,7 +900,8 @@
     sessions: BoundLiveDashboardSession[],
   ): LiveDashboardBindingCandidate[] {
     const videoLengthSec = Math.round(Number(archive?.length || video?.length || 0));
-    const clock = Date.parse(String(archive?.created_at || video?.created_at || ""));
+    const named = parseCompassIdentityFromTexts(videoIdentityTexts());
+    const clock = Date.parse(String(named?.startedAt || archive?.created_at || video?.created_at || ""));
     return [...sessions]
       .map((session) => {
         const started = Date.parse(String(session.startedAt));
@@ -725,11 +915,18 @@
         const timeDeltaSeconds = Number.isFinite(clock) && Number.isFinite(started)
           ? Math.abs(Math.round((started - clock) / 1000))
           : Number.MAX_SAFE_INTEGER;
-        return { session, timeDeltaSeconds, durationDelta, accountMatch: false, shopNameMatch: false };
+        return { session, timeDeltaSeconds, durationDelta, accountMatch: false, shopNameMatch: Boolean(named?.shopName) && session.shopName === named?.shopName };
       })
-      .sort((left, right) => left.durationDelta - right.durationDelta || left.timeDeltaSeconds - right.timeDeltaSeconds)
+      .filter((item) => !named?.shopName || item.shopNameMatch)
+      .sort((left, right) => left.timeDeltaSeconds - right.timeDeltaSeconds || left.durationDelta - right.durationDelta)
       .slice(0, 12)
       .map(({ durationDelta: _durationDelta, ...candidate }) => candidate);
+  }
+
+  function autoSelectBindCandidateId(candidates: LiveDashboardBindingCandidate[]): string {
+    const nearest = candidates[0];
+    if (!nearest || nearest.timeDeltaSeconds > 2 * 60 * 60) return "";
+    return String(nearest.session.id);
   }
 
   async function loadLiveDashboardBinding(
@@ -768,7 +965,7 @@
       if ((resolved?.candidates?.length ?? 0) > 0) {
         liveDashboardBinding = resolved;
         if (!selectedLiveDashboardSessionId) {
-          selectedLiveDashboardSessionId = String(resolved.candidates[0].session.id);
+          selectedLiveDashboardSessionId = autoSelectBindCandidateId(resolved.candidates);
         }
         return;
       }
@@ -781,9 +978,9 @@
         matchMethod: null,
       };
       if (!sessions.length) {
-        liveDashboardBindingError = "尚未导入直播大屏 XLSX。请先到「直播数据大屏」导入对应场次（如 7/28 08:15），再回来手动绑定。";
-      } else if (!selectedLiveDashboardSessionId && liveDashboardBinding.candidates[0]) {
-        selectedLiveDashboardSessionId = String(liveDashboardBinding.candidates[0].session.id);
+        liveDashboardBindingError = "尚未导入本场 XLSX。请在当前页“对齐”中下载或选择对应场次（如 7/28 08:15）。";
+      } else if (!selectedLiveDashboardSessionId) {
+        selectedLiveDashboardSessionId = autoSelectBindCandidateId(liveDashboardBinding.candidates);
       }
     } catch (error: any) {
       liveDashboardBindingError = error?.message || String(error);
@@ -811,34 +1008,76 @@
     }
   }
 
-  function currentExcelDownloadTarget(): { shopName: string; targetDate: string | null } {
-    const texts = [archive?.title, video?.title, video?.file, video?.note, archive?.anchor_name];
+  function videoIdentityTexts(): Array<string | null | undefined> {
+    return [video?.file, video?.title, archive?.title, video?.note];
+  }
+
+  function currentExcelDownloadTarget(): { shopName: string; targetDate: string | null; startedAt: string | null } {
+    const named = parseCompassIdentityFromTexts(videoIdentityTexts());
+    const createdAt = normalizeCompassStartedAt(
+      named?.startedAt || archive?.created_at || video?.created_at || null,
+    );
+    const shopName = resolveCompassShopFromAccount([
+      archive?.anchor_name,
+    ]) || named?.shopName || "";
     return {
-      shopName: inferCompassShopFromTexts(texts),
-      targetDate: inferCompassDateFromVideo({
-        createdAt: archive?.created_at || video?.created_at,
-        texts,
-      }),
+      shopName,
+      targetDate: inferCompassDateFromVideo({ createdAt, texts: named ? [] : videoIdentityTexts() }),
+      startedAt: createdAt,
     };
   }
 
-  async function downloadExcelForCurrentVideo(): Promise<void> {
-    const target = currentExcelDownloadTarget();
-    if (!target.targetDate) {
-      liveDashboardBindingError = "无法从视频判断开播日期，请到「直播数据大屏」选择日期后下载";
-      return;
+  async function resolveRoomAccountName(): Promise<string> {
+    const roomId = archive?.room_id != null ? String(archive.room_id) : "";
+    if (!roomId || roomId.startsWith("bsr:")) {
+      return archive?.anchor_name?.trim() || "";
     }
-    excelDownloading = true;
-    excelDownloadHint = `${target.shopName} · ${target.targetDate}；首次需扫码登录`;
-    liveDashboardBindingError = "";
-    stage = `正在打开罗盘下载 ${target.shopName} ${target.targetDate} 的整场数据…`;
     try {
+      const list = await invoke<RecorderList>("get_recorder_list");
+      const room = (list.recorders || []).find((item) => String(item.room_info?.room_id) === roomId);
+      return room?.user_info?.user_name?.trim() || archive?.anchor_name?.trim() || "";
+    } catch {
+      return archive?.anchor_name?.trim() || "";
+    }
+  }
+
+  async function downloadExcelForCurrentVideo(): Promise<void> {
+    excelDownloading = true;
+    excelDownloadHint = "正在识别账号和开播时间…";
+    liveDashboardBindingError = "";
+    try {
+      const accountName = await resolveRoomAccountName();
+      const named = parseCompassIdentityFromTexts(videoIdentityTexts());
+      const createdAt = normalizeCompassStartedAt(
+        named?.startedAt || archive?.created_at || video?.created_at || null,
+      );
+      const shopName = resolveCompassShopFromAccount([
+        accountName,
+        archive?.anchor_name,
+      ]) || named?.shopName || null;
+      const targetDate = inferCompassDateFromVideo({ createdAt, texts: [] });
+      if (!shopName) {
+        excelDownloading = false;
+        excelDownloadHint = "";
+        liveDashboardBindingError = `无法从账号「${accountName || "未识别"}」判断店铺。请用规范文件名「店铺_开播时间」，或确认录播账号是科创店/相机店。`;
+        return;
+      }
+      if (!targetDate || !createdAt) {
+        excelDownloading = false;
+        excelDownloadHint = "";
+        liveDashboardBindingError = "无法从本场开播时间判断日期，请先打开这场录播或绑定 Excel 场次";
+        return;
+      }
+      excelDownloadHint = `${shopName} · ${targetDate}；首次需扫码登录`;
+      stage = `正在打开罗盘下载 ${shopName} ${targetDate} 本场整场数据…`;
       await invoke("start_compass_live_downloads", {
-        targetDate: target.targetDate,
-        targetShopName: target.shopName,
+        targetDate,
+        targetShopName: shopName,
+        targetStartedAt: createdAt,
       });
     } catch (error: any) {
       excelDownloading = false;
+      excelDownloadHint = "";
       liveDashboardBindingError = error?.message || String(error);
       stage = "下载整场 Excel 失败";
     }
@@ -855,7 +1094,7 @@
         matchMethod: liveDashboardBinding?.matchMethod ?? null,
       };
       if (!sessions.length) {
-        liveDashboardBindingError = "尚未导入直播大屏 XLSX。请先到「直播数据大屏」导入对应场次。";
+        liveDashboardBindingError = "尚未导入本场 XLSX。请在当前页“对齐”中下载或选择对应场次。";
       }
     } catch (error: any) {
       liveDashboardBindingError = error?.message || String(error);
@@ -864,13 +1103,7 @@
     }
   }
 
-  function openBoundLiveDashboard(): void {
-    const sessionId = liveDashboardBinding?.session?.id;
-    if (sessionId == null) return;
-    openLiveDashboard(sessionId);
-  }
-
-  function loadPaymentEvents(sourceKey: string): void {
+  async function loadPaymentEvents(sourceKey: string): Promise<void> {
     paymentEvents = [];
     paymentEventsSummary = null;
     paymentEventsSourceLabel = "";
@@ -881,7 +1114,24 @@
     if (!sourceKey) return;
     try {
       const raw = localStorage.getItem(paymentEventsStorageKey(sourceKey));
-      if (!raw) return;
+      if (!raw) {
+        if (archive && analysisMode === "company_deal") {
+          const persisted = await invoke<unknown | null>("get_auto_review_payment_events", {
+            platform: archive.platform,
+            roomId: String(archive.room_id),
+            liveId: String(archive.live_id),
+          });
+          const bundle = parsePaymentEventsPayload(persisted);
+          if (bundle?.events.length) {
+            paymentEvents = bundle.events;
+            paymentEventsSummary = bundle.summary ?? null;
+            paymentEventsSourceLabel = bundle.sourceLabel || "后台自动复盘";
+            paymentEventsMatchMessage = "已恢复下播后自动匹配的本场订单";
+            savePaymentEvents(sourceKey);
+          }
+        }
+        return;
+      }
       const saved = JSON.parse(raw) as {
         events?: PaymentEvent[];
         summary?: PaymentEventsSummary;
@@ -952,15 +1202,45 @@
   function savePaymentEvents(sourceKey: string): void {
     if (!sourceKey || !paymentEvents.length) return;
     try {
-      localStorage.setItem(paymentEventsStorageKey(sourceKey), JSON.stringify({
+      const updatedAt = new Date().toISOString();
+      const payload = {
         events: paymentEvents,
         summary: paymentEventsSummary,
         sourceLabel: paymentEventsSourceLabel,
         matchMessage: paymentEventsMatchMessage,
         videoStartOffsetSec,
         videoCalibrationStatus,
-        updatedAt: new Date().toISOString(),
-      }));
+        updatedAt,
+      };
+      localStorage.setItem(paymentEventsStorageKey(sourceKey), JSON.stringify(payload));
+
+      // Keep non-destructive order snapshots. Later refunds/status changes
+      // create a new version instead of rewriting the historical attribution.
+      const signature = JSON.stringify({
+        events: paymentEvents.map((event) => [
+          event.orderId,
+          event.productId,
+          event.payAmountFen,
+          event.orderStatus,
+        ]),
+        summary: paymentEventsSummary,
+      });
+      const historyKey = paymentEventsHistoryStorageKey(sourceKey);
+      let history: Array<Record<string, unknown>> = [];
+      try {
+        const savedHistory = JSON.parse(localStorage.getItem(historyKey) || "[]");
+        if (Array.isArray(savedHistory)) history = savedHistory;
+      } catch {
+        history = [];
+      }
+      const lastSnapshot = history[history.length - 1];
+      const previousSignature = typeof lastSnapshot?.signature === "string"
+        ? lastSnapshot.signature
+        : "";
+      if (previousSignature !== signature) {
+        history.push({ ...payload, signature, snapshotAt: updatedAt });
+        localStorage.setItem(historyKey, JSON.stringify(history.slice(-20)));
+      }
     } catch (error: any) {
       paymentEventsError = `成交订单已加载，但本地保存失败：${error?.message || String(error)}`;
     }
@@ -974,6 +1254,8 @@
     paymentEventsMatchMessage = "";
     videoStartOffsetSec = 0;
     videoCalibrationStatus = "unverified";
+    const liveId = dashboardBindLiveId || resolveDashboardBindLiveId(archive, video);
+    clearAutoPullOrdersAttempted(liveId);
     if (currentSourceKey) {
       try {
         localStorage.removeItem(paymentEventsStorageKey(currentSourceKey));
@@ -1081,11 +1363,22 @@
         liveStartedAt,
         liveEndedAt,
       });
-      applyPaymentEventsBundle(parsePaymentEventsPayload({
+      const parsed = parsePaymentEventsPayload({
         events: result.events,
         summary: result.summary,
         source_label: result.sourceLabel || "order.searchList",
-      }));
+      });
+      applyPaymentEventsBundle(parsed);
+      if (parsed?.summary?.shopName) {
+        const summary = parsed.summary;
+        paymentEventsMatchMessage = [
+          `店铺已核验：${summary.shopName}${summary.shopId ? `（${summary.shopId}）` : ""}`,
+          `罗盘归因 ${summary.expectedEventCount ?? summary.eventCount} 单`,
+          `成交话术匹配 ${summary.eventCount} 单`,
+          summary.unmatchedEventCount != null ? `未归因 ${summary.unmatchedEventCount} 条` : "",
+        ].filter(Boolean).join(" · ");
+        if (currentSourceKey) savePaymentEvents(currentSourceKey);
+      }
       markAutoPullOrdersAttempted(liveId);
     } catch (error: any) {
       clearAutoPullOrdersAttempted(liveId);
@@ -1385,6 +1678,10 @@
     return candidateTypeAliases[text] || text;
   }
 
+  function isCandidateType(value: CandidateType | string): value is CandidateType {
+    return allowedTypes.has(value as CandidateType);
+  }
+
   function candidateDisplayType(candidate: Candidate): string {
     if (isStructuredDiscoveryCandidate(candidate)) {
       if (candidate.verificationStatus === "checking") return `${candidate.type} · 正在核验`;
@@ -1460,7 +1757,7 @@
     const start = Number(parsed.start);
     const end = Number(parsed.end);
     const type = normalizeCandidateType(parsed.type);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !allowedTypes.has(type)) return null;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !isCandidateType(type)) return null;
     const transcriptEnd = transcriptEntries.length ? transcriptEntries[transcriptEntries.length - 1].end : end;
     const safeStart = Math.max(0, start);
     const safeEnd = Math.min(end, transcriptEnd);
@@ -1554,6 +1851,9 @@
     isDiscovering = false;
     reviewingId = "";
     copiedAction = "";
+    clearPlayerFrameTimer();
+    playerFrameStatus = "idle";
+    playerFrameError = "";
     playerUrl = "";
     void disposeShakaPlayer();
     void stopNativePlayer();
@@ -1619,6 +1919,7 @@
     scriptQualityError = "";
     scriptQualitySummary = "";
     scriptQualityAnnotations = [];
+    sessionRhythmReview = null;
     selectedScriptCueId = null;
     scriptQualityRequestSequence += 1;
   }
@@ -1700,6 +2001,15 @@
       updatedAt: new Date().toISOString(),
       sourceTitle: sourceTitle(archive, video),
       diagnosis: sessionDiagnosis,
+      anchorName: archive?.anchor_name?.trim() || "",
+      anchorIdentityConfirmed: Boolean(
+        archive?.anchor_name?.trim()
+        && archive?.anchor_detection_status === "confirmed"
+      ),
+      commentEvidenceStatus: archive
+        ? (dealDanmuEntries.length > 0 ? "available" : "missing")
+        : "unknown",
+      commentCount: archive ? dealDanmuEntries.length : 0,
     };
     try {
       localStorage.setItem(storageKey(requestIdentity.sourceKey), JSON.stringify(value));
@@ -1713,6 +2023,7 @@
     if (!saved) return;
     scriptQualitySummary = saved.summary;
     scriptQualityAnnotations = saved.annotations;
+    sessionRhythmReview = saved.rhythmReview;
     selectedScriptCueId = saved.annotations[0]?.cueId ?? null;
   }
 
@@ -1721,6 +2032,7 @@
       localStorage.setItem(scriptQualityStorageKey(sourceKey), JSON.stringify({
         summary: scriptQualitySummary,
         annotations: scriptQualityAnnotations,
+        rhythmReview: sessionRhythmReview,
       }));
     } catch (error) {
       scriptQualityError = `复盘已完成，但本地保存失败：${error}`;
@@ -1830,7 +2142,7 @@
       }));
       return;
     }
-    if (currentSourceKey) loadPaymentEvents(currentSourceKey);
+    if (currentSourceKey) await loadPaymentEvents(currentSourceKey);
     resetState(true);
     const dashboardBindPromise = loadLiveDashboardBinding(archive, video);
     void loadDealDanmuEntries();
@@ -1843,6 +2155,7 @@
     } else if (isCompanyFullSessionPlayback() && archive) {
       loadFullArchivePlayer();
     }
+    void applyInitialSeekWhenReady(requestIdentity, requestId);
     analysisMode === "company_deal" ? void loadActiveMaster() : await loadActiveMaster();
     if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
     const restored = loadSaved(activeAnalysisRequestIdentity());
@@ -1886,6 +2199,39 @@
     }
   }
 
+  async function applyInitialSeekWhenReady(
+    requestIdentity: AnalysisRequestIdentity,
+    requestId: number,
+  ): Promise<void> {
+    if (initialSeekSeconds == null || !Number.isFinite(initialSeekSeconds)) return;
+    const key = `${currentSourceKey}:${refreshToken}:${Math.floor(initialSeekSeconds)}`;
+    if (appliedInitialSeekKey === key) return;
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+      await tick();
+      if (video) {
+        if (embeddedPreviewActive || nativePlayerActive || videoElement) {
+          appliedInitialSeekKey = key;
+          seekFullArchivePlayback(initialSeekSeconds);
+          return;
+        }
+      } else if (archive) {
+        const iframe = document.querySelector(".company-player-shell iframe") as HTMLIFrameElement | null;
+        if (iframe?.contentWindow) {
+          appliedInitialSeekKey = key;
+          seekFullArchivePlayback(initialSeekSeconds);
+          window.setTimeout(() => {
+            if (currentSourceKey && appliedInitialSeekKey === key) {
+              seekFullArchivePlayback(initialSeekSeconds ?? 0);
+            }
+          }, 700);
+          return;
+        }
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  }
+
   function isTransportStream(file: string): boolean {
     // A single large TS cannot safely be treated as one HLS segment: Shaka
     // starts reading the entire recording and freezes the desktop webview.
@@ -1920,7 +2266,7 @@
       if (nativePlayerHost && bounds.width > 8 && bounds.height > 8) {
         return true;
       }
-      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
     }
     return false;
   }
@@ -2181,7 +2527,11 @@
     void prepareVideoForPlayback({ force: true });
   }
 
-  async function setVideoPlayerSource(file: string): Promise<void> {
+  async function setVideoPlayerSource(
+    file: string,
+    requestIdentity?: AnalysisRequestIdentity,
+    requestId?: number,
+  ): Promise<void> {
     if (!file) {
       await disposeShakaPlayer();
       videoPlayerUrl = "";
@@ -2201,6 +2551,11 @@
     }
     playbackFileKey = file;
     const mediaUrl = await get_static_url("output", file);
+    if (
+      requestIdentity
+      && requestId !== undefined
+      && !isCurrentInitializationRequest(requestIdentity, requestId)
+    ) return;
     if (isRawTransportStream(file)) {
       // Never create an ffplay window here. Windows child/owned windows cannot
       // be composited reliably above a WebView2 surface: they detach from the
@@ -2246,8 +2601,9 @@
       // `file` points to the original recording until a fallback copy exists.
       // Try it immediately: supported TS/HLS sources should be analyzable
       // without waiting for a whole-session MP4 conversion.
-      await setVideoPlayerSource(nextPlaybackSource.file);
-      if (nextPlaybackSource.preparing && !isRawTransportStream(nextPlaybackSource.file)) {
+      await setVideoPlayerSource(nextPlaybackSource.file, requestIdentity, requestId);
+      if (!isCurrentInitializationRequest(requestIdentity, requestId)) return;
+      if (nextPlaybackSource.preparing) {
         void observeVideoPlaybackUntilReady(selectedVideo.id);
       }
     } catch (error: any) {
@@ -3296,7 +3652,7 @@
         nonce: String(playerNonce),
         embed: "1",
       });
-      playerUrl = `index_live.html?${params.toString()}`;
+      setEmbeddedPlayerUrl(params);
     } else if (videoElement) {
       videoElement.currentTime = target.seekSeconds;
       void videoElement.play().catch(() => undefined);
@@ -3515,7 +3871,7 @@
       nonce: String(playerNonce),
       embed: "1",
     });
-    playerUrl = `index_live.html?${params.toString()}`;
+    setEmbeddedPlayerUrl(params);
   }
 
   function seekFullArchivePlayback(offsetSec: number): void {
@@ -3556,7 +3912,7 @@
         nonce: String(playerNonce),
         embed: "1",
       });
-      playerUrl = `index_live.html?${params.toString()}`;
+      setEmbeddedPlayerUrl(params);
     } else if (videoElement) {
       videoElement.currentTime = candidate.start;
       void videoElement.play().catch(() => undefined);
@@ -3682,17 +4038,18 @@
       nonce: String(playerNonce),
       embed: "1",
     });
-    playerUrl = `index_live.html?${params.toString()}`;
+    setEmbeddedPlayerUrl(params);
   }
 
-  $: canDealAutoClip = Boolean(
-    analysisMode === "company_deal"
-      && video
-      && video.status !== -1
-      && paymentEvents.length
-      && transcriptEntries.length
-      && !isTranscribing,
-  );
+  $: dealAutoClipDisabledReason = resolveDealAutoClipDisabledReason({
+    analysisMode,
+    hasVideo: Boolean(video),
+    hasArchiveSource: Boolean(archive && !isImportedArchive(archive)),
+    paymentEventCount: paymentEvents.length,
+    transcriptEntryCount: transcriptEntries.length,
+    isTranscribing,
+  });
+  $: canDealAutoClip = !dealAutoClipDisabledReason;
 
   function seekToDealPeak(): void {
     if (!topDealPeak) return;
@@ -3730,6 +4087,19 @@
     void ensureDealSpeechRefined(offsetSec);
   }
 
+  function handleMetricDiagnosisSeek(offsetSec: number): void {
+    companyWorkspaceTab = "ai_review";
+    const entry = transcriptEntries.find((item) => item.start <= offsetSec && item.end >= offsetSec)
+      ?? transcriptEntries.find((item) => item.start >= offsetSec)
+      ?? null;
+    if (entry) {
+      selectedScriptCueId = entry.id;
+      seekToTranscriptEntry(entry);
+    } else {
+      seekFullArchivePlayback(offsetSec);
+    }
+  }
+
   function lookupDealSpeechRefine(offsetSec: number | null): DealClipRange | null {
     if (offsetSec == null || !paymentEvents.length || !transcriptEntries.length) return null;
     const contexts = buildDealClipContexts(paymentEvents, transcriptEntries)
@@ -3745,13 +4115,39 @@
 
   async function ensureDealSpeechRefined(offsetSec: number | null, force = false): Promise<void> {
     if (analysisMode !== "company_deal" || offsetSec == null) return;
-    if (!paymentEvents.length || !transcriptEntries.length || isTranscribing) return;
+    if (!paymentEvents.length) {
+      dealSpeechRefineError = "还没有成交订单，请先在「对齐」拉取订单";
+      dealSpeechRefineProgress = "";
+      return;
+    }
+    if (isTranscribing) {
+      dealSpeechRefineError = "成交窗还在转写，请等转写完成后再点「重试定位」";
+      dealSpeechRefineProgress = "";
+      return;
+    }
+    if (!transcriptEntries.length) {
+      dealSpeechRefineError = "还没有逐字稿。请先等成交窗转写完成，或到「整场复盘」生成逐字稿后再试";
+      dealSpeechRefineProgress = "";
+      activeDealSpeechRange = null;
+      return;
+    }
 
-    const contexts = buildDealClipContexts(paymentEvents, transcriptEntries)
+    let contexts = buildDealClipContexts(paymentEvents, transcriptEntries)
       .filter((context) => context.transcriptLines.length > 0);
+    // Force retry: widen search once — deal ASR is ±3min, but clock drift / 校准偏差 may miss the default ±10min AI window.
+    if (!contexts.length && force) {
+      contexts = buildDealClipContexts(paymentEvents, transcriptEntries, {
+        preSec: 30 * 60,
+        postSec: 5 * 60,
+      }).filter((context) => context.transcriptLines.length > 0);
+    }
     const context = selectDealClipContext(contexts, offsetSec);
     if (!context) {
-      dealSpeechRefineError = "订单时间附近没有可用逐字稿，无法定位成交链路";
+      const transcriptSpan = transcriptEntries.length
+        ? `${Math.floor(transcriptEntries[0].start / 60)}–${Math.floor(transcriptEntries[transcriptEntries.length - 1].end / 60)} 分`
+        : "无";
+      dealSpeechRefineError =
+        `订单时间附近没有逐字稿（文稿覆盖约 ${transcriptSpan}）。请到「对齐」确认视频开播点后清除并重新拉取订单，或等成交窗转写完成再点重试定位`;
       dealSpeechRefineProgress = "";
       activeDealSpeechRange = null;
       return;
@@ -3835,9 +4231,39 @@
     }
   }
 
-  function retryDealSpeechRefine(): void {
-    if (selectedDealOffsetSec == null) return;
-    void ensureDealSpeechRefined(selectedDealOffsetSec, true);
+  async function retryDealSpeechRefine(): Promise<void> {
+    const offset = selectedDealOffsetSec ?? paymentEvents[0]?.offsetSec ?? null;
+    if (offset == null) {
+      dealSpeechRefineError = "请先点选左侧一笔订单，再重试定位";
+      dealSpeechRefineProgress = "";
+      return;
+    }
+    selectedDealOffsetSec = offset;
+    if (isTranscribing) {
+      dealSpeechRefineError = "成交窗还在转写，请等转写完成后再点「重试定位」";
+      return;
+    }
+    const hasUsable = buildDealClipContexts(paymentEvents, transcriptEntries)
+      .some((context) => context.transcriptLines.length > 0);
+    if (
+      !hasUsable
+      && analysisMode === "company_deal"
+      && video
+      && !isClipVideo(video)
+      && paymentEvents.length
+      && !isFullSessionBackfilling
+    ) {
+      dealSpeechRefineError = "";
+      dealSpeechRefineProgress = "订单附近无文稿，正在按当前订单重转成交窗…";
+      try {
+        await runImportOrderTranscriptPipeline();
+      } catch (error: any) {
+        dealSpeechRefineProgress = "";
+        dealSpeechRefineError = error?.message || String(error);
+        return;
+      }
+    }
+    await ensureDealSpeechRefined(offset, true);
   }
 
   async function adoptDealAutoClipsFromTaskId(taskId: string): Promise<void> {
@@ -3890,8 +4316,17 @@
   }
 
   async function runDealOrderAutoClip(): Promise<void> {
-    if (!canDealAutoClip || dealAutoClipping || !video) return;
+    if (!canDealAutoClip || dealAutoClipping || (!video && !archive)) return;
     const selectedVideo = video;
+    const selectedArchive = archive;
+    const sourceStillActive = () => selectedVideo
+      ? video?.id === selectedVideo.id
+      : Boolean(
+        selectedArchive
+        && archive?.platform === selectedArchive.platform
+        && archive?.room_id === selectedArchive.room_id
+        && archive?.live_id === selectedArchive.live_id,
+      );
     const requestIdentity = activeAnalysisRequestIdentity();
     const requestId = ++dealAutoClipSequence;
     dealAutoClipping = true;
@@ -3912,8 +4347,7 @@
       for (let index = 0; index < contexts.length; index += 1) {
         if (
           !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, dealAutoClipSequence)
-          || !video
-          || video.id !== selectedVideo.id
+            || !sourceStillActive()
         ) {
           return;
         }
@@ -3947,8 +4381,7 @@
 
       if (
         !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, dealAutoClipSequence)
-        || !video
-        || video.id !== selectedVideo.id
+        || !sourceStillActive()
       ) {
         return;
       }
@@ -3960,15 +4393,63 @@
 
       dealAutoClipProgress = `正在提交 ${ranges.length} 条完整成交链路视频到后台队列…`;
       stage = dealAutoClipProgress;
-      const batchEventId = `deal_auto_clip_batch_${selectedVideo.id}_${Date.now()}`;
+      const batchEventId = `deal_auto_clip_batch_${selectedVideo?.id || `${selectedArchive?.platform}_${selectedArchive?.room_id}_${selectedArchive?.live_id}`}_${Date.now()}`;
       dealClipBatchTaskId = batchEventId;
-      dealClipBatchParentId = selectedVideo.id;
+      dealClipBatchParentId = selectedVideo?.id || 0;
       dealClipBatchRanges = ranges.map((range) => ({
         start: range.start,
         end: range.end,
         title: range.title,
         reason: range.reason,
       }));
+      if (!selectedVideo && selectedArchive) {
+        const generated: Array<{ video: VideoItem; range: DealClipRange }> = [];
+        for (let index = 0; index < ranges.length; index += 1) {
+          const range = ranges[index];
+          dealAutoClipProgress = `正在从原始 TS 导出成交链路 ${index + 1}/${ranges.length}…`;
+          stage = dealAutoClipProgress;
+          const clip = await invoke<VideoItem>("clip_range", {
+            eventId: `${batchEventId}_${index}`,
+            params: {
+              title: range.title,
+              note: range.reason,
+              cover: selectedArchive.cover || "",
+              platform: selectedArchive.platform,
+              room_id: selectedArchive.room_id,
+              live_id: selectedArchive.live_id,
+              ranges: [{ start: range.start, end: range.end }],
+              danmu: false,
+              local_offset: 0,
+              fix_encoding: false,
+              transition: "none",
+            },
+          });
+          generated.push({ video: clip, range });
+        }
+        if (!sourceStillActive()) return;
+        companyClipReviewRequest = {
+          taskId: batchEventId,
+          parentVideoId: generated[0]?.video.id || 0,
+          items: generated.map(({ video: clip, range }) => ({
+            video: clip,
+            sourceStartSec: range.start,
+            sourceEndSec: range.end,
+            reason: range.reason,
+            transcriptEntries: clipLocalTranscript(transcriptEntries, range.start, range.end),
+          })),
+        };
+        saveCompanyClipReview(companyClipReviewRequest);
+        await Promise.allSettled(companyClipReviewRequest.items.map((item) => invoke("update_video_subtitle", {
+          id: item.video.id,
+          subtitle: clipTranscriptToSrt(item.transcriptEntries),
+        })));
+        companyWorkspaceTab = "clip_review";
+        dealAutoClipProgress = `切片完成，共 ${generated.length} 条可在「切片复盘」查看`;
+        stage = dealAutoClipProgress;
+        return;
+      }
+
+      if (!selectedVideo) throw new Error("未找到可导出的录播视频源");
       const queued = await invoke<{ taskId: string; count: number }>("queue_deal_auto_clips", {
         eventId: batchEventId,
         parentVideoId: selectedVideo.id,
@@ -3991,8 +4472,7 @@
       const completedTask = await waitForDealAutoClipTask(queued.taskId);
       if (
         !isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, dealAutoClipSequence)
-        || !video
-        || video.id !== selectedVideo.id
+          || !sourceStillActive()
       ) {
         return;
       }
@@ -4141,6 +4621,7 @@
     scriptQualityError = "";
     scriptQualitySummary = "";
     scriptQualityAnnotations = [];
+    sessionRhythmReview = null;
     selectedScriptCueId = null;
     companyWorkspaceTab = "ai_review";
     try {
@@ -4154,6 +4635,28 @@
         scriptQualityError = "没有可复盘的非成交段句子。";
         stage = "整场复盘跳过";
         return;
+      }
+
+      const rhythmWarnings: string[] = [];
+      const rhythmAnalysis = buildSessionRhythmAnalysis(
+        transcriptEntries,
+        paymentEvents,
+        boundVideoDurationSec,
+      );
+      if (rhythmAnalysis.buckets.length) {
+        stage = "整场节奏与结构分析中…";
+        try {
+          const rhythmResponse = await invoke<string>("minimax_chat", {
+            systemPrompt: sessionRhythmSystemPrompt(),
+            messages: [{ role: "user", content: buildSessionRhythmUserMessage(rhythmAnalysis) }],
+          });
+          if (!isCurrentAnalysisRequest(requestIdentity, activeAnalysisRequestIdentity(), requestId, scriptQualityRequestSequence)) return;
+          sessionRhythmReview = parseSessionRhythmReview(rhythmResponse);
+          if (currentSourceKey) saveScriptQuality(currentSourceKey);
+        } catch (rhythmError: any) {
+          rhythmWarnings.push(rhythmError?.message || String(rhythmError));
+          sessionRhythmReview = null;
+        }
       }
 
       const entriesById = new Map(reviewEntries.map((entry) => [entry.id, entry]));
@@ -4191,10 +4694,18 @@
           ? chunkWarnings[0]
           : `部分分析块失败（${chunkWarnings.length}/${chunks.length}）：${chunkWarnings[0]}`;
       }
+      if (rhythmWarnings.length) {
+        const rhythmMessage = `节奏 AI 判断未完成：${rhythmWarnings[0]}（本地节奏图仍可使用）`;
+        scriptQualityError = scriptQualityError
+          ? `${scriptQualityError}；${rhythmMessage}`
+          : rhythmMessage;
+      }
       stage = scriptQualityAnnotations.length
         ? `整场复盘完成，标出 ${scriptQualityAnnotations.length} 处可改进${chunkWarnings.length ? `（${chunkWarnings.length} 块失败）` : ""}`
         : chunkWarnings.length === chunks.length
-          ? "整场复盘失败"
+          ? sessionRhythmReview
+            ? "整场节奏结构已完成，逐句话术复盘未完成"
+            : "整场复盘失败"
           : "整场复盘完成，未发现明显可改进句子";
       if (scriptQualityAnnotations.length) {
         selectedScriptCueId = scriptQualityAnnotations[0].cueId;
@@ -4380,7 +4891,7 @@
         systemPrompt: `${COMMERCE_REVIEW_PROMPT}\n\n这份结果主要交给没有直播运营经验的新手阅读。最终只返回一个合法 JSON 对象，不要代码围栏。字段固定为 verdict、summary、good_points、improvements、checks、spoken_script、training_checklist、professional_detail。verdict 只能是“建议保留”“修改后保留”“建议放弃”“证据不足”；summary 用一句大白话说明原因，不超过45个汉字；good_points、improvements、checks 都是1—4条短句数组，每句只说一件事，禁止使用“链路签名、CTA、证据强度、预分类”等术语。spoken_script 只能给参考改写建议，必须明确不是标准稿且不可直接照念；training_checklist 写培训讨论点和具体练习方向；professional_detail 才承载原固定格式的专业内容。JSON 字符串中的换行必须正确转义。`,
         messages: [{
           role: "user",
-          content: `请复盘当前候选片段。候选类型只是待核验线索，必须根据逐字稿重新预分类。完整成交链路必须依次覆盖：客户需求/疑问、产品匹配、卖点或价值说明、风险消除/售后承诺、价格/链接/优惠、引导下单、确认成交；缺任一环节则只作局部复盘，不得建议进入母稿或辅稿。缺少订单时间或明确成交确认时，不得写成已成交。\n\n内容：${sourceTitle()}\n候选编号：${candidate.id}\n候选类型：${candidate.type}\n实际链路：${candidate.chainStages.join(" → ") || "未形成完整链路"}\n候选商品：${candidate.product}\n候选时间：${formatTime(candidate.start)}—${formatTime(candidate.end)}\n候选证据：${candidate.evidence}\n待核验：${candidate.verify || "无"}\n\n逐字稿：\n${clipTranscript}`,
+          content: `请复盘当前候选片段。候选类型只是待核验线索，必须根据逐字稿重新预分类。完整成交链路必须依次覆盖：客户需求/疑问、产品匹配、卖点或价值说明、风险消除/售后承诺、价格/链接/优惠、引导下单、确认成交；缺任一环节则只作局部复盘，不得建议进入母稿或辅稿。缺少订单时间或明确成交确认时，不得写成已成交。\n\n内容：${sourceTitle(archive, video)}\n候选编号：${candidate.id}\n候选类型：${candidate.type}\n实际链路：${candidate.chainStages.join(" → ") || "未形成完整链路"}\n候选商品：${candidate.product}\n候选时间：${formatTime(candidate.start)}—${formatTime(candidate.end)}\n候选证据：${candidate.evidence}\n待核验：${candidate.verify || "无"}\n\n逐字稿：\n${clipTranscript}`,
         }],
       });
       if (
@@ -4460,7 +4971,7 @@
   function copyAll(): void {
     if (!selectedCandidate || !selectedReview) return;
     const content = [
-      `# ${sourceTitle()}｜${selectedCandidate.id}`,
+      `# ${sourceTitle(archive, video)}｜${selectedCandidate.id}`,
       `高光：${selectedCandidate.tier}｜${selectedCandidate.score}分｜${selectedCandidate.type}｜${selectedCandidate.product}｜${formatTime(selectedCandidate.start)}—${formatTime(selectedCandidate.end)}`,
       `## 一句话结论\n${selectedReview.beginner.verdict}：${selectedReview.beginner.summary}`,
       `## 做对了什么\n${selectedReview.beginner.goodPoints.map((item) => `- ${item}`).join("\n")}`,
@@ -4567,12 +5078,6 @@
           设为整场母稿
         </button>
       {/if}
-      {#if archive?.platform === "douyin" && liveDashboardBinding?.session}
-        <button class="secondary-button" on:click={openBoundLiveDashboard}>
-          <BarChart3 size={15} />
-          直播大屏
-        </button>
-      {/if}
       <button class="secondary-button" disabled={!currentSource || isTranscribing || isDiscovering} on:click={regenerateAndAnalyze}>
         <span class:is-spinning={isTranscribing}><RotateCcw size={15} /></span>
         重新识别
@@ -4591,20 +5096,16 @@
   </header>
 
   {#if archive?.platform === "douyin" && analysisMode !== "company_deal"}
-    <section class="live-dashboard-summary" aria-label="直播数据大屏">
+    <section class="live-dashboard-summary" aria-label="直播经营数据">
       {#if liveDashboardBindingLoading}
-        <span>正在匹配直播数据大屏…</span>
+        <span>正在匹配本场直播数据…</span>
       {:else if liveDashboardBinding?.session}
         <div class="live-dashboard-summary-heading">
           <div>
-            <strong>{liveDashboardBinding.session.shopName || "已绑定直播数据大屏"}</strong>
+            <strong>{liveDashboardBinding.session.shopName || "已绑定直播经营数据"}</strong>
             <span>{liveDashboardBinding.session.accountKey} · {liveDashboardBinding.session.startedAt} · {liveDashboardBinding.session.sourceFile}</span>
           </div>
           <div class="live-dashboard-summary-actions">
-            <button type="button" class="live-dashboard-open-button" on:click={openBoundLiveDashboard}>
-              <BarChart3 size={14} />
-              打开直播大屏
-            </button>
             <small>{liveDashboardBinding.matchMethod === "manual" ? "人工绑定" : "自动匹配"}</small>
           </div>
         </div>
@@ -4619,7 +5120,7 @@
       {:else if liveDashboardBinding?.candidates?.length}
         <div class="live-dashboard-summary-heading">
           <div>
-            <strong>未自动绑定直播数据大屏</strong>
+            <strong>未自动绑定本场直播数据</strong>
             <span>存在多个或账号不确定的候选场次，请人工确认。</span>
           </div>
         </div>
@@ -4637,7 +5138,7 @@
           </button>
         </div>
       {:else}
-        <span>未找到可绑定的官方 XLSX 直播数据。请先在直播数据大屏导入对应场次。</span>
+        <span>未找到可绑定的官方 XLSX。请在本页“对齐”中下载或选择对应场次。</span>
       {/if}
       {#if liveDashboardBindingError}
         <small class="live-dashboard-error">{liveDashboardBindingError}</small>
@@ -4735,6 +5236,7 @@
     videoId={video?.id ?? null}
     archiveSource={Boolean(archive)}
     events={paymentEvents}
+    sessionDurationSec={boundVideoDurationSec}
     danmuEntries={dealDanmuEntries}
     liveStartedAt={dealLiveStartedAt}
     transcriptBackfilling={isFullSessionBackfilling}
@@ -4755,9 +5257,11 @@
     scriptQualityError={scriptQualityError}
     scriptQualitySummary={scriptQualitySummary}
     scriptQualityAnnotations={scriptQualityAnnotations}
+    rhythmReview={sessionRhythmReview}
     selectedScriptCueId={selectedScriptCueId}
     playbackPositionSec={analysisPlaybackPositionSec}
     canAutoClip={canDealAutoClip}
+    autoClipDisabledReason={dealAutoClipDisabledReason}
     autoClipping={dealAutoClipping}
     autoClipProgress={dealAutoClipProgress}
     autoClipError={dealAutoClipError}
@@ -4777,6 +5281,7 @@
     clipReviewRequest={companyClipReviewRequest}
     alignOrderCount={paymentEventsSummary?.eventCount ?? 0}
     alignTotalPayYuan={paymentEventsSummary?.totalPayAmountYuan ?? 0}
+    alignOrderSummary={paymentEventsSummary}
     alignLoading={paymentEventsLoading}
     alignError={paymentEventsError}
     alignCanPullOrders={Boolean(dashboardBindLiveId || archive || video)}
@@ -4788,6 +5293,7 @@
     excelCanDownload={Boolean(currentExcelDownloadTarget().targetDate)}
     {excelDownloading}
     {excelDownloadHint}
+    excelError={liveDashboardBindingError}
     on:downloadExcel={() => void downloadExcelForCurrentVideo()}
     on:seek={(event) => handleCompanyDealSeek(event.detail)}
     on:select={(event) => handleCompanyDealSelect(event.detail)}
@@ -4795,7 +5301,7 @@
     on:selectScriptCue={(event) => { selectedScriptCueId = event.detail; }}
     on:autoClip={() => void runDealOrderAutoClip()}
     on:retrySpeechRefine={() => retryDealSpeechRefine()}
-    on:openDashboard={() => openBoundLiveDashboard()}
+    on:metricSeek={(event) => handleMetricDiagnosisSeek(event.detail)}
     on:bindDashboardSession={() => void bindSelectedLiveDashboard()}
     on:rebindDashboardSession={() => void rebindLiveDashboardSession()}
     on:closeClipReview={() => { companyWorkspaceTab = "ai_review"; }}
@@ -4960,9 +5466,27 @@
           {/if}
         {/if}
         {/key}
-      {:else if playerUrl}
+      {:else if playerUrl || playerFrameStatus === "loading" || playerFrameStatus === "error"}
         {#key playerUrl}
-          <iframe title="录播播放器" src={playerUrl} allow="autoplay; fullscreen" />
+          <div class="embedded-frame-shell" class:is-ready={playerFrameStatus === "ready"}>
+            {#if playerUrl}
+              <iframe bind:this={playerFrame} title="录播播放器" src={playerUrl} allow="autoplay; fullscreen" on:load={markPlayerFrameShellReady} />
+            {/if}
+            {#if playerFrameStatus !== "ready"}
+              <div class="embedded-frame-status" role={playerFrameStatus === "error" ? "alert" : "status"} aria-live="polite">
+                {#if playerFrameStatus === "error"}
+                  <Play size={28} />
+                  <strong>录播视频连接失败</strong>
+                  <span>{playerFrameError || "录播视频暂时无法加载，请重新连接。"}</span>
+                  <button type="button" on:click={loadFullArchivePlayer}>重新连接</button>
+                {:else}
+                  <Loader2 size={28} class="is-spinning" />
+                  <strong>正在连接录播视频…</strong>
+                  <span>{playerFrameLoadingHint}</span>
+                {/if}
+              </div>
+            {/if}
+          </div>
         {/key}
       {:else}
         <div class="empty-player">
@@ -5027,9 +5551,27 @@
             <video bind:this={videoElement} src={playbackMode === "native" ? videoPlayerUrl : undefined} controls playsinline preload="metadata" on:timeupdate={updateHtmlPlaybackPosition} on:error={() => void handleVideoElementError()} />
           {/if}
           {/key}
-        {:else if playerUrl}
+        {:else if playerUrl || playerFrameStatus === "loading" || playerFrameStatus === "error"}
           {#key playerUrl}
-            <iframe title="录播片段播放器" src={playerUrl} allow="autoplay; fullscreen" />
+            <div class="embedded-frame-shell" class:is-ready={playerFrameStatus === "ready"}>
+              {#if playerUrl}
+                <iframe bind:this={playerFrame} title="录播片段播放器" src={playerUrl} allow="autoplay; fullscreen" on:load={markPlayerFrameShellReady} />
+              {/if}
+              {#if playerFrameStatus !== "ready"}
+                <div class="embedded-frame-status" role={playerFrameStatus === "error" ? "alert" : "status"} aria-live="polite">
+                  {#if playerFrameStatus === "error"}
+                    <Play size={28} />
+                    <strong>录播视频连接失败</strong>
+                    <span>{playerFrameError || "录播视频暂时无法加载，请重新连接。"}</span>
+                    <button type="button" on:click={loadFullArchivePlayer}>重新连接</button>
+                  {:else}
+                    <Loader2 size={28} class="is-spinning" />
+                    <strong>正在连接录播视频…</strong>
+                    <span>{playerFrameLoadingHint}</span>
+                  {/if}
+                </div>
+              {/if}
+            </div>
           {/key}
         {:else}
           <div class="empty-player">
@@ -5126,6 +5668,7 @@
             <button
               id={`analysis-transcript-${entry.id}`}
               class="transcript-entry"
+              class:evidence-focus={entry.id === focusedEvidenceTranscriptEntryId}
               class:in-candidate={Boolean(selectedCandidate && entry.end >= selectedCandidate.start && entry.start <= selectedCandidate.end)}
               class:in-correction={Boolean(
                 workspaceTab === "proofreading" &&
@@ -5371,6 +5914,14 @@
   .company-player-shell .playback-preparation { color: #e2e8f0; }
   .company-player-shell video,
   .company-player-shell iframe { width: 100%; height: 100%; min-height: 280px; border: 0; border-radius: 10px; background: #0f172a; }
+  .embedded-frame-shell { position: relative; width: 100%; height: 100%; min-height: 280px; overflow: hidden; border-radius: 10px; background: #0f172a; }
+  .embedded-frame-shell iframe { visibility: hidden; opacity: 0; transition: opacity .18s ease; }
+  .embedded-frame-shell.is-ready iframe { visibility: visible; opacity: 1; }
+  .embedded-frame-status { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 24px; box-sizing: border-box; color: #cbd5e1; background: radial-gradient(circle at 50% 38%, #1e293b 0%, #0f172a 58%, #0b1220 100%); text-align: center; }
+  .embedded-frame-status strong { color: #f8fafc; font-size: 14px; font-weight: 650; }
+  .embedded-frame-status span { max-width: 360px; color: #94a3b8; font-size: 12px; line-height: 1.55; }
+  .embedded-frame-status button { min-height: 34px; margin-top: 4px; padding: 0 15px; border: 1px solid rgba(96,165,250,.4); border-radius: 9px; color: #eff6ff; background: #2563eb; font-size: 12px; font-weight: 650; cursor: pointer; }
+  .embedded-frame-status button:hover { background: #1d4ed8; }
   .analysis-zoom-viewport { width: 100%; height: 100%; min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
   .analysis-shell { flex: 1 1 auto; min-height: 0; width: 100%; display: flex; flex-direction: column; color: #1d1d1f; background: linear-gradient(180deg, #fbfbfd 0%, #f2f3f6 100%); zoom: var(--analysis-zoom); }
   .analysis-main { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0 0 10px; }
@@ -5398,7 +5949,6 @@
   .live-dashboard-summary-heading strong { color: #175cd3; font-size: 12px; }
   .live-dashboard-summary-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .live-dashboard-summary-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-  .live-dashboard-open-button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #bfd4ff; border-radius: 999px; background: #eff4ff; color: #175cd3; padding: 4px 10px; font-size: 12px; cursor: pointer; }
   .live-dashboard-summary-heading small { flex: 0 0 auto; padding: 3px 7px; border-radius: 999px; color: #087c42; background: #eaf8f0; }
   .live-dashboard-metrics { display: grid; grid-template-columns: repeat(11, minmax(84px, 1fr)); gap: 6px; overflow-x: auto; }
   .live-dashboard-metric { min-width: 84px; display: grid; gap: 4px; padding: 7px; border: 1px solid rgba(0,113,227,.1); border-radius: 8px; background: rgba(255,255,255,.78); }
@@ -5539,6 +6089,7 @@
   .transcript-entry:hover { background: rgba(118,118,128,.07); }
   .transcript-entry.in-candidate { background: #edf5ff; }
   .transcript-entry.in-correction { background: #fff4d9; box-shadow: inset 3px 0 0 #f79009; }
+  .transcript-entry.evidence-focus { background: #e2f4e8; box-shadow: inset 4px 0 0 #148447, 0 0 0 1px rgba(20,132,71,.16); }
   .transcript-entry time { color: #0071e3; font-size: 10px; font-variant-numeric: tabular-nums; }
   .transcript-entry span { font-size: 12px; line-height: 1.55; }
   .copy-actions { gap: 5px; }
@@ -5668,6 +6219,7 @@
   :global(.dark) .zoom-control button { color: #e8eaf0; }
   :global(.dark) .candidate-card.selected, :global(.dark) .transcript-entry.in-candidate { background: #373851; }
   :global(.dark) .transcript-entry.in-correction { background: #4b412d; }
+  :global(.dark) .transcript-entry.evidence-focus { background: #243d31; box-shadow: inset 4px 0 0 #4ade80, 0 0 0 1px rgba(74,222,128,.28); }
   :global(.dark) .highlight-filters, :global(.dark) .review-tabs, :global(.dark) .workspace-tabs { background: #24262a; }
   :global(.dark) .highlight-filters button.active, :global(.dark) .review-tabs button.active, :global(.dark) .workspace-tabs button.active, :global(.dark) .rerun-button { color: #f5f5f7; background: #3a3d43; }
   :global(.dark) .evidence-card { border-color: #494d55; background: #303238; }

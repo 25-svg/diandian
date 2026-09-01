@@ -176,4 +176,45 @@ assert.ok(
   "corrected transcript updates must invalidate discovery and review before replacement",
 );
 
+assert.match(
+  componentSource,
+  /playerFrameStatus\s*=\s*"loading"[\s\S]*?setTimeout[\s\S]*?playerFrameStatus\s*=\s*"error"/,
+  "embedded archive playback must fail closed behind a bounded connection timeout",
+);
+assert.match(
+  componentSource,
+  /event\.source\s*!==\s*playerFrame\.contentWindow/,
+  "embedded player readiness messages must be accepted only from the active iframe",
+);
+assert.match(
+  componentSource,
+  /class:is-ready=\{playerFrameStatus === "ready"\}[\s\S]*?重新连接/,
+  "the raw iframe must stay hidden until ready and expose an in-app reconnect action on failure",
+);
+
+const appLiveSource = readFileSync(
+  new URL("../src/AppLive.svelte", import.meta.url),
+  "utf8",
+);
+assert.match(
+  appLiveSource,
+  /bsr:embed-shell-ready[\s\S]*?on:playbackReady[\s\S]*?bsr:embed-playback-error/,
+  "the embedded live page must report shell readiness plus playback success or failure",
+);
+
+const playerSource = readFileSync(
+  new URL("../src/lib/components/Player.svelte", import.meta.url),
+  "utf8",
+);
+assert.match(
+  playerSource,
+  /dispatch\("playbackReady"\)[\s\S]*?dispatch\("playbackError"/,
+  "the media player must expose deterministic ready and error events to its embedding page",
+);
+assert.match(
+  playerSource,
+  /if \(embedded\)[\s\S]*?Avoid browser alerts or reload loops inside the iframe/,
+  "embedded playback failures must not show a browser alert or enter a reload loop",
+);
+
 console.log("ArchiveAnalysis source reactivity check passed");

@@ -30,6 +30,7 @@ $requiredFiles = @(
     (Join-Path $appSource "vcruntime140.dll"),
     (Join-Path $appSource "vcruntime140_1.dll"),
     (Join-Path $appSource "funasr-runtime\funasr-service.exe"),
+    (Join-Path $appSource "doudian-runtime\doudian-fetch-payment-events.exe"),
     $webView2Installer,
     $configTemplate,
     $seedDatabase,
@@ -51,6 +52,9 @@ foreach ($modelDirectory in @(
     if (-not (Test-Path -LiteralPath $modelDirectory -PathType Container)) {
         throw "安装包不完整，缺少 FunASR 模型：$modelDirectory"
     }
+}
+if (-not (Test-Path -LiteralPath (Join-Path $appSource "doudian-runtime\sdk-python\doudian") -PathType Container)) {
+    throw "安装包不完整，缺少抖店 SDK。"
 }
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "当前安装包仅支持 64 位 Windows。"
@@ -144,11 +148,18 @@ if (-not $hasExistingKnowledge) {
     New-Item -ItemType Directory -Force -Path $knowledgeDir | Out-Null
 }
 
-Get-ChildItem -LiteralPath $appSource -Force |
-    Copy-Item -Destination $appDir -Recurse -Force
+function Copy-DirectoryTree([string]$source, [string]$destination) {
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    & robocopy.exe $source $destination /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+    $robocopyExitCode = $LASTEXITCODE
+    if ($robocopyExitCode -ge 8) {
+        throw "目录复制失败（Robocopy 返回码 $robocopyExitCode）：$source -> $destination"
+    }
+}
+
+Copy-DirectoryTree -source $appSource -destination $appDir
 if (-not $hasExistingKnowledge) {
-    Get-ChildItem -LiteralPath $seedKnowledge -Force |
-        Copy-Item -Destination $knowledgeDir -Recurse -Force
+    Copy-DirectoryTree -source $seedKnowledge -destination $knowledgeDir
 }
 if (-not $hasExistingDatabase) {
     Copy-Item -LiteralPath $seedDatabase -Destination $databasePath

@@ -1,3 +1,6 @@
+use crate::database::anchor_knowledge::{
+    AnchorKnowledgeSourceInput, PublishedAnchorKnowledgeAssetInput,
+};
 use crate::database::master_sample_batch::{
     MasterSampleBatchDetail, MasterSampleBatchItemRow, MasterSampleBatchSummary,
     NewMasterSampleBatch,
@@ -338,7 +341,12 @@ pub async fn publish_master_sample_batch_draft(
         return Err("请先生成完成并核对最终母稿草稿，再发布企业母稿".into());
     }
     let host_label = resolve_batch_host_label(&state, &detail).await?;
-    let kb_root = host_knowledge_base_root(&host_label)?;
+    let anchor_profile = state
+        .db
+        .ensure_anchor_knowledge_profile(&host_label)
+        .await
+        .map_err(String::from)?;
+    let kb_root = PathBuf::from(&anchor_profile.vault_relative_root);
     let draft_json = detail
         .synthesis
         .as_ref()
@@ -367,17 +375,12 @@ pub async fn publish_master_sample_batch_draft(
             render_batch_master_section(&script_key, row, section),
         ));
     }
-    files.push((
-        kb_root.join("分析建议").join("执行规则.md"),
-        render_host_analysis_advice(&host_label, &detail, &draft),
-    ));
+    let analysis_relative = kb_root.join("分析建议").join("执行规则.md");
+    let analysis_content = render_host_analysis_advice(&host_label, &detail, &draft);
+    files.push((analysis_relative.clone(), analysis_content.clone()));
     let video_paths = load_batch_video_paths(&state, &draft).await;
-    files.extend(render_host_deal_video_refs(
-        &kb_root,
-        &host_label,
-        &draft,
-        &video_paths,
-    ));
+    let deal_files = render_host_deal_video_refs(&kb_root, &host_label, &draft, &video_paths);
+    files.extend(deal_files.iter().cloned());
     let mut created = Vec::<PathBuf>::new();
     for (relative, content) in files {
         if let Err(error) = write_new_master_file(&vault, &relative, &content, &mut created).await {
@@ -409,6 +412,26 @@ pub async fn publish_master_sample_batch_draft(
         .mark_master_sample_batch_published(request.batch_id)
         .await
         .map_err(String::from)?;
+    if let Err(error) = index_published_master_assets(
+        &state,
+        &anchor_profile.anchor_id,
+        &detail,
+        &draft,
+        1,
+        &index_relative,
+        &index,
+        &analysis_relative,
+        &analysis_content,
+        &deal_files,
+    )
+    .await
+    {
+        log::error!(
+            "母稿批次 {} 已发布，但主播知识库索引写入失败: {}",
+            request.batch_id,
+            error
+        );
+    }
     Ok(published)
 }
 
@@ -429,7 +452,12 @@ pub async fn publish_corrected_master_sample_batch_version(
         return Err("请先发布 V1.0 母稿，再生成校正版本".into());
     }
     let host_label = resolve_batch_host_label(&state, &detail).await?;
-    let kb_root = host_knowledge_base_root(&host_label)?;
+    let anchor_profile = state
+        .db
+        .ensure_anchor_knowledge_profile(&host_label)
+        .await
+        .map_err(String::from)?;
+    let kb_root = PathBuf::from(&anchor_profile.vault_relative_root);
     let script_key = builder::safe_key(&format!("MS-BATCH-{}", detail.batch.id))?;
     let previous = state
         .db
@@ -489,15 +517,14 @@ pub async fn publish_corrected_master_sample_batch_version(
             render_corrected_batch_master_section(&script_key, section),
         ));
     }
-    files.push((
-        kb_root.join("分析建议").join("校正说明-V1.1.md"),
-        format!(
+    let analysis_relative = kb_root.join("分析建议").join("校正说明-V1.1.md");
+    let analysis_content = format!(
             "# 分析建议（校正版）\n\n- 主播：{}\n- 样本批次：{}\n- 版本：V1.1\n\n## 本次校正\n\n- 已应用 {} 处可确定的型号格式校正。\n- 未能由规则验证的内容保持原样，避免擅自改写主播原话。\n",
             host_label,
             detail.batch.title.trim(),
             correction_count
-        ),
-    ));
+        );
+    files.push((analysis_relative.clone(), analysis_content.clone()));
     let mut created = Vec::<PathBuf>::new();
     for (relative, content) in files {
         if let Err(error) = write_new_master_file(&vault, &relative, &content, &mut created).await {
@@ -518,7 +545,28 @@ pub async fn publish_corrected_master_sample_batch_version(
         })
         .await;
     match published {
-        Ok(master) => Ok(master),
+        Ok(master) => {
+            let source = master_version_source(previous.id, &previous.content_hash, "1.0.0");
+            if let Err(error) = index_corrected_master_assets(
+                &state,
+                &anchor_profile.anchor_id,
+                &detail,
+                &index_relative,
+                &index,
+                &analysis_relative,
+                &analysis_content,
+                source,
+            )
+            .await
+            {
+                log::error!(
+                    "母稿批次 {} 的校正版已发布，但主播知识库索引写入失败: {}",
+                    request.batch_id,
+                    error
+                );
+            }
+            Ok(master)
+        }
         Err(error) => {
             cleanup_created_files(&vault, &created).await;
             Err(error.to_string())
@@ -1644,7 +1692,17 @@ async fn load_master_truth(state: &State, source_id: i64) -> Result<MasterTruth,
         )
         .await
         .map_err(|error| error.to_string())?;
-    let transcript = master_ingest::parse_srt_cues(&bundle.corrected_srt)?
+    let deal_window_path = context.artifact_dir.join("deal-windows.srt");
+    let transcript_srt = match tokio::fs::read_to_string(deal_window_path).await {
+        Ok(content) if !content.trim().is_empty() => Some(content),
+        _ => None,
+    };
+    let transcript_cues = match &transcript_srt {
+        Some(content) => master_ingest::parse_srt_cues(content)
+            .or_else(|_| master_ingest::parse_srt_cues(&bundle.corrected_srt)),
+        None => Ok(master_ingest::parse_srt_cues(&bundle.corrected_srt)?),
+    }?;
+    let transcript = transcript_cues
         .into_iter()
         .enumerate()
         .map(|(index, cue)| TranscriptCue {
@@ -1726,17 +1784,10 @@ async fn resolve_batch_host_label(
     )
 }
 
-fn host_knowledge_base_root(host_label: &str) -> Result<PathBuf, String> {
-    let name = sanitize_host_knowledge_base_name(host_label)?;
-    Ok(PathBuf::from(name))
-}
-
 fn sanitize_host_knowledge_base_name(host_label: &str) -> Result<String, String> {
     let trimmed = host_label.trim();
     if trimmed.is_empty() {
-        return Err(
-            "请先在批次填写样本来源/主播名（如：于千惠），再发布到「主播知识库」。".into(),
-        );
+        return Err("请先在批次填写样本来源/主播名（如：于千惠），再发布到「主播知识库」。".into());
     }
     let sanitized: String = trimmed
         .chars()
@@ -1875,6 +1926,203 @@ fn render_host_deal_video_refs(
             (video_dir.join(file_name), content)
         })
         .collect()
+}
+
+fn transcript_sources(
+    batch_id: i64,
+    version: i64,
+    evidence: &[model::BatchEvidence],
+) -> Result<Vec<AnchorKnowledgeSourceInput>, String> {
+    evidence
+        .iter()
+        .map(|item| {
+            let start_ms = i64::try_from(item.start_ms)
+                .map_err(|_| format!("证据 {} 的开始时间超出索引范围", item.evidence_id))?;
+            let end_ms = i64::try_from(item.end_ms)
+                .map_err(|_| format!("证据 {} 的结束时间超出索引范围", item.evidence_id))?;
+            if end_ms <= start_ms {
+                return Err(format!("证据 {} 的时间范围无效", item.evidence_id));
+            }
+            let transcript_hash = builder::content_hash(&item.quote);
+            Ok(AnchorKnowledgeSourceInput {
+                source_kind: "transcript".into(),
+                source_locator: format!(
+                    "video:{}#{}-{}:{}",
+                    item.video_id, item.start_ms, item.end_ms, item.evidence_id
+                ),
+                video_id: Some(item.video_id),
+                start_ms: Some(start_ms),
+                end_ms: Some(end_ms),
+                transcript_version: format!("master-batch-{batch_id}-v{version}"),
+                transcript_hash: transcript_hash.clone(),
+                product_fact_id: String::new(),
+                product_fact_version: String::new(),
+                analysis_version: String::new(),
+                content_hash: transcript_hash,
+            })
+        })
+        .collect()
+}
+
+fn master_version_source(
+    previous_master_id: i64,
+    previous_content_hash: &str,
+    previous_version: &str,
+) -> AnchorKnowledgeSourceInput {
+    AnchorKnowledgeSourceInput {
+        source_kind: "analysis".into(),
+        source_locator: format!("master-script:{previous_master_id}"),
+        video_id: None,
+        start_ms: None,
+        end_ms: None,
+        transcript_version: String::new(),
+        transcript_hash: String::new(),
+        product_fact_id: String::new(),
+        product_fact_version: String::new(),
+        analysis_version: previous_version.into(),
+        content_hash: previous_content_hash.into(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn index_published_master_assets(
+    state: &State,
+    anchor_id: &str,
+    detail: &MasterSampleBatchDetail,
+    draft: &model::BatchMasterDraft,
+    version: i64,
+    speech_relative: &Path,
+    speech_content: &str,
+    analysis_relative: &Path,
+    analysis_content: &str,
+    deal_files: &[(PathBuf, String)],
+) -> Result<(), String> {
+    let sources = transcript_sources(detail.batch.id, version, &draft.evidence)?;
+    let reviewer_id = format!("master-sample-batch:{}", detail.batch.id);
+    let reason = "母稿样本批次经人工确认发布";
+    state
+        .db
+        .import_published_anchor_knowledge_asset(PublishedAnchorKnowledgeAssetInput {
+            asset_id: format!("master-batch-{}-speech-v{version}", detail.batch.id),
+            anchor_id: anchor_id.into(),
+            asset_type: "speech".into(),
+            title: draft.title.clone(),
+            body: speech_content.into(),
+            product_id: String::new(),
+            version,
+            supersedes_asset_id: (version > 1)
+                .then(|| format!("master-batch-{}-speech-v{}", detail.batch.id, version - 1)),
+            reviewer_id: reviewer_id.clone(),
+            review_reason: reason.into(),
+            published_relative_path: normalized_path(speech_relative),
+            published_file_hash: builder::content_hash(speech_content),
+            sources: sources.clone(),
+        })
+        .await
+        .map_err(String::from)?;
+    state
+        .db
+        .import_published_anchor_knowledge_asset(PublishedAnchorKnowledgeAssetInput {
+            asset_id: format!("master-batch-{}-analysis-v{version}", detail.batch.id),
+            anchor_id: anchor_id.into(),
+            asset_type: "analysis_advice".into(),
+            title: format!("{} · 分析建议", detail.batch.title.trim()),
+            body: analysis_content.into(),
+            product_id: String::new(),
+            version,
+            supersedes_asset_id: (version > 1)
+                .then(|| format!("master-batch-{}-analysis-v{}", detail.batch.id, version - 1)),
+            reviewer_id: reviewer_id.clone(),
+            review_reason: reason.into(),
+            published_relative_path: normalized_path(analysis_relative),
+            published_file_hash: builder::content_hash(analysis_content),
+            sources: sources.clone(),
+        })
+        .await
+        .map_err(String::from)?;
+
+    for (evidence, (relative, content)) in draft.evidence.iter().zip(deal_files) {
+        let evidence_sources =
+            transcript_sources(detail.batch.id, version, std::slice::from_ref(evidence))?;
+        state
+            .db
+            .import_published_anchor_knowledge_asset(PublishedAnchorKnowledgeAssetInput {
+                asset_id: format!(
+                    "master-batch-{}-deal-{}",
+                    detail.batch.id,
+                    sanitize_evidence_file_stem(&evidence.evidence_id)
+                ),
+                anchor_id: anchor_id.into(),
+                asset_type: "deal_clip".into(),
+                title: evidence.video_title.clone(),
+                body: content.clone(),
+                product_id: String::new(),
+                version: 1,
+                supersedes_asset_id: None,
+                reviewer_id: reviewer_id.clone(),
+                review_reason: reason.into(),
+                published_relative_path: normalized_path(relative),
+                published_file_hash: builder::content_hash(content),
+                sources: evidence_sources,
+            })
+            .await
+            .map_err(String::from)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn index_corrected_master_assets(
+    state: &State,
+    anchor_id: &str,
+    detail: &MasterSampleBatchDetail,
+    speech_relative: &Path,
+    speech_content: &str,
+    analysis_relative: &Path,
+    analysis_content: &str,
+    source: AnchorKnowledgeSourceInput,
+) -> Result<(), String> {
+    let reviewer_id = format!("master-sample-batch:{}", detail.batch.id);
+    let reason = "人工发布逐字稿确定性校正版";
+    for input in [
+        PublishedAnchorKnowledgeAssetInput {
+            asset_id: format!("master-batch-{}-speech-v2", detail.batch.id),
+            anchor_id: anchor_id.into(),
+            asset_type: "speech".into(),
+            title: format!("{}（逐字稿校正）", detail.batch.title.trim()),
+            body: speech_content.into(),
+            product_id: String::new(),
+            version: 2,
+            supersedes_asset_id: Some(format!("master-batch-{}-speech-v1", detail.batch.id)),
+            reviewer_id: reviewer_id.clone(),
+            review_reason: reason.into(),
+            published_relative_path: normalized_path(speech_relative),
+            published_file_hash: builder::content_hash(speech_content),
+            sources: vec![source.clone()],
+        },
+        PublishedAnchorKnowledgeAssetInput {
+            asset_id: format!("master-batch-{}-analysis-v2", detail.batch.id),
+            anchor_id: anchor_id.into(),
+            asset_type: "analysis_advice".into(),
+            title: format!("{} · 校正说明", detail.batch.title.trim()),
+            body: analysis_content.into(),
+            product_id: String::new(),
+            version: 2,
+            supersedes_asset_id: Some(format!("master-batch-{}-analysis-v1", detail.batch.id)),
+            reviewer_id: reviewer_id.clone(),
+            review_reason: reason.into(),
+            published_relative_path: normalized_path(analysis_relative),
+            published_file_hash: builder::content_hash(analysis_content),
+            sources: vec![source],
+        },
+    ] {
+        state
+            .db
+            .import_published_anchor_knowledge_asset(input)
+            .await
+            .map_err(String::from)?;
+    }
+    Ok(())
 }
 
 fn sanitize_evidence_file_stem(evidence_id: &str) -> String {
@@ -2206,8 +2454,12 @@ mod correction_status_tests {
             sanitize_host_knowledge_base_name("于千惠知识库").unwrap(),
             "于千惠知识库"
         );
-        assert!(sanitize_host_knowledge_base_name("  ").unwrap_err().contains("主播名"));
-        assert!(sanitize_host_knowledge_base_name("a/b").unwrap().contains("知识库"));
+        assert!(sanitize_host_knowledge_base_name("  ")
+            .unwrap_err()
+            .contains("主播名"));
+        assert!(sanitize_host_knowledge_base_name("a/b")
+            .unwrap()
+            .contains("知识库"));
     }
 
     #[test]

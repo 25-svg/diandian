@@ -22,7 +22,6 @@
   export let compactHeader = false;
 
   const dispatch = createEventDispatcher<{
-    openDashboard: void;
     bindSession: void;
     rebindSession: void;
   }>();
@@ -48,7 +47,6 @@
       </div>
       <div class="head-actions">
         {#if session}
-          <button type="button" class="text-btn" on:click={() => dispatch("openDashboard")}>打开大屏</button>
           <button type="button" class="text-btn" on:click={() => dispatch("rebindSession")}>换绑</button>
         {/if}
       </div>
@@ -61,7 +59,6 @@
         {#if matchLabel} · {matchLabel}{/if}
       </span>
       <div class="head-actions">
-        <button type="button" class="text-btn" on:click={() => dispatch("openDashboard")}>打开大屏</button>
         <button type="button" class="text-btn" on:click={() => dispatch("rebindSession")}>换绑</button>
       </div>
     </div>
@@ -151,7 +148,7 @@
     {/if}
 
     {#if !session && showDashboardBind && !candidates.length}
-      <p class="status muted">未找到可绑定场次。请先在「直播数据大屏」导入官方 XLSX。</p>
+      <p class="status muted">未找到可绑定场次。请在“对齐”中下载或导入本场官方 XLSX。</p>
     {:else if !session && !orderSummary}
       <p class="status muted">暂无数据</p>
     {/if}

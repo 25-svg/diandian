@@ -71,6 +71,8 @@ pub trait RecorderTrait<T>: RecorderBasicTrait<T> {
             live_id: self.live_id().read().await.clone(),
             recording: is_recording,
             enabled: self.enabled().load(atomic::Ordering::Relaxed),
+            current_streamer: String::new(),
+            current_streamer_source: String::new(),
             room_info: RoomInfo {
                 platform: self.platform().as_str().to_string(),
                 room_id: self.room_id().to_string(),

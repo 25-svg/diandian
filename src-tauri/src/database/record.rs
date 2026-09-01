@@ -23,7 +23,12 @@ pub struct RecordRow {
     pub anchor_detected_at: String,
     pub archive_kind: String,
     pub classification_source: String,
+    pub source_path: String,
 }
+
+pub const RECORD_SOURCE_PATH_MIGRATION_SQL: &str = r#"
+ALTER TABLE records ADD COLUMN source_path TEXT NOT NULL DEFAULT '';
+"#;
 
 pub const RECORD_ARCHIVE_KIND_MIGRATION_SQL: &str = r#"
 ALTER TABLE records ADD COLUMN archive_kind TEXT NOT NULL DEFAULT 'competitor';
@@ -130,16 +135,33 @@ impl Database {
             }
             .to_string(),
             classification_source: "auto_rule".to_string(),
+            source_path: String::new(),
         };
-        if let Err(e) = sqlx::query("INSERT INTO records (live_id, room_id, title, length, size, cover, created_at, platform, parent_id, anchor_name, anchor_source, anchor_confidence, anchor_detection_status, anchor_detection_error, anchor_detected_at, archive_kind, classification_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)").bind(record.live_id.clone())
+        if let Err(e) = sqlx::query("INSERT INTO records (live_id, room_id, title, length, size, cover, created_at, platform, parent_id, anchor_name, anchor_source, anchor_confidence, anchor_detection_status, anchor_detection_error, anchor_detected_at, archive_kind, classification_source, source_path) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)").bind(record.live_id.clone())
             .bind(&record.room_id).bind(&record.title).bind(0).bind(0).bind(&record.cover).bind(&record.created_at).bind(platform.as_str().to_string()).bind(parent_id)
-            .bind(&record.anchor_name).bind(&record.anchor_source).bind(&record.anchor_confidence).bind(&record.anchor_detection_status).bind(&record.anchor_detection_error).bind(&record.anchor_detected_at).bind(&record.archive_kind).bind(&record.classification_source).execute(&lock).await {
+            .bind(&record.anchor_name).bind(&record.anchor_source).bind(&record.anchor_confidence).bind(&record.anchor_detection_status).bind(&record.anchor_detection_error).bind(&record.anchor_detected_at).bind(&record.archive_kind).bind(&record.classification_source).bind(&record.source_path).execute(&lock).await {
                 // if the record already exists, return the existing record
                 if e.to_string().contains("UNIQUE constraint failed") {
                     return self.get_record(room_id, live_id).await;
                 }
             }
         Ok(record)
+    }
+
+    pub async fn update_record_source_path(
+        &self,
+        room_id: &str,
+        live_id: &str,
+        source_path: &str,
+    ) -> Result<(), DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        sqlx::query("UPDATE records SET source_path = $1 WHERE room_id = $2 AND live_id = $3")
+            .bind(source_path)
+            .bind(room_id)
+            .bind(live_id)
+            .execute(&lock)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_record_archive_kind(
@@ -188,7 +210,10 @@ impl Database {
         }
     }
 
-    async fn get_record_by_live_id(&self, live_id: &str) -> Result<RecordRow, DatabaseError> {
+    pub(crate) async fn get_record_by_live_id(
+        &self,
+        live_id: &str,
+    ) -> Result<RecordRow, DatabaseError> {
         let lock = self.db.read().await.clone().unwrap();
         sqlx::query_as::<_, RecordRow>("SELECT * FROM records WHERE live_id = $1")
             .bind(live_id)
@@ -270,6 +295,32 @@ impl Database {
              WHERE live_id = $2",
         )
         .bind(anchor_name.trim())
+        .bind(live_id)
+        .execute(&lock)
+        .await?;
+        Ok(
+            sqlx::query_as::<_, RecordRow>("SELECT * FROM records WHERE live_id = $1")
+                .bind(live_id)
+                .fetch_one(&lock)
+                .await?,
+        )
+    }
+
+    pub async fn clear_record_anchor_manual(
+        &self,
+        live_id: &str,
+    ) -> Result<RecordRow, DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        sqlx::query(
+            "UPDATE records
+             SET anchor_name = '',
+                 anchor_source = '',
+                 anchor_confidence = '',
+                 anchor_detection_status = 'pending',
+                 anchor_detection_error = '',
+                 anchor_detected_at = ''
+             WHERE live_id = $1 AND anchor_source = 'manual'",
+        )
         .bind(live_id)
         .execute(&lock)
         .await?;

@@ -1,5 +1,6 @@
 use crate::database::live_dashboard::LiveDashboardSessionRow;
 use crate::live_dashboard_binding::{
+    bound_session_conflicts_with_record, imported_bound_session_conflicts_with_video,
     infer_shop_name_from_texts, match_dashboard_sessions, match_imported_video_by_duration,
     match_imported_video_sessions, session_matches_shop, LiveDashboardMatchCandidate,
     RecordForLiveDashboardBinding,
@@ -50,9 +51,14 @@ pub async fn resolve_live_dashboard_for_record_state(
         .await
         .map_err(|error| error.to_string())?
     {
+        let binding = state
+            .db
+            .get_live_dashboard_binding(&live_id)
+            .await
+            .map_err(|error| error.to_string())?;
         // A standardized imported filename is authoritative for shop identity.
         // Ignore an old cross-shop manual binding so resolution can repair it.
-        let cross_shop_import_binding = if let Some(video_id) = live_id
+        let stale_import_binding = if let Some(video_id) = live_id
             .strip_prefix("import:")
             .and_then(|value| value.parse::<i64>().ok())
         {
@@ -61,21 +67,50 @@ pub async fn resolve_live_dashboard_for_record_state(
                 .get_video(video_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            infer_shop_name_from_texts(&[&video.title, &video.file, &video.note])
-                .is_some_and(|shop| !session_matches_shop(&session, shop))
+            imported_bound_session_conflicts_with_video(
+                &video.title,
+                &video.file,
+                &video.note,
+                &session,
+            )
         } else {
             false
         };
-        if cross_shop_import_binding {
+        let stale_record_binding = if !live_id.starts_with("import:")
+            && binding
+                .as_ref()
+                .is_some_and(|binding| binding.match_method != "manual")
+        {
+            let record = state
+                .db
+                .get_record(&room_id, &live_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            bound_session_conflicts_with_record(
+                &RecordForLiveDashboardBinding {
+                    platform: record.platform,
+                    room_id: record.room_id,
+                    title: record.title,
+                    created_at: record.created_at,
+                    length_secs: (record.length > 0.0).then_some(record.length.round() as i64),
+                },
+                &session,
+            )
+        } else {
+            false
+        };
+        if stale_import_binding || stale_record_binding {
+            if stale_record_binding {
+                state
+                    .db
+                    .delete_live_dashboard_binding(&live_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             // Continue into imported-video matching below. A successful match
             // overwrites the stale binding through the existing UPSERT.
         } else {
-            let match_method = state
-                .db
-                .get_live_dashboard_binding(&live_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .map(|binding| binding.match_method);
+            let match_method = binding.map(|binding| binding.match_method);
             return Ok(ResolveLiveDashboardResult {
                 session: Some(session),
                 candidates: Vec::new(),

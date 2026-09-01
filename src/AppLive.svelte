@@ -31,6 +31,11 @@
   const focus_end = parseInt(urlParams.get("end") || "0");
   const embedded = urlParams.get("embed") === "1";
 
+  function postEmbeddedPlayerStatus(type: string, message = ""): void {
+    if (!embedded || window.parent === window) return;
+    window.parent.postMessage({ type, message }, "*");
+  }
+
   log.info("AppLive loaded", room_id, platform, live_id);
 
   let config: Config = null;
@@ -501,6 +506,7 @@
   // Initialize video element when component is mounted
   onMount(() => {
     video = document.getElementById("video") as HTMLVideoElement;
+    postEmbeddedPlayerStatus("bsr:embed-shell-ready");
     invoke("get_archive", { roomId: room_id, liveId: live_id }).then(
       (a: RecordItem) => {
         archive = a;
@@ -733,7 +739,10 @@
         {platform}
         {room_id}
         {live_id}
+        {embedded}
         {markers}
+        on:playbackReady={() => postEmbeddedPlayerStatus("bsr:embed-playback-ready")}
+        on:playbackError={(event) => postEmbeddedPlayerStatus("bsr:embed-playback-error", event.detail?.message)}
         on:markerAdd={(e) => {
           markers.push({
             offset: e.detail.offset,

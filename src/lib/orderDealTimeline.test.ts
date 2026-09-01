@@ -14,9 +14,20 @@ const payload = parsePaymentEventsPayload({
     event_count: 4,
     total_pay_amount_yuan: 23655.2,
     live_started_at: "2026-07-28 08:15:49",
+    shop_id: "212709966",
+    shop_name: "金典拍拍相机专卖店",
+    expected_event_count: 4,
+    expected_pay_amount_yuan: 23655.2,
+    candidate_event_count: 6,
+    current_valid_event_count: 3,
+    current_valid_amount_yuan: 18000,
+    attributed_closed_or_refunded_event_count: 1,
+    attributed_closed_or_refunded_amount_yuan: 5655.2,
+    unmatched_event_count: 2,
+    unmatched_amount_yuan: 1200,
   },
   events: [
-    { offset_sec: 45, pay_amount_fen: 320000, product_name: "佳能 R7" },
+    { offset_sec: 45, pay_amount_fen: 320000, product_name: "佳能 R7", product_id: "p1", order_status: "已关闭" },
     { offset_sec: 75, pay_amount_fen: 711500, product_name: "佳能 R62" },
     { offset_sec: 135, pay_amount_fen: 580000, product_name: "尼康 Z5" },
     { offset_sec: 140, pay_amount_fen: 450000, product_name: "索尼 A7C" },
@@ -26,6 +37,11 @@ const payload = parsePaymentEventsPayload({
 assert.ok(payload);
 assert.equal(payload!.events.length, 4);
 assert.equal(payload!.summary?.eventCount, 4);
+assert.equal(payload!.events[0]?.productId, "p1");
+assert.equal(payload!.events[0]?.orderStatus, "已关闭");
+assert.equal(payload!.summary?.shopName, "金典拍拍相机专卖店");
+assert.equal(payload!.summary?.currentValidEventCount, 3);
+assert.equal(payload!.summary?.unmatchedEventCount, 2);
 
 const buckets = buildDealMinuteBuckets(payload!.events);
 assert.equal(buckets.length, 3);

@@ -22,14 +22,21 @@ pub async fn get_user_info(
     client: &Client,
     account: &Account,
 ) -> Result<UserInfo, HuyaClientError> {
-    // https://m.huya.com/video/u/2246697169
+    let url = format!("https://m.huya.com/video/u/{}", account.id);
+    get_user_info_from_url(client, account, &url).await
+}
+
+async fn get_user_info_from_url(
+    client: &Client,
+    account: &Account,
+    url: &str,
+) -> Result<UserInfo, HuyaClientError> {
     let mut headers = generate_user_agent_header();
     if let Ok(cookies) = account.cookies.parse() {
         headers.insert("cookie", cookies);
     } else {
         return Err(HuyaClientError::InvalidCookie);
     }
-    let url = format!("https://m.huya.com/video/u/{}", account.id);
     let response = client.get(url).headers(headers).send().await?;
     let raw_content = response.text().await?;
     // <div class="video-list-info">
@@ -72,6 +79,15 @@ pub async fn get_room_info(
     account: &Account,
     room_id: &str,
 ) -> Result<(UserInfo, RoomInfo, StreamInfo), HuyaClientError> {
+    let url = format!("https://m.huya.com/{room_id}");
+    get_room_info_from_url(client, account, &url).await
+}
+
+async fn get_room_info_from_url(
+    client: &Client,
+    account: &Account,
+    url: &str,
+) -> Result<(UserInfo, RoomInfo, StreamInfo), HuyaClientError> {
     let mut headers = generate_user_agent_header();
     if let Ok(cookies) = account.cookies.parse() {
         headers.insert("cookie", cookies);
@@ -79,7 +95,6 @@ pub async fn get_room_info(
         return Err(HuyaClientError::InvalidCookie);
     }
     headers.insert("Referer", "https://m.huya.com/".parse().unwrap());
-    let url = format!("https://m.huya.com/{room_id}");
     let response = client.get(url).headers(headers).send().await?;
     let raw_content = response.text().await?;
     let (user_info, room_info, stream_info) =
@@ -116,11 +131,35 @@ pub async fn get_index_content(client: &Client, url: &str) -> Result<String, Huy
 #[cfg(test)]
 mod tests {
     use crate::platforms::PlatformType;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     use super::*;
 
+    fn serve_fixture(body: &str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
     #[tokio::test]
     async fn test_get_user_info() {
+        let (url, server) = serve_fixture(
+            r#"<div class="video-list-info"><div class="podcast-box"><img src="https://example.com/avatar.jpg"><div class="podcast-info-intro"><h2>fixture-user</h2></div></div></div>"#,
+        );
         let client = Client::new();
         let account = Account {
             platform: PlatformType::Huya.as_str().to_string(),
@@ -130,27 +169,31 @@ mod tests {
             csrf: "".to_string(),
             cookies: "".to_string(),
         };
-        let user_info = get_user_info(&client, &account).await.unwrap();
-        println!("{:?}", user_info);
+        let user_info = get_user_info_from_url(&client, &account, &url)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(user_info.user_id, "2246697169");
+        assert_eq!(user_info.user_name, "fixture-user");
+        assert_eq!(user_info.user_avatar, "https://example.com/avatar.jpg");
     }
 
     #[tokio::test]
     async fn test_get_room_info() {
-        // set log level to debug
-        std::env::set_var("RUST_LOG", "debug");
-        let _ = env_logger::try_init();
+        let (url, server) = serve_fixture(
+            r#"<script>window.HNF_GLOBAL_INIT = {"roomInfo":{"eLiveStatus":0,"tProfileInfo":{"lUid":431653844,"sNick":"fixture-anchor","sAvatar180":"https://example.com/avatar.jpg","lProfileRoom":599934},"tLiveInfo":{"lUid":431653844,"sNick":"fixture-anchor","sAvatar180":"https://example.com/avatar.jpg","sScreenshot":"https://example.com/cover.jpg","sIntroduction":"fixture-room","lProfileRoom":599934}}};</script>"#,
+        );
         let client = Client::new();
         let account = Account::default();
-        let (user_info, room_info, stream_info) =
-            get_room_info(&client, &account, "599934").await.unwrap();
-        println!("{:?}", user_info);
-        println!("{:?}", room_info);
-        println!("{:?}", stream_info);
-
-        // query index content
-        let index_content = get_index_content(&client, &stream_info.hls_url)
+        let (user_info, room_info, stream_info) = get_room_info_from_url(&client, &account, &url)
             .await
             .unwrap();
-        println!("{:?}", index_content);
+        server.join().unwrap();
+        assert_eq!(user_info.user_id, "431653844");
+        assert_eq!(user_info.user_name, "fixture-anchor");
+        assert_eq!(room_info.room_id, "599934");
+        assert_eq!(room_info.room_title, "fixture-room");
+        assert!(!room_info.status);
+        assert!(stream_info.hls_url.is_empty());
     }
 }

@@ -31,7 +31,8 @@ use crate::{
             generate_archive_subtitle, generate_whole_clip, get_archive, get_archive_disk_usage,
             get_archive_subtitle, get_archives, get_archives_by_parent_id, get_danmu_record,
             get_recent_record, get_recorder_list, get_room_info, get_today_record_count,
-            get_total_length, remove_recorder, send_danmaku, set_enable, ExportDanmuOptions,
+            get_total_length, refresh_archive_subtitle, remove_recorder, send_danmaku, set_enable,
+            ExportDanmuOptions,
         },
         review_sample::{
             delete_review_sample, get_review_samples, save_review_sample,
@@ -50,7 +51,9 @@ use crate::{
         AccountInfo,
     },
     http_server::websocket,
-    recorder_manager::{ClipRangeParams, GenerateWholeClipParams, RecorderList},
+    recorder_manager::{
+        ArchiveSubtitleRefreshResult, ClipRangeParams, GenerateWholeClipParams, RecorderList,
+    },
     security::{audit_tool_failure, audit_tool_success, require_sensitive_write},
     state::State,
 };
@@ -995,6 +998,30 @@ async fn handler_generate_archive_subtitle(
     let subtitle =
         generate_archive_subtitle(state.0, param.platform, param.room_id, param.live_id).await?;
     Ok(Json(ApiResponse::success(subtitle)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshArchiveSubtitleRequest {
+    platform: String,
+    room_id: String,
+    live_id: String,
+    force: Option<bool>,
+}
+
+async fn handler_refresh_archive_subtitle(
+    state: axum::extract::State<State>,
+    Json(param): Json<RefreshArchiveSubtitleRequest>,
+) -> Result<Json<ApiResponse<ArchiveSubtitleRefreshResult>>, ApiError> {
+    let result = refresh_archive_subtitle(
+        state.0,
+        param.platform,
+        param.room_id,
+        param.live_id,
+        param.force,
+    )
+    .await?;
+    Ok(Json(ApiResponse::success(result)))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2241,6 +2268,10 @@ pub async fn start_api_server(state: State) {
             .route(
                 "/api/generate_archive_subtitle",
                 post(handler_generate_archive_subtitle),
+            )
+            .route(
+                "/api/refresh_archive_subtitle",
+                post(handler_refresh_archive_subtitle),
             )
             .route(
                 "/api/generic_ffmpeg_command",

@@ -63,6 +63,28 @@ impl Database {
         .await?)
     }
 
+    pub async fn delete_live_dashboard_binding(&self, live_id: &str) -> Result<(), DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        sqlx::query("DELETE FROM live_dashboard_bindings WHERE live_id = $1")
+            .bind(live_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_live_ids_bound_to_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<String>, DatabaseError> {
+        let pool = self.db.read().await.clone().unwrap();
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT live_id FROM live_dashboard_bindings WHERE session_id = $1 ORDER BY bound_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await?)
+    }
+
     pub async fn bind_live_dashboard_session(
         &self,
         live_id: &str,

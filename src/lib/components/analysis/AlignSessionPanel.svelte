@@ -1,9 +1,11 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import { Loader2, Upload } from "lucide-svelte";
+  import type { PaymentEventsSummary } from "../../orderDealTimeline";
 
   export let orderCount = 0;
   export let totalPayYuan = 0;
+  export let orderSummary: PaymentEventsSummary | null = null;
   export let loading = false;
   export let error = "";
   export let canPullOrders = false;
@@ -19,6 +21,7 @@
   export let excelCanDownload = false;
   export let excelDownloading = false;
   export let excelDownloadHint = "";
+  export let excelError = "";
 
   const dispatch = createEventDispatcher<{
     importClean: void;
@@ -32,6 +35,9 @@
     bindExcel: void;
     downloadExcel: void;
   }>();
+
+  const money = (value: number | undefined): string =>
+    `¥${Number(value ?? 0).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
 </script>
 
 <section class="align-panel" aria-label="对齐本场">
@@ -39,11 +45,45 @@
     <div class="block-head">
       <strong>订单</strong>
       {#if orderCount > 0}
-        <span>已拉取 {orderCount} 笔 · ¥{totalPayYuan.toLocaleString("zh-CN")}</span>
+        <span>
+          {orderSummary?.shopName || "当前店铺"}
+          {orderSummary?.shopId ? `（${orderSummary.shopId}）` : ""}
+        </span>
       {:else}
         <span>未拉取</span>
       {/if}
     </div>
+    {#if orderCount > 0}
+      <div class="order-metrics" aria-label="订单口径说明">
+        <article>
+          <span>罗盘归因</span>
+          <strong>{orderSummary?.expectedEventCount ?? orderCount} 单</strong>
+          <small>{money(orderSummary?.expectedPayAmountYuan ?? totalPayYuan)}</small>
+        </article>
+        <article class="matched">
+          <span>成交话术订单</span>
+          <strong>{orderCount} 单</strong>
+          <small>{money(totalPayYuan)}</small>
+        </article>
+        <article>
+          <span>同时段当前有效</span>
+          <strong>{orderSummary?.currentValidEventCount ?? orderCount} 单</strong>
+          <small>{money(orderSummary?.currentValidAmountYuan ?? totalPayYuan)}</small>
+        </article>
+        <article>
+          <span>归因单现已关闭/退款</span>
+          <strong>{orderSummary?.attributedClosedOrRefundedEventCount ?? 0} 单</strong>
+          <small>{money(orderSummary?.attributedClosedOrRefundedAmountYuan)}</small>
+        </article>
+      </div>
+      {#if orderSummary?.candidateEventCount != null}
+        <p class="reconcile-note">
+          同店铺、同时间共找到 {orderSummary.candidateEventCount} 条支付记录；
+          {orderSummary.unmatchedEventCount ?? 0} 条未被本场 Excel 商品归因
+          {orderSummary.unmatchedAmountYuan != null ? `（${money(orderSummary.unmatchedAmountYuan)}）` : ""}。
+        </p>
+      {/if}
+    {/if}
     <div class="actions">
       <button type="button" class="primary" disabled={loading || !canPullOrders} on:click={() => dispatch("pullOrders")}>
         {#if loading}
@@ -67,6 +107,9 @@
     </div>
     {#if peakLabel}
       <button type="button" class="peak" on:click={() => dispatch("seekPeak")}>成交高峰：{peakLabel}</button>
+    {/if}
+    {#if error}
+      <p class="error" role="alert">{error}</p>
     {/if}
   </div>
 
@@ -101,9 +144,9 @@
       {/if}
     </div>
     {#if excelLabel}
-      <p class="hint">已按本场视频的开播时间和时长自动对上。不对时请改选或重新下载当天 Excel。</p>
+      <p class="hint">已按本场视频的开播时间和时长自动对上。重新下载时会依次选日期、切换账号、进入该场次后下载。</p>
     {:else}
-      <p class="hint">用视频时长和日期匹配已导入场次；本地没有时，点下方下载当天罗盘「整场数据」（首次需扫码登录）。</p>
+      <p class="hint">下载流程：悬停“自定义”选择日期 → 悬停账号切换店铺 → 进入该场次后下载（首次需扫码）。</p>
     {/if}
     {#if excelCandidates.length}
       <div class="excel-row">
@@ -123,19 +166,19 @@
         </button>
       </div>
     {/if}
-    {#if excelCanDownload && !excelLabel}
+    {#if excelCanDownload}
       <div class="actions">
         <button
           type="button"
           class="secondary"
-          disabled={excelDownloading || excelLoading}
+          disabled={excelDownloading}
           on:click={() => dispatch("downloadExcel")}
         >
           {#if excelDownloading}
             <Loader2 size={14} class="is-spinning" />
             正在下载整场数据…
           {:else}
-            下载本场 Excel
+            {excelLabel ? "重新按本场下载 Excel" : "按本场下载 Excel"}
           {/if}
         </button>
         {#if excelDownloadHint}
@@ -143,11 +186,10 @@
         {/if}
       </div>
     {/if}
+    {#if excelError}
+      <p class="error" role="alert">{excelError}</p>
+    {/if}
   </div>
-
-  {#if error}
-    <p class="error" role="alert">{error}</p>
-  {/if}
 </section>
 
 <style>
@@ -172,6 +214,39 @@
   .block.warning {
     border-color: #f7b27a;
     background: #fffaf5;
+  }
+  .order-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .order-metrics article {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+    padding: 10px;
+    border: 1px solid #e4e7ec;
+    border-radius: 10px;
+    background: #f8fafc;
+  }
+  .order-metrics article.matched {
+    border-color: #8fc7ff;
+    background: #eff7ff;
+  }
+  .order-metrics span,
+  .order-metrics small {
+    color: #667085;
+    font-size: 11px;
+  }
+  .order-metrics strong {
+    color: #101828;
+    font-size: 15px;
+  }
+  .reconcile-note {
+    margin: 0;
+    color: #475467;
+    font-size: 12px;
+    line-height: 1.6;
   }
   .block-head {
     display: flex;
@@ -274,6 +349,11 @@
   }
   :global(.is-spinning) {
     animation: spin 1s linear infinite;
+  }
+  @media (max-width: 900px) {
+    .order-metrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
   }
   @keyframes spin {
     to {

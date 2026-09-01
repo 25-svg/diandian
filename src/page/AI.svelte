@@ -199,7 +199,7 @@
     provider: "minimax" as "openai" | "minimax" | "ollama",
     endpoint: "https://api.minimaxi.com/anthropic",
     api_key: "",
-    model: "MiniMax-VL-01"
+    model: "MiniMax-M3"
   };
 
   let availableModels = [];
@@ -254,7 +254,7 @@
   async function saveSettings() {
     if (settings.provider === 'minimax') {
       settings.endpoint = 'https://api.minimaxi.com/anthropic';
-      settings.model = settings.model || 'MiniMax-VL-01';
+      settings.model = !settings.model || settings.model === 'MiniMax-M2.7' ? 'MiniMax-M3' : settings.model;
     }
     if (settings.provider === 'minimax' && settings.api_key) {
       await invoke('update_openai_api_key', { openaiApiKey: settings.api_key });
@@ -310,8 +310,8 @@
 
   async function loadModels() {
     if (settings.provider === 'minimax') {
-      availableModels = [{ value: 'MiniMax-VL-01', label: 'MiniMax-VL-01' }];
-      settings.model = settings.model || 'MiniMax-VL-01';
+      availableModels = [{ value: 'MiniMax-M3', label: 'MiniMax-M3' }];
+      settings.model = !settings.model || settings.model === 'MiniMax-M2.7' ? 'MiniMax-M3' : settings.model;
       return;
     }
     if (settings.endpoint && settings.api_key) {
@@ -338,7 +338,7 @@
       if (settings.endpoint?.includes('minimaxi.com')) {
         settings.provider = 'minimax';
         settings.endpoint = 'https://api.minimaxi.com/anthropic';
-        settings.model = settings.model || 'MiniMax-VL-01';
+        settings.model = !settings.model || settings.model === 'MiniMax-M2.7' ? 'MiniMax-M3' : settings.model;
         localStorage.setItem('ai_settings', JSON.stringify({ ...settings, api_key: '' }));
       }
       if (settings.provider === 'ollama') {
@@ -378,8 +378,8 @@
     }
   }
 
-  function formatTime(timestamp: string): string {
-    const date = new Date(timestamp);
+  function formatTime(timestamp: string | Date): string {
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
     return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   }
 

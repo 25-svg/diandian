@@ -112,7 +112,7 @@
       </button>
     </div>
   </header>
-  {#if autoClipProgress || autoClipError || speechRefineError || speechRefining}
+  {#if autoClipProgress || autoClipError || speechRefineError || speechRefining || (!canAutoClip && autoClipDisabledReason)}
     <div
       class="auto-clip-status"
       class:error={Boolean(autoClipError || speechRefineError)}
@@ -133,6 +133,8 @@
           <Loader2 size={14} class="is-spinning" />
           {speechRefineProgress || "AI 正在定位成交链路…"}
         </span>
+      {:else}
+        <span>{autoClipDisabledReason}</span>
       {/if}
     </div>
   {/if}

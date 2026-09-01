@@ -17,6 +17,11 @@ export type CompassQueueStatus =
   | "opening"
   | "downloading"
   | "validating"
+  | "capture-started"
+  | "capturing-metric"
+  | "capturing-products"
+  | "capturing-product-detail"
+  | "capture-session-finished"
   | "imported"
   | "skipped"
   | "failed";
@@ -35,9 +40,90 @@ export type CompassProgress = {
 };
 
 export function inferCompassShopFromTexts(values: readonly (string | null | undefined)[]): string {
+  return resolveCompassShopFromAccount(values) || "金典拍拍相机专卖店";
+}
+
+/** Shop identity from account/shop fields only. Ignores live titles like「富士相机专场」. */
+export function resolveCompassShopFromAccount(
+  values: readonly (string | null | undefined)[],
+): string | null {
   const identity = values.filter(Boolean).join(" ");
   if (identity.includes("科创")) return "金典拍拍科创专卖店";
-  return "金典拍拍相机专卖店";
+  if (identity.includes("金典拍拍相机专卖店") || identity.includes("相机专卖店")) {
+    return "金典拍拍相机专卖店";
+  }
+  return null;
+}
+
+const NAMED_VIDEO_IDENTITY =
+  /(金典拍拍科创专卖店|金典拍拍相机专卖店)_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})/;
+
+/** IDM / 导入规范名：店铺_开播时间，不把「富士相机专场」这类标题当店名。 */
+export function parseCompassIdentityFromName(
+  value?: string | null,
+): { shopName: string; startedAt: string } | null {
+  if (!value) return null;
+  const match = value.match(NAMED_VIDEO_IDENTITY);
+  if (!match) return null;
+  return {
+    shopName: match[1],
+    startedAt: `${match[2]}T${match[3]}:${match[4]}:${match[5]}+08:00`,
+  };
+}
+
+export function parseCompassIdentityFromTexts(
+  values: readonly (string | null | undefined)[],
+): { shopName: string; startedAt: string } | null {
+  for (const value of values) {
+    const parsed = parseCompassIdentityFromName(value);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+const padClockPart = (value: number): string => value.toString().padStart(2, "0");
+
+/**
+ * Convert an archive clock to the China-local clock used by Douyin Compass.
+ * Zoned values represent an absolute instant; zone-less values are treated as China local time.
+ */
+export function normalizeCompassStartedAt(value?: string | null): string | null {
+  const clock = value?.trim();
+  if (!clock) return null;
+
+  const local = clock.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?$/,
+  );
+  if (local) {
+    const year = Number(local[1]);
+    const month = Number(local[2]);
+    const day = Number(local[3]);
+    const hour = Number(local[4]);
+    const minute = Number(local[5]);
+    const second = Number(local[6] ?? "0");
+    const checked = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+    if (
+      checked.getUTCFullYear() !== year
+      || checked.getUTCMonth() !== month - 1
+      || checked.getUTCDate() !== day
+      || checked.getUTCHours() !== hour
+      || checked.getUTCMinutes() !== minute
+      || checked.getUTCSeconds() !== second
+    ) {
+      return null;
+    }
+    return `${year.toString().padStart(4, "0")}-${padClockPart(month)}-${padClockPart(day)}`
+      + `T${padClockPart(hour)}:${padClockPart(minute)}:${padClockPart(second)}+08:00`;
+  }
+
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(clock)) return null;
+  const timestamp = Date.parse(clock);
+  if (!Number.isFinite(timestamp)) return null;
+  const chinaClock = new Date(timestamp + 8 * 60 * 60 * 1000);
+  return `${chinaClock.getUTCFullYear().toString().padStart(4, "0")}`
+    + `-${padClockPart(chinaClock.getUTCMonth() + 1)}-${padClockPart(chinaClock.getUTCDate())}`
+    + `T${padClockPart(chinaClock.getUTCHours())}:${padClockPart(chinaClock.getUTCMinutes())}`
+    + `:${padClockPart(chinaClock.getUTCSeconds())}+08:00`;
 }
 
 export function inferCompassDateFromVideo(options: {
@@ -64,8 +150,8 @@ export function inferCompassDateFromVideo(options: {
       }
     }
   }
-  const clock = options.createdAt?.trim();
-  if (clock && /^\d{4}-\d{2}-\d{2}/.test(clock)) return clock.slice(0, 10);
+  const clock = normalizeCompassStartedAt(options.createdAt);
+  if (clock) return clock.slice(0, 10);
   return null;
 }
 
@@ -146,6 +232,13 @@ export function compassStatusLabel(status: string): string {
     "waiting-for-sessions": "等待场次列表",
     "sessions-found": "已找到场次",
     "waiting-for-download-button": "等待下载按钮",
+    "opening-live-screen": "正在进入直播大屏",
+    "capture-started": "开始完整采集",
+    "capturing-metric": "正在采集指标曲线",
+    "capturing-section": "正在采集页面模块",
+    "capturing-products": "正在采集商品列表",
+    "capturing-product-detail": "正在采集讲解商品",
+    "capture-session-finished": "当前场次采集完成",
     "login-required": "等待扫码登录",
     "switching-shop": "正在切换店铺",
     "shop-unavailable": "无店铺权限",

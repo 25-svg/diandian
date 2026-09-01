@@ -1057,8 +1057,7 @@ pub async fn generate_chunked_local_video_subtitle(
         let Some(joined) = pending.join_next().await else {
             break;
         };
-        let (index, result) = joined
-            .map_err(|error| format!("本地ASR分段任务异常: {error}"))??;
+        let (index, result) = joined.map_err(|error| format!("本地ASR分段任务异常: {error}"))??;
         chunk_results[index] = Some(result);
         completed += 1;
         if let Some(reporter) = reporter {
@@ -1082,8 +1081,8 @@ pub async fn generate_chunked_local_video_subtitle(
         generator_type: label,
     };
     for (index, chunk_result) in chunk_results.into_iter().enumerate() {
-        let result = chunk_result
-            .ok_or_else(|| format!("第 {}/{} 段缺少识别结果", index + 1, total))?;
+        let result =
+            chunk_result.ok_or_else(|| format!("第 {}/{} 段缺少识别结果", index + 1, total))?;
         full.concat_with_offset_ms(&result, index as u64 * LOCAL_ASR_CHUNK_SEC * 1000);
     }
     Ok(full)
@@ -1139,9 +1138,7 @@ pub async fn generate_video_subtitle(
                     )
                     .await
                     .map_err(|whisper_error| {
-                        format!(
-                            "FunASR 分段失败: {error}; Whisper 分段也失败: {whisper_error}"
-                        )
+                        format!("FunASR 分段失败: {error}; Whisper 分段也失败: {whisper_error}")
                     });
                 }
                 #[cfg(not(feature = "local-whisper"))]
@@ -2563,9 +2560,11 @@ pub fn mp4_moov_at_end(source_path: &Path) -> Result<bool, String> {
     let mut head = vec![0u8; head_len];
     file.read_exact(&mut head)
         .map_err(|error| format!("读取 MP4 头部失败: {error}"))?;
-    let head_has_mdat = head.windows(4).any(|window| window == b"mdat");
-    let head_has_moov = head.windows(4).any(|window| window == b"moov");
-    if head_has_moov {
+    let head_mdat_offset = head.windows(4).position(|window| window == b"mdat");
+    let head_moov_offset = head.windows(4).position(|window| window == b"moov");
+    if head_moov_offset.is_some_and(|moov_offset| {
+        head_mdat_offset.is_none_or(|mdat_offset| moov_offset < mdat_offset)
+    }) {
         return Ok(false);
     }
 
@@ -2577,7 +2576,10 @@ pub fn mp4_moov_at_end(source_path: &Path) -> Result<bool, String> {
         .map_err(|error| format!("读取 MP4 尾部失败: {error}"))?;
     let tail_has_moov = tail.windows(4).any(|window| window == b"moov");
 
-    Ok(head_has_mdat && tail_has_moov)
+    Ok(head_mdat_offset.is_some()
+        && (head_moov_offset.is_some_and(|moov_offset| {
+            head_mdat_offset.is_some_and(|mdat_offset| moov_offset > mdat_offset)
+        }) || tail_has_moov))
 }
 
 /// Move the `moov` atom to the front for streaming/web playback without re-encoding.

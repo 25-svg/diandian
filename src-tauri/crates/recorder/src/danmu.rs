@@ -71,8 +71,7 @@ impl DanmuStorage {
             user_name: normalize_optional_field(user_name),
         };
         self.cache.write().await.push(entry.clone());
-        let line = serde_json::to_string(&entry)
-            .unwrap_or_else(|_| format!("{ts}:{content}"));
+        let line = serde_json::to_string(&entry).unwrap_or_else(|_| format!("{ts}:{content}"));
         let _ = self
             .file
             .write()
@@ -114,15 +113,17 @@ pub fn parse_danmu_line(line: &str) -> Option<DanmuEntry> {
         return None;
     }
     if line.starts_with('{') {
-        return serde_json::from_str::<DanmuEntry>(line).ok().and_then(|mut entry| {
-            entry.content = entry.content.trim().to_string();
-            if entry.content.is_empty() {
-                return None;
-            }
-            entry.user_id = normalize_optional_field(entry.user_id.as_deref());
-            entry.user_name = normalize_optional_field(entry.user_name.as_deref());
-            Some(entry)
-        });
+        return serde_json::from_str::<DanmuEntry>(line)
+            .ok()
+            .and_then(|mut entry| {
+                entry.content = entry.content.trim().to_string();
+                if entry.content.is_empty() {
+                    return None;
+                }
+                entry.user_id = normalize_optional_field(entry.user_id.as_deref());
+                entry.user_name = normalize_optional_field(entry.user_name.as_deref());
+                Some(entry)
+            });
     }
     let (ts_str, content) = line.split_once(':')?;
     let ts = ts_str.trim().parse::<i64>().ok()?;

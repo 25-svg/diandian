@@ -38,6 +38,7 @@ try {
         "$rootName/app/vcruntime140.dll",
         "$rootName/app/vcruntime140_1.dll",
         "$rootName/app/funasr-runtime/funasr-service.exe",
+        "$rootName/app/doudian-runtime/doudian-fetch-payment-events.exe",
         "$rootName/runtime/MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
         "$rootName/seed/Conf.template.toml",
         "$rootName/seed/data_v2.db",
@@ -122,6 +123,7 @@ try {
         (Join-Path $testInstallRoot "storage\应用\vcruntime140.dll"),
         (Join-Path $testInstallRoot "storage\应用\vcruntime140_1.dll"),
         (Join-Path $testInstallRoot "storage\应用\funasr-runtime\funasr-service.exe"),
+        (Join-Path $testInstallRoot "storage\应用\doudian-runtime\doudian-fetch-payment-events.exe"),
         (Join-Path $testInstallRoot "appdata\cn.vjoi.bili-shadowreplay\Conf.toml"),
         (Join-Path $testInstallRoot "appdata\cn.vjoi.bili-shadowreplay\models\whisper\ggml-small-q5_1.bin"),
         (Join-Path $testInstallRoot "appdata\cn.vjoi.bilishadowreplay\data_v2.db")

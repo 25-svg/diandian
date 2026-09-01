@@ -38,14 +38,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 #[cfg(windows)]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
 use std::time::UNIX_EPOCH;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 #[cfg(feature = "gui")]
 use tauri::{Emitter, Manager};
@@ -1206,7 +1206,7 @@ pub async fn clip_range(
         .unwrap_or_else(|_| Err("切片任务失败".to_string()))
 }
 
-async fn clip_range_inner(
+pub(crate) async fn clip_range_inner(
     state: &State,
     reporter: &ProgressReporter,
     params: ClipRangeParams,
@@ -1865,7 +1865,11 @@ pub async fn update_video_cover(
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_video_subtitle(state: state_type!(), id: i64) -> Result<String, String> {
     log::debug!("Get video subtitle: {id}");
-    let context = resolve_video_transcript_context(&state, id).await?;
+    load_video_subtitle(&state, id).await
+}
+
+pub(crate) async fn load_video_subtitle(state: &State, id: i64) -> Result<String, String> {
+    let context = resolve_video_transcript_context(state, id).await?;
     let video = state.db.get_video(context.video_id).await?;
     let duration_ms = if video.length > 0 {
         u64::try_from(video.length)
@@ -2123,6 +2127,7 @@ pub async fn prepare_video_playback(
                     .parent()
                     .ok_or_else(|| "HLS playlist path has no parent directory".to_string())?
                     .join("segment-%06d.ts");
+                state_clone.recorder_manager.wait_for_recording_idle().await;
                 let _media_permit = state_clone
                     .media_execution_gate
                     .clone()
@@ -2217,6 +2222,7 @@ pub async fn prepare_video_playback(
             reporter
                 .update("正在生成可播放版本，请保留原始视频不动…")
                 .await;
+            state_clone.recorder_manager.wait_for_recording_idle().await;
             let _media_permit = state_clone
                 .media_execution_gate
                 .clone()
@@ -2341,7 +2347,9 @@ fn range_subtitle_paths(
 ) -> (PathBuf, PathBuf, PathBuf) {
     (
         context.artifact_dir.join(format!("{artifact_stem}.srt")),
-        context.artifact_dir.join(format!("{artifact_stem}.partial.srt")),
+        context
+            .artifact_dir
+            .join(format!("{artifact_stem}.partial.srt")),
         context.artifact_dir.join(format!("{artifact_stem}.json")),
     )
 }
@@ -2365,8 +2373,18 @@ fn merge_srt_documents(left: &str, right: &str) -> Result<String, String> {
             .start_time
             .hours
             .cmp(&right_item.start_time.hours)
-            .then(left_item.start_time.minutes.cmp(&right_item.start_time.minutes))
-            .then(left_item.start_time.seconds.cmp(&right_item.start_time.seconds))
+            .then(
+                left_item
+                    .start_time
+                    .minutes
+                    .cmp(&right_item.start_time.minutes),
+            )
+            .then(
+                left_item
+                    .start_time
+                    .seconds
+                    .cmp(&right_item.start_time.seconds),
+            )
             .then(
                 left_item
                     .start_time
@@ -2728,6 +2746,7 @@ pub async fn generate_video_product_mention_scan(
             let segment_path = temp_dir.join(format!("product-scan-{chunk_index:04}.wav"));
             // Only FFmpeg extraction uses the shared media gate. Releasing it
             // before ASR keeps cutting and playback preparation responsive.
+            state.recorder_manager.wait_for_recording_idle().await;
             let media_permit = state
                 .media_execution_gate
                 .clone()
@@ -2930,6 +2949,7 @@ pub async fn generate_video_deal_window_subtitle(
             "成交窗口转写正在排队"
         })
         .await;
+    state.recorder_manager.wait_for_recording_idle().await;
     let _media_permit = state
         .media_execution_gate
         .clone()
@@ -2976,7 +2996,11 @@ pub async fn generate_video_deal_window_subtitle(
     let (final_subtitle_path, partial_subtitle_path, index_path) =
         range_subtitle_paths(&context, &stem);
     let chunk_count = work_chunks.len();
-    let label = if is_gap_fill { "非成交段" } else { "成交窗口" };
+    let label = if is_gap_fill {
+        "非成交段"
+    } else {
+        "成交窗口"
+    };
 
     let generation_result: Result<String, String> = async {
         tokio::fs::create_dir_all(&context.artifact_dir)
@@ -3017,14 +3041,12 @@ pub async fn generate_video_deal_window_subtitle(
         let mut extracted: Vec<Option<(f64, PathBuf)>> = vec![None; chunk_count];
         let mut extract_done = 0usize;
         while let Some(joined) = extract_set.join_next().await {
-            let (index, start_sec, segment_path) = joined
-                .map_err(|error| format!("成交音频提取任务异常: {error}"))??;
+            let (index, start_sec, segment_path) =
+                joined.map_err(|error| format!("成交音频提取任务异常: {error}"))??;
             extracted[index] = Some((start_sec, segment_path));
             extract_done += 1;
             reporter
-                .update(&format!(
-                    "并行提取成交音频 {extract_done}/{chunk_count}"
-                ))
+                .update(&format!("并行提取成交音频 {extract_done}/{chunk_count}"))
                 .await;
         }
 
@@ -3083,14 +3105,12 @@ pub async fn generate_video_deal_window_subtitle(
             vec![None; chunk_count];
         let mut asr_done = 0usize;
         while let Some(joined) = asr_set.join_next().await {
-            let (index, start_sec, result) = joined
-                .map_err(|error| format!("成交 ASR 任务异常: {error}"))??;
+            let (index, start_sec, result) =
+                joined.map_err(|error| format!("成交 ASR 任务异常: {error}"))??;
             asr_results[index] = Some((start_sec, result));
             asr_done += 1;
             reporter
-                .update(&format!(
-                    "并行转写成交音频 {asr_done}/{chunk_count}"
-                ))
+                .update(&format!("并行转写成交音频 {asr_done}/{chunk_count}"))
                 .await;
 
             let mut ordered: Vec<(f64, &crate::subtitle_generator::GenerateResult)> = asr_results
@@ -3133,10 +3153,8 @@ pub async fn generate_video_deal_window_subtitle(
             }
         }
 
-        let mut ordered_final: Vec<(f64, crate::subtitle_generator::GenerateResult)> = asr_results
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut ordered_final: Vec<(f64, crate::subtitle_generator::GenerateResult)> =
+            asr_results.into_iter().flatten().collect();
         ordered_final.sort_by(|left, right| {
             left.0
                 .partial_cmp(&right.0)
@@ -3273,6 +3291,7 @@ async fn generate_video_subtitle_inner(
     reporter
         .update("媒体任务正在排队，避免同时运行转码和逐字稿识别")
         .await;
+    state.recorder_manager.wait_for_recording_idle().await;
     let _media_permit = state
         .media_execution_gate
         .clone()
@@ -4411,6 +4430,7 @@ pub async fn queue_deal_auto_clips(
             event_id.clone(),
             TaskPriority::Normal,
             async move {
+                state_clone.recorder_manager.wait_for_recording_idle().await;
                 let _media_permit = state_clone
                     .media_execution_gate
                     .clone()
@@ -4617,6 +4637,7 @@ pub async fn clip_video(
     };
     state.db.add_task(&task).await?;
 
+    state.recorder_manager.wait_for_recording_idle().await;
     let _media_permit = state
         .media_execution_gate
         .clone()

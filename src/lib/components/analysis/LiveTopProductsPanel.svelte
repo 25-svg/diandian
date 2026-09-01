@@ -14,43 +14,51 @@
   $: catalog = buildLiveProductCatalog(events);
   $: visibleProducts = extractLiveTopProducts(transcriptEntries, events).slice(0, 5);
   $: hasTranscript = transcriptEntries.length > 0;
-  $: maxMentions = Math.max(1, ...visibleProducts.map((product) => product.mentionCount));
+  $: rankByOrders = visibleProducts.length > 0 && visibleProducts.every((product) => product.metric === "order");
+  $: maxScore = Math.max(
+    1,
+    ...visibleProducts.map((product) => (product.metric === "order" ? product.orderCount : product.mentionCount)),
+  );
 </script>
 
 <section class="top-products-panel" aria-label="整场高频商品 TOP5">
   <header>
     <div>
       <strong>整场高频商品 TOP5</strong>
-      <span>按逐字稿提及次数统计</span>
+      <span>{rankByOrders ? "按成交件数统计（文稿未匹配到型号）" : "按逐字稿提及次数统计"}</span>
     </div>
     {#if transcriptBackfilling}
       <small>文稿补转中</small>
-    {:else if hasTranscript && visibleProducts.length}
+    {:else if hasTranscript && visibleProducts.length && !rankByOrders}
       <small>统计完成</small>
+    {:else if visibleProducts.length && rankByOrders}
+      <small>按成交件数</small>
     {/if}
   </header>
 
   {#if !catalog.length}
     <p class="empty">本场没有可用于识别的订单商品</p>
   {:else if visibleProducts.length}
-    <ol class="chart" aria-label="提及次数条形图">
+    <ol class="chart" aria-label={rankByOrders ? "成交件数条形图" : "提及次数条形图"}>
       {#each visibleProducts as product, index (product.id)}
+        {@const score = product.metric === "order" ? product.orderCount : product.mentionCount}
+        {@const unit = product.metric === "order" ? "笔" : "次"}
         <li>
           <span class="rank">{index + 1}</span>
           <div class="row">
             <div class="meta">
               <span class="name" title={product.name}>{product.name}</span>
-              <strong>{product.mentionCount} 次</strong>
+              <strong>{score} {unit}</strong>
             </div>
             <div
               class="bar-track"
               role="img"
-              aria-label={`${product.name} 提及 ${product.mentionCount} 次`}
+              aria-label={`${product.name} ${score} ${unit}`}
             >
               <div
                 class="bar-fill"
                 class:top={index === 0}
-                style={`width: ${(product.mentionCount / maxMentions) * 100}%`}
+                style={`width: ${(score / maxScore) * 100}%`}
               ></div>
             </div>
           </div>
@@ -59,6 +67,8 @@
     </ol>
     {#if transcriptBackfilling}
       <p class="hint">成交窗外文稿补转中，TOP5 会随文稿更新</p>
+    {:else if rankByOrders && hasTranscript}
+      <p class="hint">文稿未匹配到订单型号别名，已按本场成交件数展示</p>
     {/if}
   {:else if !hasTranscript && transcriptBackfilling}
     <p class="empty">等待成交窗/补转文稿…</p>

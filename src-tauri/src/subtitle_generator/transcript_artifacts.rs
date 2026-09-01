@@ -470,8 +470,38 @@ impl TranscriptArtifactStore {
             proposals,
             fact_card.as_ref(),
         )?;
-        let (safe_corrected_srt, model_number_corrections) =
+        let protected_pending_timings = corrections
+            .iter()
+            .filter(|correction| {
+                correction.decision == ReviewDecision::Pending
+                    && !is_pending_placeholder(&correction.proposed)
+            })
+            .map(|correction| (correction.start_ms, correction.end_ms))
+            .collect::<HashSet<_>>();
+        let (mut safe_corrected_srt, mut model_number_corrections) =
             normalize_srt_model_numbers(&safe_corrected_srt)?;
+        if !protected_pending_timings.is_empty() {
+            let raw_cues = parse_srt_cues(&raw_srt);
+            for timing in &protected_pending_timings {
+                let Some(raw_text) = cue_text_at(&raw_cues, *timing) else {
+                    continue;
+                };
+                let current_cues = parse_srt_cues(&safe_corrected_srt);
+                let Some(current_text) = cue_text_at(&current_cues, *timing) else {
+                    continue;
+                };
+                safe_corrected_srt = replace_cue_text(
+                    &safe_corrected_srt,
+                    timing.0,
+                    timing.1,
+                    current_text,
+                    raw_text,
+                )?;
+            }
+            model_number_corrections.retain(|correction| {
+                !protected_pending_timings.contains(&(correction.start_ms, correction.end_ms))
+            });
+        }
         drop_duplicate_unresolved_reviews_covered_by_model_formatting(
             &mut corrections,
             &model_number_corrections,
@@ -1214,12 +1244,14 @@ fn prepare_asr_artifacts(
     let corrections = located
         .into_iter()
         .map(|correction| {
-            let displayed_proposal =
-                if correction.supported || is_pending_placeholder(&correction.proposal.corrected) {
-                    correction.proposal.corrected.clone()
-                } else {
-                    "[待确认]".to_string()
-                };
+            let displayed_proposal = if correction.supported
+                || correction.proposal.provider_critical
+                || is_pending_placeholder(&correction.proposal.corrected)
+            {
+                correction.proposal.corrected.clone()
+            } else {
+                "[待确认]".to_string()
+            };
             let decision = if correction.pending {
                 ReviewDecision::Pending
             } else {

@@ -297,6 +297,8 @@ mod tests {
                 live_id: "".to_string(),
                 recording: false,
                 enabled: false,
+                current_streamer: String::new(),
+                current_streamer_source: String::new(),
             }),
             timestamp: 0,
         };

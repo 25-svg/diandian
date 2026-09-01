@@ -54,6 +54,11 @@ pub async fn detect_archive_anchor(
     live_id: String,
     force: Option<bool>,
 ) -> Result<RecordRow, String> {
+    let platform_type = PlatformType::from_str(&platform)?;
+    state
+        .recorder_manager
+        .resolve_archive_dir(platform_type, &room_id, &live_id)
+        .await;
     detect_archive_anchor_inner(
         state.db.as_ref(),
         state.config.as_ref(),
@@ -152,8 +157,15 @@ async fn detect_archive_anchor_inner(
         return Ok(running);
     }
 
-    match run_archive_minimax_anchor_detection(config, platform, room_id, live_id, archive.length)
-        .await
+    match run_archive_minimax_anchor_detection(
+        config,
+        platform,
+        room_id,
+        live_id,
+        archive.length,
+        &archive.source_path,
+    )
+    .await
     {
         Ok((anchor_name, confidence, status, error)) => db
             .save_record_anchor_detection(&live_id, &anchor_name, &confidence, &status, &error)
@@ -273,6 +285,7 @@ async fn run_archive_minimax_anchor_detection(
     room_id: &str,
     live_id: &str,
     _duration_seconds: f64,
+    source_path: &str,
 ) -> Result<(String, String, String, String), String> {
     let api_key = {
         let config = config.read().await;
@@ -280,10 +293,14 @@ async fn run_archive_minimax_anchor_detection(
     };
     let platform_type = PlatformType::from_str(platform)
         .map_err(|_| format!("unsupported archive platform: {platform}"))?;
-    let cache = config.read().await.cache.clone();
-    let playlist = CachePath::new(cache.into(), platform_type, room_id, live_id)
-        .with_filename("playlist.m3u8")
-        .full_path();
+    let playlist = if source_path.trim().is_empty() {
+        let cache = config.read().await.cache.clone();
+        CachePath::new(cache.into(), platform_type, room_id, live_id)
+            .with_filename("playlist.m3u8")
+            .full_path()
+    } else {
+        std::path::PathBuf::from(source_path.trim()).join("playlist.m3u8")
+    };
     if !playlist.exists() {
         return Err("recording media is missing".to_string());
     }

@@ -121,6 +121,71 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// One durable post-record review workflow per archive. Completed work is
+    /// also considered a duplicate: recorder lifecycle events can be replayed
+    /// during reconnects and must never create a second set of learning clips.
+    pub async fn add_auto_review_pipeline_task_if_absent(
+        &self,
+        task: &TaskRow,
+        platform: &str,
+        room_id: &str,
+        live_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO tasks (id, type, status, message, metadata, created_at)
+            SELECT $1, $2, $3, $4, $5, $6
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM tasks
+                WHERE type = 'auto_review_pipeline'
+                  AND status NOT IN ('failed', 'interrupted')
+                  AND json_extract(metadata, '$.platform') = $7
+                  AND json_extract(metadata, '$.room_id') = $8
+                  AND json_extract(metadata, '$.live_id') = $9
+            )
+            "#,
+        )
+        .bind(&task.id)
+        .bind(&task.task_type)
+        .bind(&task.status)
+        .bind(&task.message)
+        .bind(&task.metadata)
+        .bind(&task.created_at)
+        .bind(platform)
+        .bind(room_id)
+        .bind(live_id)
+        .execute(&lock)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn get_latest_auto_review_pipeline_task(
+        &self,
+        platform: &str,
+        room_id: &str,
+        live_id: &str,
+    ) -> Result<Option<TaskRow>, DatabaseError> {
+        let lock = self.db.read().await.clone().unwrap();
+        Ok(sqlx::query_as::<_, TaskRow>(
+            r#"
+            SELECT * FROM tasks
+            WHERE type = 'auto_review_pipeline'
+              AND json_extract(metadata, '$.platform') = $1
+              AND json_extract(metadata, '$.room_id') = $2
+              AND json_extract(metadata, '$.live_id') = $3
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(platform)
+        .bind(room_id)
+        .bind(live_id)
+        .fetch_optional(&lock)
+        .await?)
+    }
+
     /// Creates a playback conversion task only when this video does not already
     /// have a queued or running conversion. H.264 conversion is expensive, so
     /// concurrent clicks must never create duplicate full-length files.
@@ -287,14 +352,23 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    pub async fn finish_pending_tasks(&self) -> Result<(), DatabaseError> {
+    pub async fn finish_pending_tasks(&self) -> Result<Vec<TaskRow>, DatabaseError> {
         let lock = self.db.read().await.clone().unwrap();
+        let mut interrupted = sqlx::query_as::<_, TaskRow>(
+            "SELECT * FROM tasks WHERE status = 'pending' or status = 'processing'",
+        )
+        .fetch_all(&lock)
+        .await?;
         let _ = sqlx::query(
-            "UPDATE tasks SET status = 'interrupted', message = 'Application restarted before this task completed; retry it when ready' WHERE status = 'pending' or status = 'processing'",
+            "UPDATE tasks SET status = 'interrupted', message = '程序重启时任务未完成，系统将尝试恢复' WHERE status = 'pending' or status = 'processing'",
         )
         .execute(&lock)
         .await?;
-        Ok(())
+        for task in &mut interrupted {
+            task.status = "interrupted".to_string();
+            task.message = "程序重启时任务未完成，系统将尝试恢复".to_string();
+        }
+        Ok(interrupted)
     }
 
     /// Marks queued/running playback conversions for one video as interrupted so a
@@ -368,6 +442,36 @@ mod tests {
         let tasks = db.get_tasks().await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "first");
+    }
+
+    #[tokio::test]
+    async fn auto_review_pipeline_is_idempotent_after_success_but_retryable_after_failure() {
+        let db = test_db().await;
+        let task = |id: &str| TaskRow {
+            id: id.into(),
+            task_type: "auto_review_pipeline".into(),
+            status: "pending".into(),
+            message: String::new(),
+            metadata: r#"{"platform":"douyin","room_id":"room","live_id":"live"}"#.into(),
+            created_at: "2026-08-27T00:00:00Z".into(),
+        };
+
+        assert!(db
+            .add_auto_review_pipeline_task_if_absent(&task("first"), "douyin", "room", "live")
+            .await
+            .unwrap());
+        assert!(!db
+            .add_auto_review_pipeline_task_if_absent(&task("duplicate"), "douyin", "room", "live")
+            .await
+            .unwrap());
+
+        db.update_task("first", "failed", "network", None)
+            .await
+            .unwrap();
+        assert!(db
+            .add_auto_review_pipeline_task_if_absent(&task("retry"), "douyin", "room", "live")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

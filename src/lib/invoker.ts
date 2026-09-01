@@ -11,6 +11,7 @@ import { buildSensitiveCommandArgs } from "./sensitiveCommand";
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: any;
+    __BSR_DISABLE_SOCKET_IO_FOR_TESTS__?: boolean;
   }
 }
 
@@ -261,7 +262,7 @@ function createSocket() {
   });
 }
 
-if (!TAURI_ENV) {
+if (!TAURI_ENV && !(import.meta.env.DEV && window.__BSR_DISABLE_SOCKET_IO_FOR_TESTS__)) {
   createSocket();
 }
 

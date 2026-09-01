@@ -31,6 +31,7 @@
   export let global_offset = 0;
   export let focus_start = 0;
   export let focus_end = 0;
+  export let embedded = false;
   export let markers: Marker[] = [];
   export let danmu_records: DanmuEntry[] = [];
   export function seek(offset: number) {
@@ -327,13 +328,16 @@ ${mediaPlaylistUrl}`;
           resolve(response);
         })
         .catch((error) => {
-          log.error("tauriNetworkPlugin error for URI:", uri, error);
+          const networkMessage = error instanceof Error
+            ? error.message
+            : String(error || "Network request failed");
+          log.error("tauriNetworkPlugin error for URI:", uri, networkMessage);
           reject(
             new shaka.util.Error(
               shaka.util.Error.Severity.CRITICAL,
               shaka.util.Error.Category.NETWORK,
               shaka.util.Error.Code.OPERATION_ABORTED,
-              error.message || error || "Network request failed"
+              networkMessage
             )
           );
         });
@@ -377,6 +381,8 @@ ${mediaPlaylistUrl}`;
   }
 
   async function init() {
+    const playbackLoadStartedAt = Date.now();
+    log.info("Embedded archive player loading", room_id, live_id);
     update_stream_list();
 
     setInterval(async () => {
@@ -444,9 +450,22 @@ ${mediaPlaylistUrl}`;
 
       // This runs if the asynchronous load is successful.
       console.log("The video has now been loaded!");
-    } catch (error) {
-      log.error("Error code", error.code, "object", error);
-      if (error.code == 3000) {
+      log.info(
+        "Embedded archive player ready",
+        room_id,
+        live_id,
+        `${Date.now() - playbackLoadStartedAt}ms`,
+      );
+      dispatch("playbackReady");
+    } catch (error: any) {
+      const errorCode = Number(error?.code) || 0;
+      const errorMessage = error?.message || "录播流暂时不可用";
+      log.error("Error code", errorCode, "object", error);
+      dispatch("playbackError", { code: errorCode, message: errorMessage });
+      if (embedded) {
+        // The parent analysis page owns the retry state for embedded playback.
+        // Avoid browser alerts or reload loops inside the iframe.
+      } else if (errorCode == 3000) {
         // reload
         setTimeout(() => {
           location.reload();
@@ -455,12 +474,12 @@ ${mediaPlaylistUrl}`;
         alert(
           "加载失败，请尝试刷新页面\n" +
             "Error code: " +
-            error.code +
+            errorCode +
             "\n" +
             "Error message: " +
-            error.message
+            errorMessage
         );
-        log.error("Error code", error.code, "object", error);
+        log.error("Error code", errorCode, "object", error);
       }
     }
 

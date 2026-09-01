@@ -72,6 +72,7 @@ export function videoToImportedArchive(video: VideoItem): RecordItem {
     anchor_detected_at: video.anchor_detected_at,
     archive_kind: importedArchiveKindFromVideo(video.note),
     classification_source: "manual",
+    source_path: "",
     imported_video_id: video.id,
   };
 }

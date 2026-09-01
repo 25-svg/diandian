@@ -85,12 +85,21 @@ pub async fn get_storage_migration_status(
     Ok(state.storage_migration.snapshot())
 }
 
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_storage_runtime_status(
+    state: state_type!(),
+) -> Result<crate::storage_readiness::StorageRuntimeSnapshot, ()> {
+    let config = state.config.read().await;
+    Ok(crate::storage_readiness::storage_runtime_snapshot(&config))
+}
+
 #[cfg(feature = "gui")]
 use tauri::State as TauriState;
 
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_config(state: state_type!()) -> Result<Config, ()> {
     let mut config = state.config.read().await.clone();
+    config.cache = config.preferred_cache_path().to_string();
     // Configuration screens only need to know whether a key is configured.
     // Never send provider secrets into WebView JavaScript or browser storage.
     config.openai_api_key.clear();
@@ -115,14 +124,25 @@ pub async fn get_static_port(_state: state_type!()) -> Result<u16, ()> {
 #[cfg_attr(feature = "gui", tauri::command)]
 #[allow(dead_code)]
 pub async fn set_cache_path(state: state_type!(), cache_path: String) -> Result<(), String> {
-    let old_cache_path = state.config.read().await.cache.clone();
+    let (old_cache_path, old_preferred_cache_path) = {
+        let config = state.config.read().await;
+        (
+            config.cache.clone(),
+            config.preferred_cache_path().to_string(),
+        )
+    };
     log::info!("Try to set cache path: {old_cache_path} -> {cache_path}");
-    if old_cache_path == cache_path {
+    if old_cache_path == cache_path && old_preferred_cache_path == cache_path {
         return Ok(());
     }
 
     validate_storage_path(&cache_path, "缓存目录")?;
     ensure_storage_dir(&cache_path)?;
+
+    if old_cache_path == cache_path {
+        state.config.write().await.set_cache_path(&cache_path);
+        return Ok(());
+    }
 
     let old_cache_path_obj = std::path::Path::new(&old_cache_path);
     let new_cache_path_obj = std::path::Path::new(&cache_path);

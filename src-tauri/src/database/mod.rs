@@ -4,6 +4,8 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 pub mod account;
+pub mod anchor_knowledge;
+pub mod compass_analysis;
 pub mod knowledge;
 pub mod live_dashboard;
 pub mod live_dashboard_binding;
@@ -12,8 +14,10 @@ pub mod master_script;
 pub mod message;
 pub mod record;
 pub mod recorder;
+pub mod recorder_health;
 pub mod review_sample;
 pub mod task;
+pub mod training;
 pub mod transcript_dictionary_candidate;
 pub mod video;
 pub mod video_archive;
@@ -42,6 +46,10 @@ pub enum DatabaseError {
     InvalidTranscriptDictionaryCandidateMetadata(String),
     #[error("invalid master script state: {0}")]
     InvalidMasterScriptState(String),
+    #[error("invalid training state: {0}")]
+    InvalidTrainingState(String),
+    #[error("invalid anchor knowledge state: {0}")]
+    InvalidAnchorKnowledgeState(String),
 }
 
 impl From<DatabaseError> for String {

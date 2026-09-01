@@ -5,6 +5,7 @@ use super::transcript_review::{
     load_legacy_archive_transcript_audit, resolve_legacy_archive_review_item,
     LegacyTranscriptAuditBundle,
 };
+use crate::anchor_detection::validate_manual_anchor_name;
 use crate::danmu2ass;
 use crate::database::record::RecordRow;
 use crate::database::recorder::RecorderRow;
@@ -38,6 +39,42 @@ use serde::Serialize;
 #[cfg_attr(feature = "gui", tauri::command)]
 pub async fn get_recorder_list(state: state_type!()) -> Result<RecorderList, ()> {
     Ok(state.recorder_manager.get_recorder_list().await)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_known_streamer_names(state: state_type!()) -> Result<Vec<String>, String> {
+    state
+        .db
+        .list_known_streamer_names()
+        .await
+        .map_err(String::from)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn set_room_streamer(
+    state: state_type!(),
+    platform: String,
+    room_id: String,
+    streamer_name: String,
+) -> Result<(), String> {
+    let platform = PlatformType::from_str(&platform)?;
+    let normalized_name = if streamer_name.trim().is_empty() {
+        None
+    } else {
+        Some(validate_manual_anchor_name(&streamer_name)?)
+    };
+    state
+        .recorder_manager
+        .set_room_streamer_assignment(platform, &room_id, normalized_name.as_deref())
+        .await
+        .map_err(String::from)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_recorder_health(
+    state: state_type!(),
+) -> Result<Vec<crate::database::recorder_health::RecorderHealthRow>, String> {
+    state.db.list_recorder_health().await.map_err(String::from)
 }
 
 #[cfg_attr(feature = "gui", tauri::command)]

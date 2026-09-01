@@ -2271,7 +2271,7 @@
               <button class="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50" disabled={generatingMasterBatchDraft || progress.synthesisGenerating} on:click={generateSelectedMasterBatchDraft}>
                 {generatingMasterBatchDraft || progress.synthesisGenerating ? "正在提炼..." : selectedMasterSampleBatch.batch.status === "draft_ready" ? "按新规则重新生成" : "生成最终母稿草稿"}
               </button>
-            {:else if selectedMasterSampleBatch.batch.status !== "draft_ready" && selectedMasterSampleBatch.batch.status !== "published"}
+            {:else if selectedMasterSampleBatch.batch.status !== "published"}
               <button class="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50" disabled={startingMasterBatch} on:click={startSelectedMasterBatchProcessing}>
                 {startingMasterBatch ? "正在启动..." : (selectedMasterSampleBatch.batch.status === "failed" || selectedMasterSampleBatch.batch.status === "processing") ? "继续未完成场次" : "开始逐场处理"}
               </button>

@@ -56,3 +56,11 @@ src-tauri/target-dev-vs2022/
 scripts/__pycache__/
 asr-benchmarks/__pycache__/
 cargo-check-native.txt
+
+# Local Cargo build cache used by Codex verification runs.
+.codex-target-compass/
+
+# Playwright output is reproducible; formal screenshots are copied into the Project-003 acceptance folder.
+test-results/
+test-results-streamer-debug/
+playwright-report/

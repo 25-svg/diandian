@@ -1,8 +1,10 @@
 import type { ScriptIssueAnnotation } from "./scriptQuality";
+import { isSessionRhythmReview, type SessionRhythmReview } from "./sessionRhythm.js";
 
 export type SavedScriptQuality = {
   summary: string;
   annotations: ScriptIssueAnnotation[];
+  rhythmReview: SessionRhythmReview | null;
 };
 
 export function scriptQualityStorageKey(sourceKey: string): string {
@@ -27,6 +29,7 @@ export function parseSavedScriptQuality(raw: string | null): SavedScriptQuality 
         && typeof item.reason === "string"
         && typeof item.suggestion === "string",
       ),
+      rhythmReview: isSessionRhythmReview(value.rhythmReview) ? value.rhythmReview : null,
     };
   } catch {
     return null;

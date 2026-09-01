@@ -8,12 +8,16 @@
   import { log, onOpenUrl, set_title } from "./lib/invoker";
   import Clip from "./page/Clip.svelte";
   import Task from "./page/Task.svelte";
+  import ScenarioTraining from "./page/ScenarioTraining.svelte";
+  import StreamerCoach from "./page/StreamerCoach.svelte";
+  import AnchorKnowledge from "./page/AnchorKnowledge.svelte";
   import Archive from "./page/Archive.svelte";
   import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
-  import LiveDataDashboard from "./page/LiveDataDashboard.svelte";
   import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
+  import StartupWizard from "./lib/components/StartupWizard.svelte";
   import type { RecordItem } from "./lib/db";
-  import { isClipVideo, type VideoItem } from "./lib/interface";
+  import { isClipVideo, type StartupReadiness, type VideoItem } from "./lib/interface";
+  import { findArchiveSourceVideo } from "./lib/archiveVideoBinding";
   import { buildExistingClipReviewRequest, type ClipReviewRequest } from "./lib/clipReview";
   import { getMasterBaseline, listMasterSampleBatches } from "./lib/masterScript";
   import { onMount } from "svelte";
@@ -25,8 +29,8 @@
   let analysisRefreshToken = 0;
   let analysisMode: "legacy" | "company_deal" = "legacy";
   let analysisFocusTab: "" | "clip_review" = "";
+  let analysisInitialSeekSeconds: number | null = null;
   let analysisNavigationLock = false;
-  let liveDashboardSessionId: number | null = null;
   let masterSourceVideo: VideoItem | null = null;
   let clipReviewRequest: ClipReviewRequest | null = null;
   let showMiniMaxSetup = false;
@@ -34,6 +38,23 @@
   let miniMaxSetupError = "";
   let miniMaxSetupSaving = false;
   let miniMaxSetupComplete = false;
+  let startupReadiness: StartupReadiness | null = null;
+  let showStartupWizard = false;
+  let startupReadinessLoading = false;
+
+  async function loadStartupReadiness(showWhenIncomplete = true): Promise<void> {
+    startupReadinessLoading = true;
+    try {
+      startupReadiness = await invoke<StartupReadiness>("get_startup_readiness");
+      if (showWhenIncomplete) {
+        showStartupWizard = !startupReadiness.wizardCompleted;
+      }
+    } catch (error: any) {
+      console.warn("Failed to inspect startup readiness", error);
+    } finally {
+      startupReadinessLoading = false;
+    }
+  }
 
   async function checkMiniMaxSetup(): Promise<void> {
     try {
@@ -68,24 +89,27 @@
     video: VideoItem | null;
     mode: "legacy" | "company_deal";
     focusTab: "" | "clip_review";
+    seekSeconds: number | null;
   } {
     if (!detail || typeof detail !== "object") {
-      return { video: null, mode: "legacy", focusTab: "" };
+      return { video: null, mode: "legacy", focusTab: "", seekSeconds: null };
     }
     const record = detail as Record<string, unknown>;
     const nested = record.video;
     const focusTab = record.focusTab === "clip_review" ? "clip_review" : "";
+    const seekSeconds = typeof record.seekSeconds === "number" ? record.seekSeconds : null;
     if (nested && typeof nested === "object" && nested !== null && "id" in nested) {
       return {
         video: nested as VideoItem,
         mode: record.analysisMode === "company_deal" ? "company_deal" : "legacy",
         focusTab,
+        seekSeconds,
       };
     }
     if ("id" in record) {
-      return { video: detail as VideoItem, mode: "legacy", focusTab };
+      return { video: detail as VideoItem, mode: "legacy", focusTab, seekSeconds };
     }
-    return { video: null, mode: "legacy", focusTab: "" };
+    return { video: null, mode: "legacy", focusTab: "", seekSeconds: null };
   }
 
   function openAnalysisPage(options: {
@@ -93,6 +117,7 @@
     video?: VideoItem | null;
     mode?: "legacy" | "company_deal";
     focusTab?: "" | "clip_review";
+    seekSeconds?: number | null;
   }): void {
     const archive = options.archive ?? null;
     const video = options.video ?? null;
@@ -105,6 +130,7 @@
     analysisVideo = video;
     analysisMode = options.mode ?? "legacy";
     analysisFocusTab = options.focusTab ?? "";
+    analysisInitialSeekSeconds = options.seekSeconds ?? null;
     analysisRefreshToken += 1;
     active = "录播分析";
     queueMicrotask(() => {
@@ -143,6 +169,7 @@
     void set_title("典典直播切片");
     void ensureActiveEnterpriseMaster();
     void checkMiniMaxSetup();
+    void loadStartupReadiness();
   });
   onMount(() => {
     const openMiniMaxSetup = () => {
@@ -152,6 +179,19 @@
     };
     window.addEventListener("bsr:open-minimax-setup", openMiniMaxSetup);
     return () => window.removeEventListener("bsr:open-minimax-setup", openMiniMaxSetup);
+  });
+  onMount(() => {
+    const navigateFromShell = (event: Event) => {
+      const page = String((event as CustomEvent<unknown>).detail || "");
+      if (!page) return;
+      if (page !== "录播分析") {
+        analysisArchive = null;
+        analysisVideo = null;
+      }
+      active = page;
+    };
+    window.addEventListener("bsr:navigate", navigateFromShell);
+    return () => window.removeEventListener("bsr:navigate", navigateFromShell);
   });
   onMount(async () => {
     await onOpenUrl((urls: string[]) => {
@@ -206,7 +246,7 @@
       });
     };
     const openVideoAnalysis = (event: Event) => {
-      const { video, mode, focusTab } = resolveVideoAnalysisDetail(
+      const { video, mode, focusTab, seekSeconds } = resolveVideoAnalysisDetail(
         (event as CustomEvent<unknown>).detail,
       );
       // Clips belong in the three-column review workspace. Opening them in
@@ -218,10 +258,16 @@
         active = "切片";
         return;
       }
-      openAnalysisPage({ archive: null, video, mode, focusTab });
+      openAnalysisPage({ archive: null, video, mode, focusTab, seekSeconds });
     };
-    const openCompanyDealReview = (event: Event) => {
-      const archive = (event as CustomEvent<RecordItem>).detail;
+    const openCompanyDealReview = async (event: Event) => {
+      const detail = (event as CustomEvent<RecordItem | { archive: RecordItem; seekSeconds?: number }>).detail;
+      const archive = detail && typeof detail === "object" && "archive" in detail
+        ? detail.archive
+        : detail as RecordItem;
+      const seekSeconds = detail && typeof detail === "object" && "archive" in detail && typeof detail.seekSeconds === "number"
+        ? detail.seekSeconds
+        : null;
       if (!archive) {
         alert("无法打开分析页：录播数据为空。");
         return;
@@ -230,18 +276,30 @@
         alert("只有公司录播才能打开成交订单时间轴分析。");
         return;
       }
+      try {
+        const videos = await invoke<VideoItem[]>("get_all_videos");
+        const sourceVideo = findArchiveSourceVideo(archive, videos);
+        if (sourceVideo) {
+          openAnalysisPage({
+            archive,
+            video: sourceVideo,
+            mode: "company_deal",
+            seekSeconds,
+          });
+          return;
+        }
+      } catch (error) {
+        console.warn("Unable to resolve archive source video", error);
+      }
       openAnalysisPage({
         archive,
         video: null,
         mode: "company_deal",
+        seekSeconds,
       });
     };
     const openMasterBuilder = (_event: Event) => {
       alert("已废弃「整场进母稿」。请从成交话术精炼后，经 Clip「母稿样本批次」发布到「主播知识库」的 视频/成交、话术、分析建议。");
-    };
-    const openLiveDashboard = (event: Event) => {
-      liveDashboardSessionId = (event as CustomEvent<{ sessionId: number }>).detail.sessionId;
-      active = "直播数据大屏";
     };
     const openClipReview = (event: Event) => {
       clipReviewRequest = (event as CustomEvent<ClipReviewRequest>).detail;
@@ -251,14 +309,12 @@
     window.addEventListener("bsr:open-company-deal-review", openCompanyDealReview);
     window.addEventListener("bsr:open-video-analysis", openVideoAnalysis);
     window.addEventListener("bsr:build-master", openMasterBuilder);
-    window.addEventListener("bsr:open-live-dashboard", openLiveDashboard);
     window.addEventListener("bsr:open-clip-review", openClipReview);
     return () => {
       window.removeEventListener("bsr:open-archive-analysis", openArchiveAnalysis);
       window.removeEventListener("bsr:open-company-deal-review", openCompanyDealReview);
       window.removeEventListener("bsr:open-video-analysis", openVideoAnalysis);
       window.removeEventListener("bsr:build-master", openMasterBuilder);
-      window.removeEventListener("bsr:open-live-dashboard", openLiveDashboard);
       window.removeEventListener("bsr:open-clip-review", openClipReview);
     };
   });
@@ -299,6 +355,7 @@
           refreshToken={analysisRefreshToken}
           analysisMode={analysisMode}
           focusTab={analysisFocusTab}
+          initialSeekSeconds={analysisInitialSeekSeconds}
           on:back={() => {
             active = analysisVideo ? "切片" : "录播";
           }}
@@ -313,8 +370,14 @@
       <div class="page" class:visible={active == "任务"}>
         <Task />
       </div>
-      <div class="page" class:visible={active == "直播数据大屏"}>
-        <LiveDataDashboard initialSessionId={liveDashboardSessionId} />
+      <div class="page" class:visible={active == "情景训练"}>
+        <ScenarioTraining />
+      </div>
+      <div class="page" class:visible={active == "主播教练"}>
+        <StreamerCoach on:navigate={(event) => active = event.detail.page} />
+      </div>
+      <div class="page" class:visible={active == "主播知识库"}>
+        <AnchorKnowledge />
       </div>
       <div class="page" class:visible={active == "账号"}>
         <Account />
@@ -341,7 +404,22 @@
   />
 {/if}
 
-{#if showMiniMaxSetup}
+{#if showStartupWizard && startupReadiness}
+  <StartupWizard
+    readiness={startupReadiness}
+    refreshing={startupReadinessLoading}
+    on:refresh={() => void loadStartupReadiness(false)}
+    on:navigate={(event) => {
+      active = event.detail.page;
+      showStartupWizard = false;
+    }}
+    on:close={() => showStartupWizard = false}
+    on:completed={() => {
+      showStartupWizard = false;
+      startupReadiness = startupReadiness ? { ...startupReadiness, wizardCompleted: true } : null;
+    }}
+  />
+{:else if showMiniMaxSetup}
   <div class="minimax-setup-backdrop" role="presentation">
     <section class="minimax-setup-card" role="dialog" aria-modal="true" aria-labelledby="minimax-setup-title">
       <div class="minimax-setup-icon">AI</div>
@@ -383,6 +461,7 @@
     display: flex;
     height: 100vh;
     flex: 0 0 224px;
+    min-width: 0;
   }
 
   .wrap {
@@ -417,6 +496,13 @@
     min-height: 0;
   }
 
+  @media (prefers-reduced-motion: reduce) {
+    .page {
+      transform: none;
+      transition: none;
+    }
+  }
+
   .page.visible :global(> *) {
     flex: 1 1 auto;
     min-height: 0;
@@ -424,7 +510,9 @@
   }
 
   .content {
-    width: calc(100% - 12px);
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
     height: calc(100vh - 20px);
     margin: 10px 10px 10px 0;
     overflow: hidden;
@@ -433,6 +521,24 @@
     background: var(--mac-bg-elevated);
     box-shadow: var(--mac-shadow-lg);
     backdrop-filter: blur(24px) saturate(150%);
+  }
+
+  @media (max-width: 700px) {
+    .wrap {
+      flex-direction: column;
+    }
+    .sidebar {
+      width: 100%;
+      height: auto;
+      flex: 0 0 auto;
+    }
+    .content {
+      align-self: stretch;
+      width: auto;
+      height: auto;
+      min-height: 0;
+      margin: 0 6px 6px;
+    }
   }
 
   :global(.dark) .wrap {

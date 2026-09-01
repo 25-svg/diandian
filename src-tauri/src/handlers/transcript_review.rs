@@ -12,7 +12,6 @@ use crate::subtitle_generator::transcript_artifacts::{
     TranscriptCorrection, TranscriptSource,
 };
 use recorder::platforms::PlatformType;
-use recorder::CachePath;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -662,12 +661,12 @@ async fn resolve_transcript_source(
             let platform = PlatformType::from_str(platform)?;
             validate_archive_identifier("roomId", room_id)?;
             validate_archive_identifier("liveId", live_id)?;
-            let cache = state.config.read().await.cache.clone();
+            let archive_dir = state
+                .recorder_manager
+                .resolve_archive_dir(platform, room_id, live_id)
+                .await;
 
-            Ok((
-                source.clone(),
-                CachePath::new(cache.into(), platform, room_id, live_id).full_path(),
-            ))
+            Ok((source.clone(), archive_dir))
         }
         TranscriptSource::Video { video_id } => {
             let output = state.config.read().await.output.clone();

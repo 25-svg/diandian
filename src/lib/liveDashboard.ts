@@ -115,15 +115,9 @@ export function formatArchiveDashboardIdentity(
 
   return {
     primary: anchorName || "未识别账号",
-    secondary: anchorName ? "未绑定直播数据大屏" : "可在录播分析页绑定罗盘数据",
+    secondary: anchorName ? "未绑定直播经营数据" : "可在录播分析页绑定罗盘数据",
     hasDashboard: false,
   };
-}
-
-export function openLiveDashboard(sessionId: number) {
-  window.dispatchEvent(
-    new CustomEvent("bsr:open-live-dashboard", { detail: { sessionId } })
-  );
 }
 
 export function dashboardMetricCards(metrics: LiveDashboardMetrics) {
