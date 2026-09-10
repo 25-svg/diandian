@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.json","include":["src/lib/coachPractice.ts","src/lib/coachPractice.test.ts","src/lib/components/CoachPractice.svelte","src/lib/components/BSidebar.svelte","src/page/CameraKnowledgeQuiz.svelte"],"references":[]}

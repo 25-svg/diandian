@@ -142,3 +142,66 @@ test("减少动态效果下保持最终状态和可操作性", async ({ page }) 
   await expect(page.getByText("异议回应有证据，但成交推进偏弱")).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+test("相机知识问答作为独立侧边栏入口", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => {
+    const detail = error.stack || error.message;
+    if (/CameraKnowledgeQuiz|CoachPractice|相机知识问答/i.test(detail)) errors.push(detail);
+  });
+  page.on("console", (message) => {
+    if (message.type() === "error" && /CameraKnowledgeQuiz|CoachPractice|相机知识问答/i.test(message.text())) {
+      errors.push(message.text());
+    }
+  });
+  await page.setViewportSize({ width: 320, height: 800 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+
+  const navigation = page.getByRole("button", { name: "相机知识问答", exact: true });
+  await navigation.focus();
+  await page.keyboard.press("Enter");
+  await expect(navigation).toHaveClass(/active/);
+  await expect(page.getByRole("heading", { name: "相机知识问答", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "认识相机" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "快速答题" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "评论实战" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "错题复习" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "从佳能 EOS R50 开始" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "常卖机型课程" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "学习建议" })).toBeVisible();
+  const primaryCameraImage = page.getByRole("img", { name: "佳能 EOS R50 参数卡原图" });
+  await expect(primaryCameraImage).toBeVisible();
+  await expect.poll(() => primaryCameraImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+  await primaryCameraImage.evaluate((image: HTMLImageElement) => image.decode());
+  await expect(page.getByText("当前练习主播")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "罗雨欣", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "相机知识练习" })).toBeVisible();
+
+  await page.getByRole("button", { name: "零基础认机", exact: true }).click();
+  await expect(page.getByText("看图认识 · 1/12")).toBeVisible();
+  const dimensions = await page.evaluate(() => ({
+    body: document.body.scrollWidth,
+    viewport: document.documentElement.clientWidth,
+  }));
+  expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport);
+  await page.screenshot({ path: "test-results/camera-knowledge-quiz-sidebar-320.png", fullPage: true });
+  expect(errors).toEqual([]);
+});
+
+for (const width of [768, 1440]) {
+  test(`相机知识问答在 ${width}px 保持完整结构`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "相机知识问答", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "相机知识问答", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "认识相机" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "快速答题" })).toBeVisible();
+    const primaryCameraImage = page.getByRole("img", { name: "佳能 EOS R50 参数卡原图" });
+    await expect.poll(() => primaryCameraImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+    await primaryCameraImage.evaluate((image: HTMLImageElement) => image.decode());
+    expect(await page.evaluate(() => document.body.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    await page.screenshot({ path: `test-results/camera-knowledge-quiz-sidebar-${width}.png`, fullPage: true });
+  });
+}

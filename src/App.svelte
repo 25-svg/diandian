@@ -10,6 +10,7 @@
   import Task from "./page/Task.svelte";
   import ScenarioTraining from "./page/ScenarioTraining.svelte";
   import StreamerCoach from "./page/StreamerCoach.svelte";
+  import CameraKnowledgeQuiz from "./page/CameraKnowledgeQuiz.svelte";
   import AnchorKnowledge from "./page/AnchorKnowledge.svelte";
   import Archive from "./page/Archive.svelte";
   import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
@@ -375,6 +376,9 @@
       </div>
       <div class="page" class:visible={active == "主播教练"}>
         <StreamerCoach on:navigate={(event) => active = event.detail.page} />
+      </div>
+      <div class="page" class:visible={active == "相机知识问答"}>
+        <CameraKnowledgeQuiz />
       </div>
       <div class="page" class:visible={active == "主播知识库"}>
         <AnchorKnowledge />

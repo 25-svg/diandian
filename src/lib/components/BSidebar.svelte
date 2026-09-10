@@ -13,6 +13,7 @@
     Scissors,
     Sparkles,
     Bot,
+    Camera,
   } from "lucide-svelte";
   import { hasNewVersion } from "../stores/version";
   import SidebarItem from "./SidebarItem.svelte";
@@ -78,6 +79,11 @@
     <SidebarItem label="主播教练" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
         <Bot class="w-5 h-5" />
+      </div>
+    </SidebarItem>
+    <SidebarItem label="相机知识问答" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon">
+        <Camera class="w-5 h-5" />
       </div>
     </SidebarItem>
     <SidebarItem label="主播知识库" {activeUrl} on:activeChange={navigate}>
