@@ -20,8 +20,9 @@ use tokio::{
 use super::{GenerateResult, SubtitleGeneratorType};
 
 const BASE_PORT: u16 = 18765;
-/// Default parallel FunASR processes. Each loads a full model (~GB RAM).
-const DEFAULT_WORKERS: usize = 2;
+/// Keep one FunASR model resident by default. Operators can opt into parallel
+/// workers with BSR_FUNASR_WORKERS when the machine has enough memory.
+const DEFAULT_WORKERS: usize = 1;
 const MAX_WORKERS: usize = 4;
 const DEFAULT_HOTWORDS: &str = "小白兔 佳能小白兔 七零二百 70-200 R62 RF24-240 24-240 99新 在仓现货 前盖 后盖 遮光罩 脚架环 UV镜 小黄车 56号链接 优惠完价 5839";
 
@@ -502,6 +503,8 @@ mod tests {
     #[test]
     fn worker_count_clamps_env() {
         let previous = std::env::var("BSR_FUNASR_WORKERS").ok();
+        std::env::remove_var("BSR_FUNASR_WORKERS");
+        assert_eq!(worker_count(), 1);
         std::env::set_var("BSR_FUNASR_WORKERS", "9");
         assert_eq!(worker_count(), MAX_WORKERS);
         std::env::set_var("BSR_FUNASR_WORKERS", "0");
