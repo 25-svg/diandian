@@ -117,6 +117,85 @@ CREATE INDEX idx_anchor_knowledge_search_scope
   ON anchor_knowledge_search_index(anchor_id, asset_type, published_at DESC);
 "#;
 
+pub const ANCHOR_LEARNING_CASE_MIGRATION_SQL: &str = r#"
+CREATE TABLE anchor_learning_cases (
+  case_id TEXT PRIMARY KEY CHECK(trim(case_id) <> ''),
+  asset_id TEXT NOT NULL UNIQUE REFERENCES anchor_knowledge_assets(asset_id) ON DELETE CASCADE,
+  stage TEXT NOT NULL CHECK(stage IN ('opening','traffic','needs','explanation','objection','conversion','after_sales','retention')),
+  skill TEXT NOT NULL CHECK(trim(skill) <> ''),
+  product_category TEXT NOT NULL DEFAULT '',
+  difficulty TEXT NOT NULL CHECK(difficulty IN ('beginner','intermediate','advanced')),
+  evidence_level TEXT NOT NULL CHECK(evidence_level IN ('A','B','C','D')),
+  evidence_summary TEXT NOT NULL DEFAULT '',
+  operator_commentary TEXT NOT NULL DEFAULT '',
+  ai_analysis TEXT NOT NULL DEFAULT '',
+  scene_context TEXT NOT NULL CHECK(trim(scene_context) <> ''),
+  audience_trigger TEXT NOT NULL DEFAULT '',
+  training_goal TEXT NOT NULL CHECK(trim(training_goal) <> ''),
+  applicable_scope TEXT NOT NULL CHECK(trim(applicable_scope) <> ''),
+  expiry_conditions TEXT NOT NULL CHECK(trim(expiry_conditions) <> ''),
+  review_due_at TEXT NOT NULL CHECK(trim(review_due_at) <> ''),
+  expression_reason TEXT NOT NULL DEFAULT '',
+  logic_reason TEXT NOT NULL DEFAULT '',
+  trust_reason TEXT NOT NULL DEFAULT '',
+  action_reason TEXT NOT NULL DEFAULT '',
+  reusable_outline TEXT NOT NULL DEFAULT '',
+  forbidden_copy TEXT NOT NULL DEFAULT '',
+  trainee_reference TEXT NOT NULL DEFAULT '',
+  fact_slots_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(fact_slots_json)),
+  internal_use_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(internal_use_confirmed IN (0,1)),
+  retired_at TEXT,
+  retired_by TEXT NOT NULL DEFAULT '',
+  retire_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE anchor_learning_case_lines (
+  line_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES anchor_learning_cases(case_id) ON DELETE CASCADE,
+  line_order INTEGER NOT NULL CHECK(line_order >= 0),
+  start_ms INTEGER NOT NULL CHECK(start_ms >= 0),
+  end_ms INTEGER NOT NULL CHECK(end_ms > start_ms),
+  original_text TEXT NOT NULL CHECK(trim(original_text) <> ''),
+  function_text TEXT NOT NULL DEFAULT '',
+  timing_reason TEXT NOT NULL DEFAULT '',
+  technique TEXT NOT NULL DEFAULT '',
+  trust_mechanism TEXT NOT NULL DEFAULT '',
+  action_cue TEXT NOT NULL DEFAULT '',
+  risk_note TEXT NOT NULL DEFAULT '',
+  reusable_pattern TEXT NOT NULL DEFAULT '',
+  UNIQUE(case_id, line_order)
+);
+
+CREATE TABLE anchor_learning_case_tags (
+  case_id TEXT NOT NULL REFERENCES anchor_learning_cases(case_id) ON DELETE CASCADE,
+  tag_kind TEXT NOT NULL CHECK(tag_kind IN ('stage','skill','product','audience','risk')),
+  tag_value TEXT NOT NULL CHECK(trim(tag_value) <> ''),
+  PRIMARY KEY(case_id, tag_kind, tag_value)
+);
+
+CREATE TABLE anchor_learning_case_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES anchor_learning_cases(case_id) ON DELETE RESTRICT,
+  trainee_anchor_id TEXT NOT NULL REFERENCES anchor_knowledge_profiles(anchor_id) ON DELETE RESTRICT,
+  practice_mode TEXT NOT NULL CHECK(practice_mode IN ('shadow','recall','scenario','risk_spotting')),
+  answer_text TEXT NOT NULL DEFAULT '',
+  evaluation_status TEXT NOT NULL CHECK(evaluation_status IN ('scored','needs_review')),
+  scores_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(scores_json)),
+  feedback_text TEXT NOT NULL DEFAULT '',
+  case_snapshot_json TEXT NOT NULL CHECK(json_valid(case_snapshot_json)),
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_learning_cases_public
+  ON anchor_learning_cases(evidence_level, retired_at, updated_at DESC);
+CREATE INDEX idx_learning_case_lines_order
+  ON anchor_learning_case_lines(case_id, line_order);
+CREATE INDEX idx_learning_case_attempts_trainee
+  ON anchor_learning_case_attempts(trainee_anchor_id, created_at DESC);
+"#;
+
 const ASSET_TYPES: [&str; 3] = ["speech", "deal_clip", "analysis_advice"];
 const SOURCE_KINDS: [&str; 5] = [
     "video",
@@ -198,6 +277,134 @@ pub struct CreateAnchorKnowledgeCandidateRequest {
     pub created_by_id: String,
     pub supersedes_asset_id: Option<String>,
     pub sources: Vec<AnchorKnowledgeSourceInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateAnchorLearningCaseRequest {
+    pub anchor_id: String,
+    pub title: String,
+    pub body: String,
+    pub product_id: String,
+    pub stage: String,
+    pub skill: String,
+    pub product_category: String,
+    pub difficulty: String,
+    pub evidence_level: String,
+    pub evidence_summary: String,
+    pub operator_commentary: String,
+    pub ai_analysis: String,
+    pub scene_context: String,
+    pub audience_trigger: String,
+    pub training_goal: String,
+    pub applicable_scope: String,
+    pub expiry_conditions: String,
+    pub review_due_at: String,
+    pub expression_reason: String,
+    pub logic_reason: String,
+    pub trust_reason: String,
+    pub action_reason: String,
+    pub reusable_outline: String,
+    pub forbidden_copy: String,
+    pub trainee_reference: String,
+    pub fact_slots: Vec<String>,
+    pub internal_use_confirmed: bool,
+    pub created_by_kind: String,
+    pub created_by_id: String,
+    pub supersedes_asset_id: Option<String>,
+    pub sources: Vec<AnchorKnowledgeSourceInput>,
+    pub lines: Vec<LearningCaseLineInput>,
+    pub tags: Vec<LearningCaseTagInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LearningCaseLineInput {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub original_text: String,
+    pub function_text: String,
+    pub timing_reason: String,
+    pub technique: String,
+    pub trust_mechanism: String,
+    pub action_cue: String,
+    pub risk_note: String,
+    pub reusable_pattern: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LearningCaseTagInput {
+    pub tag_kind: String,
+    pub tag_value: String,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningCaseRow {
+    pub case_id: String,
+    pub asset_id: String,
+    pub stage: String,
+    pub skill: String,
+    pub product_category: String,
+    pub difficulty: String,
+    pub evidence_level: String,
+    pub evidence_summary: String,
+    pub operator_commentary: String,
+    pub ai_analysis: String,
+    pub scene_context: String,
+    pub audience_trigger: String,
+    pub training_goal: String,
+    pub applicable_scope: String,
+    pub expiry_conditions: String,
+    pub review_due_at: String,
+    pub expression_reason: String,
+    pub logic_reason: String,
+    pub trust_reason: String,
+    pub action_reason: String,
+    pub reusable_outline: String,
+    pub forbidden_copy: String,
+    pub trainee_reference: String,
+    pub fact_slots_json: String,
+    pub internal_use_confirmed: bool,
+    pub retired_at: Option<String>,
+    pub retired_by: String,
+    pub retire_reason: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningCaseLineRow {
+    pub line_id: String,
+    pub case_id: String,
+    pub line_order: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub original_text: String,
+    pub function_text: String,
+    pub timing_reason: String,
+    pub technique: String,
+    pub trust_mechanism: String,
+    pub action_cue: String,
+    pub risk_note: String,
+    pub reusable_pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningCaseAttemptRow {
+    pub attempt_id: String,
+    pub case_id: String,
+    pub trainee_anchor_id: String,
+    pub practice_mode: String,
+    pub answer_text: String,
+    pub evaluation_status: String,
+    pub scores_json: String,
+    pub feedback_text: String,
+    pub case_snapshot_json: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1265,6 +1472,106 @@ mod tests {
         let database = Database::new();
         database.set(pool).await;
         database
+    }
+
+    #[tokio::test]
+    async fn learning_case_migration_enforces_publication_and_timeline_boundaries() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        pool.execute("PRAGMA foreign_keys = ON").await.unwrap();
+        pool.execute(ANCHOR_KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        pool.execute(ANCHOR_LEARNING_CASE_MIGRATION_SQL)
+            .await
+            .unwrap();
+
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('anchor_learning_cases','anchor_learning_case_lines','anchor_learning_case_tags','anchor_learning_case_attempts')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 4);
+
+        pool.execute(
+            "INSERT INTO anchor_knowledge_profiles (anchor_id, display_name, normalized_name, vault_relative_root, created_at, updated_at) VALUES ('anchor-a','主播A','主播a','主播知识库/anchor-a',datetime('now'),datetime('now'))",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "INSERT INTO anchor_knowledge_assets (asset_id, anchor_id, asset_type, title, body, created_by_kind, created_by_id, content_hash, is_current, created_at, updated_at) VALUES ('a1','anchor-a','speech','价格异议处理','先确认需求再提供证据','human','operator','asset-hash',1,datetime('now'),datetime('now'))",
+        )
+        .await
+        .unwrap();
+
+        let missing_asset = sqlx::query(
+            "INSERT INTO anchor_learning_cases (case_id, asset_id, stage, skill, product_category, difficulty, evidence_level, evidence_summary, operator_commentary, ai_analysis, scene_context, audience_trigger, training_goal, applicable_scope, expiry_conditions, review_due_at, expression_reason, logic_reason, trust_reason, action_reason, reusable_outline, forbidden_copy, trainee_reference, fact_slots_json, internal_use_confirmed, created_at, updated_at) VALUES ('missing-case','missing','needs','需求确认','相机','beginner','D','待审核','运营说明','AI分析','场景','评论','目标','二手相机','规则变化','2026-12-31','表达','逻辑','信任','行动','骨架','禁用','参考','[]',1,datetime('now'),datetime('now'))",
+        )
+        .execute(&pool)
+        .await;
+        assert!(missing_asset.is_err());
+
+        pool.execute(
+            "INSERT INTO anchor_learning_cases (case_id, asset_id, stage, skill, product_category, difficulty, evidence_level, evidence_summary, operator_commentary, ai_analysis, scene_context, audience_trigger, training_goal, applicable_scope, expiry_conditions, review_due_at, expression_reason, logic_reason, trust_reason, action_reason, reusable_outline, forbidden_copy, trainee_reference, fact_slots_json, internal_use_confirmed, created_at, updated_at) VALUES ('c1','a1','needs','需求确认','相机','beginner','D','待审核','运营说明','AI分析','场景','评论','目标','二手相机','规则变化','2026-12-31','表达','逻辑','信任','行动','骨架','禁用','参考','[\"用途\"]',1,datetime('now'),datetime('now'))",
+        )
+        .await
+        .unwrap();
+        let persisted: (String, String, String, String, String, i64) = sqlx::query_as(
+            "SELECT cases.operator_commentary, cases.ai_analysis, cases.applicable_scope, cases.expiry_conditions, cases.review_due_at, assets.is_current FROM anchor_learning_cases cases JOIN anchor_knowledge_assets assets ON assets.asset_id = cases.asset_id WHERE cases.case_id = 'c1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "运营说明".into(),
+                "AI分析".into(),
+                "二手相机".into(),
+                "规则变化".into(),
+                "2026-12-31".into(),
+                1,
+            )
+        );
+
+        let duplicate_extension = sqlx::query(
+            "INSERT INTO anchor_learning_cases (case_id, asset_id, stage, skill, difficulty, evidence_level, scene_context, training_goal, applicable_scope, expiry_conditions, review_due_at, fact_slots_json, created_at, updated_at) VALUES ('c2','a1','needs','需求确认','beginner','A','场景','目标','范围','条件','2026-12-31','[]',datetime('now'),datetime('now'))",
+        )
+        .execute(&pool)
+        .await;
+        assert!(duplicate_extension.is_err());
+
+        let invalid_line = sqlx::query(
+            "INSERT INTO anchor_learning_case_lines (line_id, case_id, line_order, start_ms, end_ms, original_text) VALUES ('l1','c1',0,1000,1000,'先问用途')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_line.is_err());
+        pool.execute(
+            "INSERT INTO anchor_learning_case_lines (line_id, case_id, line_order, start_ms, end_ms, original_text) VALUES ('l1','c1',0,1000,2500,'先问用途')",
+        )
+        .await
+        .unwrap();
+
+        let invalid_snapshot = sqlx::query(
+            "INSERT INTO anchor_learning_case_attempts (attempt_id, case_id, trainee_anchor_id, practice_mode, evaluation_status, case_snapshot_json, created_at) VALUES ('try-1','c1','anchor-a','shadow','scored','not-json',datetime('now'))",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_snapshot.is_err());
+        pool.execute(
+            "INSERT INTO anchor_learning_case_attempts (attempt_id, case_id, trainee_anchor_id, practice_mode, evaluation_status, case_snapshot_json, created_at) VALUES ('try-1','c1','anchor-a','shadow','scored','{\"caseId\":\"c1\"}',datetime('now'))",
+        )
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query("DELETE FROM anchor_learning_cases WHERE case_id = 'c1'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
     }
 
     fn source(marker: &str) -> AnchorKnowledgeSourceInput {

@@ -631,6 +631,12 @@ fn get_migrations() -> Vec<Migration> {
             sql: database::training::HUMAN_MACHINE_ADAPTIVE_TURNS_MIGRATION_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 43,
+            description: "add_anchor_learning_cases",
+            sql: database::anchor_knowledge::ANCHOR_LEARNING_CASE_MIGRATION_SQL,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
