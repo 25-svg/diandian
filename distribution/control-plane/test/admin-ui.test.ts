@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page, expect as dom } from "@playwright/test";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -7,7 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 let browser: Browser, server: Server, origin: string;
 const pages: Page[] = [];
 beforeAll(async () => {
-  const script = await build({ entryPoints: [new URL("../admin/app.ts", import.meta.url).pathname.replace(/^\/(\w:)/, "$1")], bundle: true, write: false, format: "esm" });
+  const script = await build({ entryPoints: [fileURLToPath(new URL("../admin/app.ts", import.meta.url))], bundle: true, write: false, format: "esm" });
   const html = readFileSync(new URL("../admin/index.html", import.meta.url));
   const css = readFileSync(new URL("../admin/styles.css", import.meta.url));
   server = createServer((req, res) => {
@@ -127,7 +128,7 @@ describe("private admin UI in a real browser", () => {
     await dom(page.locator("main")).toBeFocused();
   });
 
-  it("generates download links from the entered release and discards late secrets after navigation", async () => {
+  it.each(["navigation", "pagehide", "restore"] as const)("generates download links from the entered release and discards late secrets after %s", async (cleanup) => {
     const { page, writes } = await open();
     await page.getByRole("link", { name: "激活码与下载链接", exact: true }).click();
     await page.getByLabel("已全量发布的版本编号").fill("r1");
@@ -145,13 +146,96 @@ describe("private admin UI in a real browser", () => {
     });
     const requested = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/activation-codes"));
     await page.getByRole("button", { name: "生成激活码", exact: true }).click(); await requested;
-    await page.getByRole("link", { name: "总览", exact: true }).click();
+    if (cleanup === "navigation") await page.getByRole("link", { name: "总览", exact: true }).click();
+    else await page.evaluate((type) => dispatchEvent(new PageTransitionEvent(type, { persisted: true })), cleanup === "restore" ? "pageshow" : "pagehide");
     const responded = page.waitForResponse((response) => response.request().method() === "POST" && response.url().endsWith("/activation-codes"));
     release(); await responded;
-    await dom(page.getByRole("heading", { name: "总览", exact: true })).toBeVisible();
+    await dom(page.getByRole("heading", { name: cleanup === "navigation" ? "总览" : "激活码与下载链接", exact: true })).toBeVisible();
+    if (cleanup !== "navigation") await dom(page.getByRole("button", { name: "生成激活码", exact: true })).toBeEnabled();
     await dom(page.getByText("LATE-SECRET", { exact: true })).toHaveCount(0);
-    await page.goBack();
+    if (cleanup === "navigation") await page.goBack();
     await dom(page.getByText("LATE-SECRET", { exact: true })).toHaveCount(0);
+  });
+
+  it.each(["hide", "generate", "navigate", "pagehide", "restore"] as const)("clears all concurrent one-time secrets on %s", async (cleanup) => {
+    const { page } = await open();
+    let releaseFirst!: () => void, releaseSecond!: () => void;
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const second = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let codeRequests = 0;
+    await page.route("**/api/admin/activation-codes", async (route) => {
+      if (route.request().method() === "GET") return route.fallback();
+      if (++codeRequests > 1) return route.fulfill({ status: 503, json: { error: {} } });
+      await first;
+      await route.fulfill({ json: { codes: [{ id: "first", code: "FIRST-SECRET", expiresAt: 1_900_000_000 }] } });
+    });
+    await page.route("**/api/admin/download-links", async (route) => {
+      if (route.request().method() === "GET") return route.fallback();
+      await second;
+      await route.fulfill({ json: { id: "second", url: "https://updates.example/SECOND-SECRET", expiresAt: 1_900_000_000 } });
+    });
+    await page.getByRole("link", { name: "激活码与下载链接", exact: true }).click();
+    await page.getByLabel("已全量发布的版本编号").fill("r1");
+    const codeRequested = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/activation-codes"));
+    await page.getByRole("button", { name: "生成激活码", exact: true }).click(); await codeRequested;
+    const linkRequested = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/download-links"));
+    await page.getByRole("button", { name: "生成下载链接", exact: true }).click(); await linkRequested;
+    await dom(page.locator(".secret")).toHaveCount(0);
+    releaseFirst();
+    await dom(page.getByText("FIRST-SECRET", { exact: true })).toBeVisible();
+    await dom(page.locator(".secret")).toHaveCount(1);
+    releaseSecond();
+    await dom(page.getByText("https://updates.example/SECOND-SECRET", { exact: true })).toBeVisible();
+    await dom(page.locator(".secret")).toHaveCount(2);
+    const results = await page.locator(".secret").elementHandles();
+    if (cleanup === "hide") await page.getByRole("button", { name: "隐藏结果", exact: true }).first().click();
+    else if (cleanup === "generate") await page.getByRole("button", { name: "生成激活码", exact: true }).click();
+    else if (cleanup === "navigate") await page.getByRole("link", { name: "总览", exact: true }).click();
+    else await page.evaluate((type) => dispatchEvent(new PageTransitionEvent(type, { persisted: true })), cleanup === "restore" ? "pageshow" : "pagehide");
+    await dom(page.locator(".secret")).toHaveCount(0, { timeout: 1000 });
+    expect(await page.locator("body").textContent()).not.toMatch(/FIRST-SECRET|SECOND-SECRET/);
+    // Clear detached nodes too, so retained DOM references cannot keep the secret text.
+    for (const result of results) { expect(await result.textContent()).toBe(""); await result.dispose(); }
+    if (cleanup === "navigate") {
+      await page.goBack();
+      await dom(page.getByRole("heading", { name: "激活码与下载链接", exact: true })).toBeVisible();
+      await dom(page.locator(".secret")).toHaveCount(0);
+      expect(await page.locator("body").textContent()).not.toMatch(/FIRST-SECRET|SECOND-SECRET/);
+    }
+  });
+
+  it("does not reveal a pending secret after the user hides existing results", async () => {
+    const { page } = await open();
+    let releaseFirst!: () => void, releaseSecond!: () => void;
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const second = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    await page.route("**/api/admin/activation-codes", async (route) => {
+      if (route.request().method() === "GET") return route.fallback();
+      await first;
+      await route.fulfill({ json: { codes: [{ id: "first", code: "FIRST-BEFORE-HIDE", expiresAt: 1_900_000_000 }] } });
+    });
+    await page.route("**/api/admin/download-links", async (route) => {
+      if (route.request().method() === "GET") return route.fallback();
+      await second;
+      await route.fulfill({ json: { id: "late", url: "https://updates.example/LATE-AFTER-HIDE", expiresAt: 1_900_000_000 } });
+    });
+    await page.getByRole("link", { name: "激活码与下载链接", exact: true }).click();
+    await page.getByLabel("已全量发布的版本编号").fill("r1");
+    const codeRequested = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/activation-codes"));
+    await page.getByRole("button", { name: "生成激活码", exact: true }).click();
+    await codeRequested;
+    const linkRequested = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/download-links"));
+    await page.getByRole("button", { name: "生成下载链接", exact: true }).click();
+    await linkRequested;
+    releaseFirst();
+    await dom(page.getByText("FIRST-BEFORE-HIDE", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "隐藏结果", exact: true }).click();
+    await dom(page.locator(".secret")).toHaveCount(0);
+    const responded = page.waitForResponse((response) => response.request().method() === "POST" && response.url().endsWith("/download-links"));
+    releaseSecond();
+    await responded;
+    await dom(page.getByText("https://updates.example/LATE-AFTER-HIDE", { exact: true })).toHaveCount(0);
+    await dom(page.locator(".secret")).toHaveCount(0);
   });
 
   it("uses the server cursor to load more devices without losing the first page", async () => {

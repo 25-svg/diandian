@@ -12,9 +12,10 @@ const statuses: Record<string, string> = { active: "已启用", revoked: "已禁
 const root = document.querySelector<HTMLDivElement>("#app")!;
 let identity: Identity;
 let epoch = 0;
+let sensitiveGeneration = 0;
 let main: HTMLElement;
 let notice: HTMLElement;
-let sensitive: HTMLElement | undefined;
+const sensitiveResults = new Set<HTMLElement>();
 let activeDialog: HTMLDialogElement | undefined;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", className = ""): HTMLElementTagNameMap[K] {
@@ -34,7 +35,11 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return response.json() as Promise<T>;
 }
-function clearSensitive() { sensitive?.replaceChildren(); sensitive?.remove(); sensitive = undefined; }
+function clearSensitive(invalidatePending = true) {
+  if (invalidatePending) ++sensitiveGeneration;
+  for (const result of sensitiveResults) { result.replaceChildren(); result.remove(); }
+  sensitiveResults.clear();
+}
 function clearView() { ++epoch; clearSensitive(); activeDialog?.close(); activeDialog?.remove(); activeDialog = undefined; }
 function date(value: unknown) {
   if (!value) return "—";
@@ -53,17 +58,17 @@ function select(form: HTMLElement, label: string, choices: [string, string][]) {
   wrapper.append(control); form.append(wrapper); return control;
 }
 async function write(path: string, body: Row, source: HTMLButtonElement, secret = false, method = "POST") {
-  const started = epoch; source.disabled = true; clearSensitive(); message("正在提交…");
+  const started = epoch; source.disabled = true; clearSensitive(false); const sensitiveStarted = sensitiveGeneration; message("正在提交…");
   try {
     const result = await api<Row>(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    if (started !== epoch) return;
+    if (started !== epoch || (secret && sensitiveStarted !== sensitiveGeneration)) return;
     if (secret) {
-      sensitive = el("section", "", "secret panel"); sensitive.setAttribute("aria-label", "一次性结果");
+      const sensitive = el("section", "", "secret panel"); sensitive.setAttribute("aria-label", "一次性结果");
       sensitive.append(el("h2", "一次性显示，请立即妥善保存"), el("p", "离开此页后不会再次显示。"));
       const codes = Array.isArray(result.codes) ? result.codes as Row[] : [];
       for (const code of codes) sensitive.append(el("code", String(code.code)));
       if (typeof result.url === "string") sensitive.append(el("code", result.url));
-      sensitive.append(button("隐藏结果", clearSensitive)); main.append(sensitive);
+      sensitive.append(button("隐藏结果", clearSensitive)); sensitiveResults.add(sensitive); main.append(sensitive);
     } else {
       await render();
       // A navigation while refreshing must not receive this operation's status.
@@ -190,6 +195,7 @@ async function render() {
   }
 }
 async function boot() {
+  clearView();
   root.replaceChildren(el("p", "正在加载…", "boot"));
   try {
     identity = await api<Identity>("/me");
