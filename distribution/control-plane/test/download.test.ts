@@ -8,7 +8,7 @@ import { sha256Hex } from "../src/crypto";
 const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
 const context = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
 
-function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void, beforeBatch?: () => void): D1Database {
+function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void, beforeBatch?: () => void | Promise<void>): D1Database {
   const statement = (sql: string, values: unknown[] = []) => ({
     sql,
     values,
@@ -24,7 +24,7 @@ function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void, 
   return {
     prepare: (sql: string) => statement(sql) as unknown as D1PreparedStatement,
     batch: async (statements: D1PreparedStatement[]) => {
-      beforeBatch?.();
+      await beforeBatch?.();
       database.exec("BEGIN IMMEDIATE");
       try {
         const results = (statements as unknown as Array<{ sql: string; values: unknown[] }>).map(({ sql, values }) => {
@@ -52,7 +52,7 @@ describe("private update download and events", () => {
   const databases: DatabaseSync[] = [];
   afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-  async function fixture(afterDeviceAuthentication?: () => void, beforeBatch?: () => void) {
+  async function fixture(afterDeviceAuthentication?: () => void, beforeBatch?: () => void | Promise<void>) {
     const database = new DatabaseSync(":memory:");
     database.exec(migration);
     databases.push(database);
@@ -248,6 +248,43 @@ describe("private update download and events", () => {
     expect((await post("release-22", "2.22.0")).status).toBe(204);
     expect(database.prepare("SELECT count(*) AS count FROM update_events WHERE id = ?").get(clientEventId)).toEqual({ count: 1 });
     expect((await post("release-23", "2.23.0")).status).toBe(400);
+    expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.22.0" });
+  });
+
+  it("atomically rejects concurrent conflicting reuse of an install event id without advancing the losing version", async () => {
+    let firstBatchReached!: () => void;
+    let releaseFirstBatch!: () => void;
+    const firstAtBatch = new Promise<void>((resolve) => { firstBatchReached = resolve; });
+    const releaseFirst = new Promise<void>((resolve) => { releaseFirstBatch = resolve; });
+    let batchCalls = 0;
+    const { database, env } = await fixture(undefined, async () => {
+      batchCalls += 1;
+      if (batchCalls === 1) {
+        firstBatchReached();
+        await releaseFirst;
+      }
+    });
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token);
+    seedRelease(database, "production", "release-22", "2.22.0");
+    seedRelease(database, "production", "release-23", "2.23.0");
+    seedHistoryTicket(database, "ticket-22", "device-1", "release-22");
+    seedHistoryTicket(database, "ticket-23", "device-1", "release-23");
+    const clientEventId = "123e4567-e89b-42d3-a456-426614174000";
+    const post = (releaseId: string, currentVersion: string) => worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ releaseId, currentVersion, eventType: "install_succeeded", clientEventId }),
+    }), env, context);
+
+    const first = post("release-23", "2.23.0");
+    await firstAtBatch;
+    const conflicting = await post("release-22", "2.22.0");
+    releaseFirstBatch();
+    const original = await first;
+
+    expect([original.status, conflicting.status].sort()).toEqual([204, 400]);
+    expect(database.prepare("SELECT id, release_id, current_version FROM update_events WHERE id = ?").all(clientEventId))
+      .toEqual([{ id: clientEventId, release_id: "release-22", current_version: "2.22.0" }]);
     expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.22.0" });
   });
 

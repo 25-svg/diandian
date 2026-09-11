@@ -269,16 +269,27 @@ export class UpdateService {
       if (current && compareVersions(parsedVersion, current) <= 0) {
         const recorded = await this.insertInstallEvent(eventId, deviceId, releaseId, version, now);
         if (recorded.meta.changes !== 1) {
-          const duplicate = await this.matchingInstallEvent(eventId, deviceId, releaseId, version);
-          if (!duplicate) throw new UpdateError("TICKET_INVALID", "Update event is unavailable.");
+          const existing = await this.installEventPayload(eventId);
+          if (!existing) throw new UpdateError("TICKET_INVALID", "Update event is unavailable.");
+          if (existing.device_id !== deviceId || existing.release_id !== releaseId
+            || existing.current_version !== version || existing.event_type !== "install_succeeded") {
+            throw new UpdateError("INVALID_REQUEST", "Update event id conflicts with an existing event.");
+          }
         }
         return;
       }
       const [recorded, advanced] = await this.db.batch([
         this.installEventStatement(eventId, deviceId, releaseId, version, now, eligibility.current_version),
-        this.installVersionStatement(deviceId, releaseId, version, now, eligibility.current_version),
+        this.installVersionStatement(eventId, deviceId, releaseId, version, now, eligibility.current_version),
       ]);
       if (recorded?.meta.changes === 1 && advanced?.meta.changes === 1) return;
+      if (recorded?.meta.changes === 0) {
+        const existing = await this.installEventPayload(eventId);
+        if (existing && (existing.device_id !== deviceId || existing.release_id !== releaseId
+          || existing.current_version !== version || existing.event_type !== "install_succeeded")) {
+          throw new UpdateError("INVALID_REQUEST", "Update event id conflicts with an existing event.");
+        }
+      }
     }
     throw new UpdateError("RETRYABLE", "Update state changed; retry the request.");
   }
@@ -295,7 +306,7 @@ export class UpdateService {
     ).bind(eventId, version, now, releaseId, deviceId, expectedCurrent, version);
   }
 
-  private installVersionStatement(deviceId: string, releaseId: string, version: string, now: number, expectedCurrent: string | null): D1PreparedStatement {
+  private installVersionStatement(eventId: string, deviceId: string, releaseId: string, version: string, now: number, expectedCurrent: string | null): D1PreparedStatement {
     return this.db.prepare(
       `UPDATE devices SET current_version = ?, last_seen_at = ?
        WHERE id = ? AND status = 'active' AND current_version IS ?
@@ -303,8 +314,12 @@ export class UpdateService {
            SELECT 1 FROM releases r WHERE r.id = ? AND r.version = ? AND r.status IN ('testing', 'production', 'halted')
              AND (r.status != 'testing' OR devices.test_group = '1')
          )
-         AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = devices.id AND dt.release_id = ? AND dt.purpose = 'update')`,
-    ).bind(version, now, deviceId, expectedCurrent, releaseId, version, releaseId);
+         AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = devices.id AND dt.release_id = ? AND dt.purpose = 'update')
+         AND EXISTS (
+           SELECT 1 FROM update_events ue WHERE ue.id = ? AND ue.device_id = devices.id
+             AND ue.release_id = ? AND ue.current_version = ? AND ue.event_type = 'install_succeeded'
+         )`,
+    ).bind(version, now, deviceId, expectedCurrent, releaseId, version, releaseId, eventId, releaseId, version);
   }
 
   private async insertInstallEvent(eventId: string, deviceId: string, releaseId: string, version: string, now: number): Promise<D1Result> {
@@ -319,12 +334,10 @@ export class UpdateService {
     ).bind(eventId, version, now, releaseId, deviceId, version).run();
   }
 
-  private async matchingInstallEvent(eventId: string, deviceId: string, releaseId: string, version: string): Promise<boolean> {
-    const row = await this.db.prepare(
-      `SELECT 1 FROM update_events WHERE id = ? AND device_id = ? AND release_id = ?
-       AND current_version = ? AND event_type = 'install_succeeded'`,
-    ).bind(eventId, deviceId, releaseId, version).first();
-    return row !== null;
+  private async installEventPayload(eventId: string): Promise<{ device_id: string; release_id: string | null; current_version: string; event_type: string } | null> {
+    return this.db.prepare(
+      "SELECT device_id, release_id, current_version, event_type FROM update_events WHERE id = ?",
+    ).bind(eventId).first<{ device_id: string; release_id: string | null; current_version: string; event_type: string }>();
   }
 
   private now(): number {
