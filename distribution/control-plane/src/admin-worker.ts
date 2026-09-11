@@ -1,157 +1,85 @@
 import { randomToken, sha256Hex } from "./crypto";
-import { createAccessIdentityAdapter, type AccessIdentityAdapter, type VerifiedAccessIdentity } from "./admin-auth";
+import { createAccessIdentityAdapter, createServiceIdentityAdapter, type AccessIdentityAdapter, type ServiceIdentityAdapter, type VerifiedAccessIdentity, type VerifiedServiceIdentity } from "./admin-auth";
+import { parseVersion } from "./update-service";
 
-export type { VerifiedAccessIdentity } from "./admin-auth";
-
+export type { VerifiedAccessIdentity, VerifiedServiceIdentity } from "./admin-auth";
 type Role = "owner" | "operator";
 type Admin = { id: string; email: string; role: Role };
-type AdminEnv = { DB: D1Database; ARTIFACTS: R2Bucket; UPDATE_API_BASE_URL?: string; ADMIN_ACCESS_ISSUER?: string; ADMIN_ACCESS_AUDIENCE?: string; ADMIN_ACCESS_JWKS_URL?: string; PUBLISHER_ACCESS_ISSUER?: string; PUBLISHER_ACCESS_AUDIENCE?: string; PUBLISHER_ACCESS_JWKS_URL?: string };
-type WorkerOptions = { adminAccess: AccessIdentityAdapter; publisherAccess: AccessIdentityAdapter; clock?: () => number };
-
-const BODY_LIMIT = 8 * 1024;
-const PAGE_LIMIT = 100;
-const TOKEN_BYTES = 32;
-
-function response(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
-}
-function failure(code: string, message: string, status: number): Response { return response({ error: { code, message } }, status); }
-function id(): string { return crypto.randomUUID(); }
-function safeId(value: string): boolean { return /^[A-Za-z0-9_-]{1,256}$/.test(value); }
-function nowFrom(clock: () => number): number { const now = clock(); if (!Number.isSafeInteger(now)) throw new Error("Invalid clock"); return now; }
-
-async function body(request: Request): Promise<Record<string, unknown>> {
-  const contentLength = request.headers.get("content-length");
-  if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > BODY_LIMIT)) throw new HttpError("PAYLOAD_TOO_LARGE", "Request body is too large.", 413);
-  if (!request.body) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
-  const reader = request.body.getReader(); const chunks: Uint8Array[] = []; let length = 0;
-  try { while (true) { const { done, value } = await reader.read(); if (done) break; length += value.byteLength; if (length > BODY_LIMIT) { try { await reader.cancel(); } catch { /* preserve cap response */ } throw new HttpError("PAYLOAD_TOO_LARGE", "Request body is too large.", 413); } chunks.push(value); } }
-  finally { reader.releaseLock(); }
-  const bytes = new Uint8Array(length); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  try { const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(); return parsed as Record<string, unknown>; }
-  catch { throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); }
-}
-function stringField(input: Record<string, unknown>, name: string, max: number, pattern?: RegExp): string {
-  const value = input[name];
-  if (typeof value !== "string" || value.length === 0 || value.length > max || (pattern && !pattern.test(value))) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
-  return value;
-}
-function optionalString(input: Record<string, unknown>, name: string, max: number): string {
-  const value = input[name]; if (value === undefined) return ""; return stringField(input, name, max);
-}
+type Env = { DB: D1Database; ARTIFACTS: R2Bucket; UPDATE_API_BASE_URL?: string; ADMIN_ACCESS_ISSUER?: string; ADMIN_ACCESS_AUDIENCE?: string; ADMIN_ACCESS_JWKS_URL?: string; PUBLISHER_ACCESS_ISSUER?: string; PUBLISHER_ACCESS_AUDIENCE?: string; PUBLISHER_ACCESS_JWKS_URL?: string };
+type Options = { adminAccess: AccessIdentityAdapter; publisherAccess: ServiceIdentityAdapter; clock?: () => number };
+const MAX_BODY = 8 * 1024, MAX_PAGE = 100, TOKEN_BYTES = 32;
 class HttpError extends Error { constructor(readonly code: string, message: string, readonly status: number) { super(message); } }
+const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+const fail = (code: string, message: string, status: number) => json({ error: { code, message } }, status);
+const id = () => crypto.randomUUID();
+const now = (clock: () => number) => { const value = clock(); if (!Number.isSafeInteger(value)) throw new Error("Invalid clock"); return value; };
 
-async function findAdmin(db: D1Database, identity: VerifiedAccessIdentity): Promise<Admin | null> {
-  return db.prepare("SELECT id, email, role FROM admins WHERE email = ?").bind(identity.email).first<Admin>();
+async function readBody(request: Request): Promise<Record<string, unknown>> {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!/^application\/json(?:\s*;|$)/i.test(contentType)) throw new HttpError("UNSUPPORTED_MEDIA_TYPE", "JSON content is required.", 415);
+  const length = request.headers.get("content-length"); if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY)) throw new HttpError("PAYLOAD_TOO_LARGE", "Request body is too large.", 413);
+  if (!request.body) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
+  const reader = request.body.getReader(), chunks: Uint8Array[] = []; let total = 0;
+  try { while (true) { const { done, value } = await reader.read(); if (done) break; total += value.byteLength; if (total > MAX_BODY) { try { await reader.cancel(); } catch {} throw new HttpError("PAYLOAD_TOO_LARGE", "Request body is too large.", 413); } chunks.push(value); } } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(total); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try { const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(); return parsed as Record<string, unknown>; } catch { throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); }
 }
-async function audit(db: D1Database, adminId: string | null, action: string, targetType: string, targetId: string | null, result: "started" | "success" | "failure", now: number, auditId = id()): Promise<string> {
-  const details = JSON.stringify({ result });
-  if (result === "started") await db.prepare("INSERT INTO audit_logs (id, admin_id, action, target_type, target_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(auditId, adminId, action, targetType, targetId, details, now).run();
-  else await db.prepare("UPDATE audit_logs SET details_json = ? WHERE id = ?").bind(details, auditId).run();
+function text(input: Record<string, unknown>, key: string, max: number, pattern?: RegExp) { const value = input[key]; if (typeof value !== "string" || !value || value.length > max || (pattern && !pattern.test(value))) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); return value; }
+function assertKeys(input: Record<string, unknown>, keys: string[]) { if (Object.keys(input).some((key) => !keys.includes(key))) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); }
+function page(request: Request) { const url = new URL(request.url); const limitRaw = url.searchParams.get("limit") ?? "50"; const cursorRaw = url.searchParams.get("cursor") ?? "0"; if (!/^\d+$/.test(limitRaw) || !/^\d+$/.test(cursorRaw)) throw new HttpError("INVALID_REQUEST", "Pagination is invalid.", 400); const limit = Number(limitRaw), cursor = Number(cursorRaw); if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE || !Number.isSafeInteger(cursor) || cursor > 1_000_000) throw new HttpError("INVALID_REQUEST", "Pagination is invalid.", 400); return { limit, cursor }; }
+async function list(db: D1Database, request: Request, sql: string) { const { limit, cursor } = page(request); const { results } = await db.prepare(`${sql} LIMIT ? OFFSET ?`).bind(limit + 1, cursor).all(); return json({ items: results.slice(0, limit), nextCursor: results.length > limit ? String(cursor + limit) : null }); }
+async function findAdmin(db: D1Database, identity: VerifiedAccessIdentity) { return db.prepare("SELECT id, email, role FROM admins WHERE email = ? AND disabled_at IS NULL").bind(identity.email).first<Admin>(); }
+async function audit(db: D1Database, actor: string | null, action: string, targetType: string, targetId: string | null, result: "started" | "success" | "failure", timestamp: number, details: Record<string, unknown> = {}, auditId = id()) {
+  const detailsJson = JSON.stringify({ result, ...details });
+  if (result === "started") await db.prepare("INSERT INTO audit_logs (id, admin_id, action, target_type, target_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(auditId, actor, action, targetType, targetId, detailsJson, timestamp).run();
+  else await db.prepare("UPDATE audit_logs SET details_json = ? WHERE id = ?").bind(detailsJson, auditId).run();
   return auditId;
 }
-
-async function withAudit<T>(db: D1Database, identity: Admin, action: string, targetType: string, targetId: string | null, now: number, run: () => Promise<T>): Promise<T> {
-  const auditId = await audit(db, identity.id, action, targetType, targetId, "started", now);
-  try { const output = await run(); await audit(db, identity.id, action, targetType, targetId, "success", now, auditId); return output; }
-  catch (cause) { try { await audit(db, identity.id, action, targetType, targetId, "failure", now, auditId); } catch { /* started row remains forensic evidence. */ } throw cause; }
+async function withAudit<T>(db: D1Database, admin: Admin, action: string, targetType: string, targetId: string, timestamp: number, run: () => Promise<T>, details: Record<string, unknown> = {}) {
+  const auditId = await audit(db, admin.id, action, targetType, targetId, "started", timestamp, details);
+  let output: T;
+  try { output = await run(); } catch (cause) { try { await audit(db, admin.id, action, targetType, targetId, "failure", timestamp, details, auditId); } catch {} throw cause; }
+  try { await audit(db, admin.id, action, targetType, targetId, "success", timestamp, details, auditId); } catch { /* business success remains successful; started row is durable evidence */ }
+  return output!;
 }
-
+function csrf(request: Request) { const origin = request.headers.get("origin"); if (origin !== new URL(request.url).origin || request.headers.get("sec-fetch-site") === "cross-site") throw new HttpError("CSRF_REJECTED", "Cross-site write request rejected.", 403); }
 function releaseInput(input: Record<string, unknown>) {
-  const allowed = new Set(["version", "platform", "arch", "objectKey", "size", "sha256", "signature", "notes", "pubDate"]);
-  if (Object.keys(input).some((key) => !allowed.has(key))) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
-  const version = stringField(input, "version", 128, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.-]+)?$/);
-  const platform = stringField(input, "platform", 32, /^[a-z0-9_-]+$/);
-  const arch = stringField(input, "arch", 32, /^[a-z0-9_-]+$/);
-  const objectKey = stringField(input, "objectKey", 512, /^(?!\/)(?!.*\.\.)(?!.*[\r\n\0]).+$/);
-  const size = input.size; if (!Number.isSafeInteger(size) || (size as number) < 0 || (size as number) > 2 ** 53 - 1) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
-  const sha256 = stringField(input, "sha256", 64, /^[a-fA-F0-9]{64}$/).toLowerCase();
-  const signature = stringField(input, "signature", 16_384);
-  const notes = stringField(input, "notes", 16_384);
-  const pubDate = stringField(input, "pubDate", 64); if (Number.isNaN(Date.parse(pubDate))) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
-  return { version, platform, arch, objectKey, size: size as number, sha256, signature, notes, pubDate };
+  assertKeys(input, ["version", "platform", "arch", "objectKey", "size", "sha256", "signature", "notes", "pubDate"]);
+  const version = text(input, "version", 256); if (!parseVersion(version)) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
+  const platform = text(input, "platform", 32), arch = text(input, "arch", 32); if (platform !== "windows" || arch !== "x86_64") throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
+  const objectKey = text(input, "objectKey", 512, /^(?!\/)(?!.*\.\.)(?!.*[\r\n\0]).+$/), sha256 = text(input, "sha256", 64, /^[a-fA-F0-9]{64}$/).toLowerCase(), signature = text(input, "signature", 512, /^[A-Za-z0-9+/]{86}==$/), notes = text(input, "notes", 16_384), pubDate = text(input, "pubDate", 64);
+  if (Number.isNaN(Date.parse(pubDate)) || !Number.isSafeInteger(input.size) || (input.size as number) < 0) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
+  return { version, platform, arch, objectKey, size: input.size as number, sha256, signature, notes, pubDate };
 }
+async function requireOwner(env: Env, admin: Admin, action: string, timestamp: number) { if (admin.role === "owner") return; const auditId = await audit(env.DB, admin.id, action, "authorization", admin.id, "started", timestamp); await audit(env.DB, admin.id, action, "authorization", admin.id, "failure", timestamp, {}, auditId); throw new HttpError("FORBIDDEN", "Owner access is required.", 403); }
 
-function routes(options: WorkerOptions) {
-  const clock = options.clock ?? (() => Math.floor(Date.now() / 1000));
-  return async (request: Request, env: AdminEnv): Promise<Response> => {
-    const path = new URL(request.url).pathname;
-    const now = nowFrom(clock);
-    if (path === "/api/publisher/releases") return publisher(request, env, options.publisherAccess, now);
-    if (!path.startsWith("/api/admin/")) return failure("NOT_FOUND", "Route not found.", 404);
-    const verified = await options.adminAccess.verify(request);
-    if (!verified) return failure("UNAUTHORIZED", "Authentication is required.", 401);
-    const admin = await findAdmin(env.DB, verified);
-    if (!admin) return failure("FORBIDDEN", "Administrator access is required.", 403);
-    return adminRoute(request, env, admin, path.slice("/api/admin".length), now);
-  };
-}
-
-async function adminRoute(request: Request, env: AdminEnv, admin: Admin, path: string, now: number): Promise<Response> {
-  const ownerOnly = async (action: string, target: string) => {
-    if (admin.role === "owner") return true;
-    const auditId = await audit(env.DB, admin.id, action, target, null, "started", now);
-    await audit(env.DB, admin.id, action, target, null, "failure", now, auditId);
-    return false;
-  };
-  if (path === "/overview" && request.method === "GET") {
-    const [devices, releases, codes] = await Promise.all([env.DB.prepare("SELECT count(*) AS count FROM devices WHERE status = 'active'").first(), env.DB.prepare("SELECT count(*) AS count FROM releases WHERE status IN ('testing', 'production')").first(), env.DB.prepare("SELECT count(*) AS count FROM activation_codes WHERE status = 'unused' AND expires_at > ?").bind(now).first()]);
-    return response({ devices: (devices as { count: number }).count, releases: (releases as { count: number }).count, activationCodes: (codes as { count: number }).count });
-  }
-  if (path === "/devices" && request.method === "GET") return response((await env.DB.prepare("SELECT id, status, streamer_note, current_version, test_group, activated_at, revoked_at, last_seen_at FROM devices ORDER BY created_at DESC LIMIT ?").bind(PAGE_LIMIT).all()).results);
+async function adminRoute(request: Request, env: Env, admin: Admin, path: string, timestamp: number): Promise<Response> {
+  const write = request.method === "POST" || request.method === "DELETE";
+  if (write) { try { csrf(request); } catch (cause) { const auditId = await audit(env.DB, admin.id, "csrf.reject", "request", path, "started", timestamp); await audit(env.DB, admin.id, "csrf.reject", "request", path, "failure", timestamp, {}, auditId); throw cause; } }
+  if (path === "/overview" && request.method === "GET") { const [d, r, c] = await Promise.all([env.DB.prepare("SELECT count(*) AS count FROM devices WHERE status = 'active'").first<{ count: number }>(), env.DB.prepare("SELECT count(*) AS count FROM releases WHERE status IN ('testing','production')").first<{ count: number }>(), env.DB.prepare("SELECT count(*) AS count FROM activation_codes WHERE status='unused' AND expires_at > ?").bind(timestamp).first<{ count: number }>()]); return json({ devices: d?.count ?? 0, releases: r?.count ?? 0, activationCodes: c?.count ?? 0 }); }
+  if (path === "/devices" && request.method === "GET") return list(env.DB, request, "SELECT id,status,streamer_note,current_version,test_group,activated_at,revoked_at,last_seen_at FROM devices ORDER BY created_at DESC");
   let match = /^\/devices\/([A-Za-z0-9_-]{1,256})\/(revoke|unbind|test-group)$/.exec(path);
-  if (match && request.method === "POST") {
-    const deviceId = match[1]!; const action = match[2]!;
-    return withAudit(env.DB, admin, `device.${action}`, "device", deviceId, now, async () => {
-      if (action === "revoke") await env.DB.prepare("UPDATE devices SET status = 'revoked', revoked_at = ? WHERE id = ?").bind(now, deviceId).run();
-      else if (action === "unbind") await env.DB.prepare("UPDATE devices SET status = 'revoked', revoked_at = ?, fingerprint_hash = ?, token_hash = ? WHERE id = ?").bind(now, `unbound-${id()}`, `unbound-${id()}`, deviceId).run();
-      else { const input = await body(request); if (typeof input.enabled !== "boolean") throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); await env.DB.prepare("UPDATE devices SET test_group = ? WHERE id = ?").bind(input.enabled ? "1" : null, deviceId).run(); }
-      return response({ ok: true });
-    });
-  }
-  if (path === "/activation-codes" && request.method === "POST") return withAudit(env.DB, admin, "activation_code.create", "activation_code", null, now, async () => {
-    const input = await body(request); const count = input.count === undefined ? 1 : input.count; const days = input.days === undefined ? 7 : input.days;
-    if (typeof count !== "number" || !Number.isInteger(count) || count < 1 || count > 20 || typeof days !== "number" || !Number.isInteger(days) || days < 1 || days > 30) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400);
-    const codes: Array<{ id: string; code: string; expiresAt: number }> = [];
-    for (let index = 0; index < count; index += 1) { const code = randomToken(TOKEN_BYTES); const codeId = id(); const expiresAt = now + days * 86400; await env.DB.prepare("INSERT INTO activation_codes (id, code_hash, status, expires_at, created_at) VALUES (?, ?, 'unused', ?, ?)").bind(codeId, await sha256Hex(code), expiresAt, now).run(); codes.push({ id: codeId, code, expiresAt }); }
-    return response({ codes }, 201);
-  });
-  if (path === "/activation-codes" && request.method === "GET") return response((await env.DB.prepare("SELECT id, status, used_by_device_id, used_at, expires_at, created_at FROM activation_codes ORDER BY created_at DESC LIMIT ?").bind(PAGE_LIMIT).all()).results);
-  match = /^\/activation-codes\/([A-Za-z0-9_-]{1,256})\/revoke$/.exec(path);
-  if (match && request.method === "POST") return withAudit(env.DB, admin, "activation_code.revoke", "activation_code", match[1]!, now, async () => { await env.DB.prepare("UPDATE activation_codes SET status = 'revoked' WHERE id = ? AND status = 'unused'").bind(match![1]).run(); return response({ ok: true }); });
-  if (path === "/download-links" && request.method === "POST") return withAudit(env.DB, admin, "download_link.create", "release", null, now, async () => {
-    const input = await body(request); const releaseId = stringField(input, "releaseId", 256, /^[A-Za-z0-9_-]+$/);
-    const base = env.UPDATE_API_BASE_URL; if (!base) throw new HttpError("CONFIGURATION_ERROR", "Download links are unavailable.", 503);
-    let origin: URL; try { origin = new URL(base); } catch { throw new HttpError("CONFIGURATION_ERROR", "Download links are unavailable.", 503); }
-    if (origin.protocol !== "https:") throw new HttpError("CONFIGURATION_ERROR", "Download links are unavailable.", 503);
-    const ticket = randomToken(TOKEN_BYTES); const ticketId = id(); const expiresAt = now + 86400;
-    const saved = await env.DB.prepare("INSERT INTO download_tickets (id, token_hash, device_id, release_id, purpose, expires_at, created_at) SELECT ?, ?, NULL, id, 'initial', ?, ? FROM releases WHERE id = ? AND status = 'production'").bind(ticketId, await sha256Hex(ticket), expiresAt, now, releaseId).run();
-    if (saved.meta.changes !== 1) throw new HttpError("RELEASE_UNAVAILABLE", "A production release is required.", 409);
-    const url = new URL(`/v1/initial-download/${ticket}`, origin).toString();
-    return response({ id: ticketId, expiresAt, url }, 201);
-  });
-  if (path === "/download-links" && request.method === "GET") return response((await env.DB.prepare("SELECT id, release_id, expires_at, revoked_at, created_at FROM download_tickets WHERE purpose = 'initial' ORDER BY created_at DESC LIMIT ?").bind(PAGE_LIMIT).all()).results);
-  match = /^\/download-links\/([A-Za-z0-9_-]{1,256})\/revoke$/.exec(path);
-  if (match && request.method === "POST") return withAudit(env.DB, admin, "download_link.revoke", "download_ticket", match[1]!, now, async () => { await env.DB.prepare("UPDATE download_tickets SET revoked_at = ? WHERE id = ? AND purpose = 'initial'").bind(now, match![1]).run(); return response({ ok: true }); });
-  if (path === "/releases" && request.method === "GET") return response((await env.DB.prepare("SELECT id, version, status, notes, pub_date, size, sha256, platform, arch, created_at, updated_at FROM releases ORDER BY created_at DESC LIMIT ?").bind(PAGE_LIMIT).all()).results);
-  match = /^\/releases\/([A-Za-z0-9_-]{1,256})\/(testing|production|halted)$/.exec(path);
-  if (match && request.method === "POST") { if (!(await ownerOnly(`release.${match[2]}`, "release"))) return failure("FORBIDDEN", "Owner access is required.", 403); const [releaseId, status] = [match[1]!, match[2]!]; return withAudit(env.DB, admin, `release.${status}`, "release", releaseId, now, async () => { const prior = status === "testing" ? "draft" : status === "production" ? "testing" : "testing', 'production"; const sql = status === "halted" ? "UPDATE releases SET status = 'halted', updated_at = ? WHERE id = ? AND status IN ('testing', 'production')" : `UPDATE releases SET status = '${status}', updated_at = ? WHERE id = ? AND status = '${prior}'`; const changed = await env.DB.prepare(sql).bind(now, releaseId).run(); if (changed.meta.changes !== 1) throw new HttpError("INVALID_RELEASE_TRANSITION", "Release transition is not allowed.", 409); return response({ ok: true }); }); }
-  if (path === "/admins" && request.method === "GET") { if (!(await ownerOnly("admin.list", "admin"))) return failure("FORBIDDEN", "Owner access is required.", 403); return response((await env.DB.prepare("SELECT id, email, role, created_at FROM admins ORDER BY created_at DESC LIMIT ?").bind(PAGE_LIMIT).all()).results); }
-  if (path === "/admins" && request.method === "POST") { if (!(await ownerOnly("admin.create", "admin"))) return failure("FORBIDDEN", "Owner access is required.", 403); return withAudit(env.DB, admin, "admin.create", "admin", null, now, async () => { const input = await body(request); const email = stringField(input, "email", 320, /^[^\s@]+@[^\s@]+\.[^\s@]+$/).toLowerCase(); const role = input.role; if (role !== "owner" && role !== "operator") throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); const newId = id(); await env.DB.prepare("INSERT INTO admins (id, email, password_hash, role, created_at) VALUES (?, ?, '', ?, ?)").bind(newId, email, role, now).run(); return response({ id: newId, email, role }, 201); }); }
-  match = /^\/admins\/([A-Za-z0-9_-]{1,256})$/.exec(path);
-  if (match && request.method === "DELETE") { if (!(await ownerOnly("admin.delete", "admin"))) return failure("FORBIDDEN", "Owner access is required.", 403); const target = match[1]!; return withAudit(env.DB, admin, "admin.delete", "admin", target, now, async () => { const deleted = await env.DB.prepare("DELETE FROM admins WHERE id = ? AND (SELECT count(*) FROM admins WHERE role = 'owner') > 1 OR id = ? AND EXISTS (SELECT 1 FROM admins WHERE id = ? AND role != 'owner')").bind(target, target, target).run(); if (deleted.meta.changes !== 1) throw new HttpError("LAST_OWNER", "At least one owner is required.", 409); return response({ ok: true }); }); }
-  if (path === "/audit" && request.method === "GET") { if (!(await ownerOnly("audit.list", "audit"))) return failure("FORBIDDEN", "Owner access is required.", 403); return response((await env.DB.prepare("SELECT id, admin_id, action, target_type, target_id, details_json, created_at FROM audit_logs ORDER BY created_at DESC LIMIT ?").bind(PAGE_LIMIT).all()).results); }
-  return failure("NOT_FOUND", "Route not found.", 404);
+  if (match && request.method === "POST") { const deviceId = match[1]!, action = match[2]!; return withAudit(env.DB, admin, `device.${action}`, "device", deviceId, timestamp, async () => { if (action === "revoke") await env.DB.prepare("UPDATE devices SET status='revoked', revoked_at=? WHERE id=?").bind(timestamp, deviceId).run(); else if (action === "unbind") await env.DB.prepare("UPDATE devices SET status='revoked', revoked_at=?, fingerprint_hash=?, token_hash=? WHERE id=?").bind(timestamp, `unbound-${id()}`, `unbound-${id()}`, deviceId).run(); else { const input = await readBody(request); assertKeys(input, ["enabled"]); if (typeof input.enabled !== "boolean") throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); await env.DB.prepare("UPDATE devices SET test_group=? WHERE id=?").bind(input.enabled ? "1" : null, deviceId).run(); } return json({ ok: true }); }); }
+  if (path === "/activation-codes" && request.method === "POST") { const operationId = id(); return withAudit(env.DB, admin, "activation_code.create", "activation_batch", operationId, timestamp, async () => { const input = await readBody(request); assertKeys(input, ["count", "days"]); const count = input.count; if (!Number.isInteger(count) || (count as number) < 1 || (count as number) > 20 || (input.days !== undefined && input.days !== 7)) throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); const values = await Promise.all(Array.from({ length: count as number }, async () => { const code = randomToken(TOKEN_BYTES), codeId = id(); return { code, codeId, hash: await sha256Hex(code) }; })); const expiry = timestamp + 7 * 86400; await env.DB.batch(values.map((value) => env.DB.prepare("INSERT INTO activation_codes (id,code_hash,status,expires_at,created_at) VALUES (?,?,'unused',?,?)").bind(value.codeId, value.hash, expiry, timestamp))); return json({ codes: values.map(({ codeId, code }) => ({ id: codeId, code, expiresAt: expiry })) }, 201); }, { createdIds: [operationId] }); }
+  if (path === "/activation-codes" && request.method === "GET") return list(env.DB, request, "SELECT id,status,used_by_device_id,used_at,expires_at,created_at FROM activation_codes ORDER BY created_at DESC");
+  match = /^\/activation-codes\/([A-Za-z0-9_-]{1,256})\/revoke$/.exec(path); if (match && request.method === "POST") return withAudit(env.DB, admin, "activation_code.revoke", "activation_code", match[1]!, timestamp, async () => { await env.DB.prepare("UPDATE activation_codes SET status='revoked' WHERE id=? AND status='unused'").bind(match![1]).run(); return json({ ok: true }); });
+  if (path === "/download-links" && request.method === "POST") { const ticketId = id(); return withAudit(env.DB, admin, "download_link.create", "download_ticket", ticketId, timestamp, async () => { const input = await readBody(request); assertKeys(input, ["releaseId"]); const releaseId = text(input, "releaseId", 256, /^[A-Za-z0-9_-]+$/), base = env.UPDATE_API_BASE_URL; if (!base) throw new HttpError("CONFIGURATION_ERROR", "Download links are unavailable.", 503); let origin: URL; try { origin = new URL(base); } catch { throw new HttpError("CONFIGURATION_ERROR", "Download links are unavailable.", 503); } if (origin.protocol !== "https:") throw new HttpError("CONFIGURATION_ERROR", "Download links are unavailable.", 503); const ticket = randomToken(TOKEN_BYTES), expiresAt = timestamp + 86400; const saved = await env.DB.prepare("INSERT INTO download_tickets (id,token_hash,device_id,release_id,purpose,expires_at,created_at) SELECT ?,?,NULL,id,'initial',?,? FROM releases WHERE id=? AND status='production'").bind(ticketId, await sha256Hex(ticket), expiresAt, timestamp, releaseId).run(); if (saved.meta.changes !== 1) throw new HttpError("RELEASE_UNAVAILABLE", "A production release is required.", 409); return json({ id: ticketId, expiresAt, url: new URL(`/v1/initial-download/${ticket}`, origin).toString() }, 201); }); }
+  if (path === "/download-links" && request.method === "GET") return list(env.DB, request, "SELECT id,release_id,expires_at,revoked_at,created_at FROM download_tickets WHERE purpose='initial' ORDER BY created_at DESC");
+  match = /^\/download-links\/([A-Za-z0-9_-]{1,256})\/revoke$/.exec(path); if (match && request.method === "POST") return withAudit(env.DB, admin, "download_link.revoke", "download_ticket", match[1]!, timestamp, async () => { await env.DB.prepare("UPDATE download_tickets SET revoked_at=? WHERE id=? AND purpose='initial'").bind(timestamp, match![1]).run(); return json({ ok: true }); });
+  if (path === "/releases" && request.method === "GET") return list(env.DB, request, "SELECT id,version,status,notes,pub_date,size,sha256,platform,arch,created_at,updated_at FROM releases ORDER BY created_at DESC");
+  match = /^\/releases\/([A-Za-z0-9_-]{1,256})\/(testing|production|halted)$/.exec(path); if (match && request.method === "POST") { const releaseId = match[1]!, status = match[2]!; await requireOwner(env, admin, `release.${status}`, timestamp); return withAudit(env.DB, admin, `release.${status}`, "release", releaseId, timestamp, async () => { if (status === "testing") { const release = await env.DB.prepare("SELECT object_key,size,sha256,platform,arch,version,pub_date,signature FROM releases WHERE id=? AND status='draft'").bind(releaseId).first<{ object_key:string;size:number;sha256:string;platform:string;arch:string;version:string;pub_date:string;signature:string }>(); if (!release || release.platform !== "windows" || release.arch !== "x86_64" || !parseVersion(release.version) || Number.isNaN(Date.parse(release.pub_date)) || !/^[A-Za-z0-9+/]{86}==$/.test(release.signature)) throw new HttpError("INVALID_RELEASE_TRANSITION", "Release transition is not allowed.", 409); const head = await env.ARTIFACTS.head(release.object_key); if (!head || head.size !== release.size || head.customMetadata?.sha256?.toLowerCase() !== release.sha256.toLowerCase()) throw new HttpError("ARTIFACT_INVALID", "Release artifact is unavailable.", 409); } const prior = status === "testing" ? "draft" : status === "production" ? "testing" : null; const statement = status === "halted" ? env.DB.prepare("UPDATE releases SET status='halted',updated_at=? WHERE id=? AND status IN ('testing','production')").bind(timestamp, releaseId) : env.DB.prepare("UPDATE releases SET status=?,updated_at=? WHERE id=? AND status=?").bind(status, timestamp, releaseId, prior); const changed = await statement.run(); if (changed.meta.changes !== 1) throw new HttpError("INVALID_RELEASE_TRANSITION", "Release transition is not allowed.", 409); return json({ ok: true }); }); }
+  if (path === "/admins" && request.method === "GET") { await requireOwner(env, admin, "admin.list", timestamp); return list(env.DB, request, "SELECT id,email,role,created_at,disabled_at FROM admins WHERE disabled_at IS NULL ORDER BY created_at DESC"); }
+  if (path === "/admins" && request.method === "POST") { await requireOwner(env, admin, "admin.create", timestamp); const input = await readBody(request); assertKeys(input, ["email", "role"]); const email = text(input, "email", 320, /^[^\s@]+@[^\s@]+\.[^\s@]+$/).toLowerCase(), role = input.role; if (role !== "owner" && role !== "operator") throw new HttpError("INVALID_REQUEST", "Request body is invalid.", 400); const existing = await env.DB.prepare("SELECT id FROM admins WHERE email=?").bind(email).first<{id:string}>(); const targetId = existing?.id ?? id(); return withAudit(env.DB, admin, "admin.create", "admin", targetId, timestamp, async () => { await env.DB.prepare("INSERT INTO admins (id,email,password_hash,role,created_at,disabled_at) VALUES (?,?,'',?,?,NULL) ON CONFLICT(email) DO UPDATE SET role=excluded.role,disabled_at=NULL").bind(targetId, email, role, timestamp).run(); return json({ id: targetId, email, role }, 201); }); }
+  match = /^\/admins\/([A-Za-z0-9_-]{1,256})$/.exec(path); if (match && request.method === "DELETE") { await requireOwner(env, admin, "admin.disable", timestamp); const targetId = match[1]!; return withAudit(env.DB, admin, "admin.disable", "admin", targetId, timestamp, async () => { const changed = await env.DB.prepare("UPDATE admins SET disabled_at=? WHERE id=? AND disabled_at IS NULL AND (role != 'owner' OR (SELECT count(*) FROM admins WHERE role='owner' AND disabled_at IS NULL) > 1)").bind(timestamp, targetId).run(); if (changed.meta.changes !== 1) throw new HttpError("LAST_OWNER", "At least one owner is required.", 409); return json({ ok: true }); }); }
+  if (path === "/audit" && request.method === "GET") { await requireOwner(env, admin, "audit.list", timestamp); return list(env.DB, request, "SELECT id,admin_id,action,target_type,target_id,details_json,created_at FROM audit_logs ORDER BY created_at DESC"); }
+  return fail("NOT_FOUND", "Route not found.", 404);
 }
 
-async function publisher(request: Request, env: AdminEnv, access: AccessIdentityAdapter, now: number): Promise<Response> {
-  if (request.method !== "POST") return failure("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
-  const identity = await access.verify(request); if (!identity) return failure("UNAUTHORIZED", "Publisher authentication is required.", 401);
-  const auditId = await audit(env.DB, null, "publisher.release.create", "release", null, "started", now);
-  try { const input = releaseInput(await body(request)); const releaseId = id(); await env.DB.prepare("INSERT INTO releases (id, version, status, notes, pub_date, object_key, size, sha256, platform, arch, signature, created_at, updated_at) VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(releaseId, input.version, input.notes, input.pubDate, input.objectKey, input.size, input.sha256, input.platform, input.arch, input.signature, now, now).run(); await audit(env.DB, null, "publisher.release.create", "release", null, "success", now, auditId); return response({ id: releaseId, status: "draft" }, 201); }
-  catch (cause) { try { await audit(env.DB, null, "publisher.release.create", "release", null, "failure", now, auditId); } catch { /* started remains */ } if (cause instanceof HttpError) return failure(cause.code, cause.message, cause.status); return failure("INVALID_REQUEST", "Unable to create release.", 400); }
+async function publisher(request: Request, env: Env, access: ServiceIdentityAdapter, timestamp: number) {
+  if (request.method !== "POST") return fail("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
+  const machine = await access.verify(request); if (!machine) return fail("UNAUTHORIZED", "Publisher authentication is required.", 401);
+  const targetId = id(), auditId = await audit(env.DB, null, "publisher.release.create", "release", targetId, "started", timestamp, { machineId: machine.serviceTokenId });
+  try { const input = releaseInput(await readBody(request)); await env.DB.prepare("INSERT INTO releases (id,version,status,notes,pub_date,object_key,size,sha256,platform,arch,signature,created_at,updated_at) VALUES (?,?,'draft',?,?,?,?,?,?,?,?,?,?)").bind(targetId,input.version,input.notes,input.pubDate,input.objectKey,input.size,input.sha256,input.platform,input.arch,input.signature,timestamp,timestamp).run(); try { await audit(env.DB,null,"publisher.release.create","release",targetId,"success",timestamp,{ machineId: machine.serviceTokenId },auditId); } catch {} return json({ id: targetId,status:"draft" },201); } catch (cause) { try { await audit(env.DB,null,"publisher.release.create","release",targetId,"failure",timestamp,{ machineId: machine.serviceTokenId },auditId); } catch {} if (cause instanceof HttpError) return fail(cause.code,cause.message,cause.status); return fail("INVALID_REQUEST","Unable to create release.",400); }
 }
-
-export function createAdminWorker(options: WorkerOptions) { return { fetch: async (request: Request, env: AdminEnv, _context: ExecutionContext): Promise<Response> => { try { return await routes(options)(request, env); } catch (cause) { if (cause instanceof HttpError) return failure(cause.code, cause.message, cause.status); return failure("INTERNAL_ERROR", "Unable to process this request.", 500); } } }; }
-
-export default { fetch(request: Request, env: AdminEnv, context: ExecutionContext) { return createAdminWorker({ adminAccess: createAccessIdentityAdapter({ issuer: env.ADMIN_ACCESS_ISSUER ?? "", audience: env.ADMIN_ACCESS_AUDIENCE ?? "", jwksUrl: env.ADMIN_ACCESS_JWKS_URL ?? "" }), publisherAccess: createAccessIdentityAdapter({ issuer: env.PUBLISHER_ACCESS_ISSUER ?? "", audience: env.PUBLISHER_ACCESS_AUDIENCE ?? "", jwksUrl: env.PUBLISHER_ACCESS_JWKS_URL ?? "" }) }).fetch(request, env, context); } };
+export function createAdminWorker(options: Options) { const clock = options.clock ?? (() => Math.floor(Date.now()/1000)); return { async fetch(request: Request, env: Env, _context: ExecutionContext): Promise<Response> { try { const path = new URL(request.url).pathname, timestamp = now(clock); if (path === "/api/publisher/releases") return await publisher(request,env,options.publisherAccess,timestamp); if (!path.startsWith("/api/admin/")) return fail("NOT_FOUND","Route not found.",404); const identity = await options.adminAccess.verify(request); if (!identity) return fail("UNAUTHORIZED","Authentication is required.",401); const admin = await findAdmin(env.DB,identity); if (!admin) return fail("FORBIDDEN","Administrator access is required.",403); return await adminRoute(request,env,admin,path.slice("/api/admin".length),timestamp); } catch (cause) { if (cause instanceof HttpError) return fail(cause.code,cause.message,cause.status); return fail("INTERNAL_ERROR","Unable to process this request.",500); } } }; }
+export default { fetch(request: Request, env: Env, context: ExecutionContext) { return createAdminWorker({ adminAccess: createAccessIdentityAdapter({issuer:env.ADMIN_ACCESS_ISSUER ?? "", audience:env.ADMIN_ACCESS_AUDIENCE ?? "", jwksUrl:env.ADMIN_ACCESS_JWKS_URL ?? ""}), publisherAccess: createServiceIdentityAdapter({issuer:env.PUBLISHER_ACCESS_ISSUER ?? "", audience:env.PUBLISHER_ACCESS_AUDIENCE ?? "", jwksUrl:env.PUBLISHER_ACCESS_JWKS_URL ?? ""}) }).fetch(request,env,context); } };

@@ -2,7 +2,8 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE admins (
   id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('owner', 'operator')), created_at INTEGER NOT NULL
+  role TEXT NOT NULL CHECK (role IN ('owner', 'operator')), created_at INTEGER NOT NULL,
+  disabled_at INTEGER
 );
 CREATE TABLE devices (
   id TEXT PRIMARY KEY, fingerprint_hash TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL UNIQUE,
@@ -43,7 +44,7 @@ CREATE TABLE audit_logs (
   target_type TEXT NOT NULL, target_id TEXT, details_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL
 );
 
-CREATE INDEX idx_admins_role ON admins(role);
+CREATE INDEX idx_admins_role ON admins(role, disabled_at);
 CREATE INDEX idx_devices_token_hash ON devices(token_hash);
 CREATE INDEX idx_devices_status_last_seen ON devices(status, last_seen_at);
 CREATE INDEX idx_activation_codes_expires_at ON activation_codes(expires_at);

@@ -31,6 +31,7 @@ describe("initial D1 migration", () => {
     const activationColumns = database.prepare("PRAGMA table_info(activation_codes)").all().map(({ name }) => name);
     expect(activationColumns).toEqual(expect.arrayContaining(["code_hash", "status", "used_by_device_id", "used_at"]));
     expect(database.prepare("SELECT sql FROM sqlite_master WHERE name = 'devices'").get()).toHaveProperty("sql", expect.stringContaining("CHECK"));
+    expect(database.prepare("PRAGMA table_info(admins)").all().map(({ name }) => name)).toContain("disabled_at");
   });
 
   it("enforces one activation code for one device and ticket purpose binding", () => {

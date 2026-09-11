@@ -34,7 +34,7 @@ interface ParsedVersion {
   prerelease: string[] | null;
 }
 
-function parseVersion(value: string): ParsedVersion | null {
+export function parseVersion(value: string): ParsedVersion | null {
   if (typeof value !== "string" || value.length > 256) return null;
   const match = SEMVER.exec(value);
   if (!match) return null;
@@ -77,7 +77,7 @@ function requireSafeRoute(target: string, arch: string): void {
   }
 }
 
-function requireVersion(value: string): ParsedVersion {
+export function requireVersion(value: string): ParsedVersion {
   const parsed = parseVersion(value);
   if (!parsed) throw new UpdateError("INVALID_REQUEST", "Version must be a valid SemVer value.");
   return parsed;
@@ -185,6 +185,12 @@ export class UpdateService {
     if (!record) throw new UpdateError("TICKET_INVALID", "Download ticket is invalid or unavailable.");
     const object = await this.artifacts.get(record.object_key);
     if (!object) throw new UpdateError("ARTIFACT_NOT_FOUND", "Update artifact is unavailable.");
+    const stillValid = await this.db.prepare(
+      `SELECT 1 FROM download_tickets dt JOIN releases r ON r.id = dt.release_id
+       WHERE dt.token_hash = ? AND dt.device_id IS NULL AND dt.purpose = 'initial'
+         AND dt.expires_at > ? AND dt.revoked_at IS NULL AND r.id = ? AND r.status = 'production'`,
+    ).bind(await sha256Hex(ticket), this.now(), record.id).first();
+    if (!stillValid) throw new UpdateError("TICKET_INVALID", "Download ticket is invalid or unavailable.");
     return new Response(object.body, {
       headers: {
         "cache-control": "private, no-store",

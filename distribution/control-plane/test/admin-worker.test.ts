@@ -31,7 +31,7 @@ function fixture(role: "owner" | "operator" = "owner") {
 
 async function request(role: "owner" | "operator", method: string, path: string, body?: unknown) {
   const { worker, env, database } = fixture(role);
-  const response = await worker.fetch(new Request(`https://admin.example${path}`, { method, headers: body ? { "content-type": "application/json" } : undefined, body: body === undefined ? undefined : JSON.stringify(body) }), env, {} as ExecutionContext);
+  const response = await worker.fetch(new Request(`https://admin.example${path}`, { method, headers: method === "POST" || method === "DELETE" ? { origin: "https://admin.example", "content-type": "application/json" } : undefined, body: body === undefined ? undefined : JSON.stringify(body) }), env, {} as ExecutionContext);
   return { response, database };
 }
 
@@ -48,27 +48,26 @@ describe("role-based admin API", () => {
 
   it("records a failure audit and never leaks activation plaintext into lists", async () => {
     const { worker, env, database } = fixture("operator");
-    const created = await worker.fetch(new Request("https://admin.example/api/admin/activation-codes", { method: "POST", headers: { "content-type": "application/json" }, body: '{"count":1}' }), env, {} as ExecutionContext);
+    const created = await worker.fetch(new Request("https://admin.example/api/admin/activation-codes", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: '{"count":1}' }), env, {} as ExecutionContext);
     const raw = (await created.json() as { codes: Array<{ code: string }> }).codes[0]!.code;
     const list = await worker.fetch(new Request("https://admin.example/api/admin/activation-codes"), env, {} as ExecutionContext);
     expect(JSON.stringify(await list.json())).not.toContain(raw);
-    expect((await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/production", { method: "POST" }), env, {} as ExecutionContext)).status).toBe(403);
+    expect((await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/production", { method: "POST", headers: { origin: "https://admin.example" } }), env, {} as ExecutionContext)).status).toBe(403);
     expect(database.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'release.production'").get()).toEqual({ count: 1 });
   });
 
   it("protects the last owner with a stable conflict", async () => {
     const { worker, env } = fixture();
-    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins/admin-1", { method: "DELETE" }), env, {} as ExecutionContext);
+    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins/admin-1", { method: "DELETE", headers: { origin: "https://admin.example" } }), env, {} as ExecutionContext);
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ error: { code: "LAST_OWNER", message: "At least one owner is required." } });
   });
 
   it("publisher can only create complete draft metadata", async () => {
     const database = new DatabaseSync(":memory:"); database.exec(migration); databases.push(database);
-    const identity: VerifiedAccessIdentity = { email: "publisher@example.com" };
-    const worker = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => identity }, clock: () => 1_700_000_000 });
+    const worker = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => ({ serviceTokenId: "publisher" }) }, clock: () => 1_700_000_000 });
     const env = { DB: makeD1(database), ARTIFACTS: {} as R2Bucket, UPDATE_API_BASE_URL: "https://updates.example" };
-    const body = { version: "2.0.0", platform: "windows", arch: "x86_64", objectKey: "private/2.exe", size: 1, sha256: "a".repeat(64), signature: "sig", notes: "notes", pubDate: "2026-09-11T00:00:00Z" };
+    const body = { version: "2.0.0", platform: "windows", arch: "x86_64", objectKey: "private/2.exe", size: 1, sha256: "a".repeat(64), signature: "a".repeat(86) + "==", notes: "notes", pubDate: "2026-09-11T00:00:00Z" };
     const response = await worker.fetch(new Request("https://admin.example/api/publisher/releases", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }), env, {} as ExecutionContext);
     expect(response.status).toBe(201);
     expect(database.prepare("SELECT status FROM releases").get()).toEqual({ status: "draft" });
@@ -78,19 +77,31 @@ describe("role-based admin API", () => {
     const database = new DatabaseSync(":memory:"); database.exec(migration); databases.push(database);
     const env = { DB: makeD1(database), ARTIFACTS: {} as R2Bucket, UPDATE_API_BASE_URL: "https://updates.example" };
     const adminOnly = createAdminWorker({ adminAccess: { verify: async () => ({ email: "admin@example.com" }) }, publisherAccess: { verify: async () => null } });
-    const publisherOnly = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => ({ email: "publisher@example.com" }) } });
+    const publisherOnly = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => ({ serviceTokenId: "publisher" }) } });
     expect((await adminOnly.fetch(new Request("https://admin.example/api/publisher/releases", { method: "POST" }), env, {} as ExecutionContext)).status).toBe(401);
     expect((await publisherOnly.fetch(new Request("https://admin.example/api/admin/overview"), env, {} as ExecutionContext)).status).toBe(401);
   });
 
   it("caps streamed write bodies and rejects publisher status injection", async () => {
     const { worker, env } = fixture("operator");
-    const oversized = await worker.fetch(new Request("https://admin.example/api/admin/activation-codes", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ padding: "x".repeat(8_192) }) }), env, {} as ExecutionContext);
+    const oversized = await worker.fetch(new Request("https://admin.example/api/admin/activation-codes", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ padding: "x".repeat(8_192) }) }), env, {} as ExecutionContext);
     expect(oversized.status).toBe(413);
 
     const database = new DatabaseSync(":memory:"); database.exec(migration); databases.push(database);
-    const publisher = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => ({ email: "publisher@example.com" }) }, clock: () => 1_700_000_000 });
-    const body = { version: "2.0.0", platform: "windows", arch: "x86_64", objectKey: "private/2.exe", size: 1, sha256: "a".repeat(64), signature: "sig", notes: "notes", pubDate: "2026-09-11T00:00:00Z", status: "production" };
+    const publisher = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => ({ serviceTokenId: "publisher" }) }, clock: () => 1_700_000_000 });
+    const body = { version: "2.0.0", platform: "windows", arch: "x86_64", objectKey: "private/2.exe", size: 1, sha256: "a".repeat(64), signature: "a".repeat(86) + "==", notes: "notes", pubDate: "2026-09-11T00:00:00Z", status: "production" };
     expect((await publisher.fetch(new Request("https://admin.example/api/publisher/releases", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }), { ...env, DB: makeD1(database) }, {} as ExecutionContext)).status).toBe(400);
+  });
+
+  it("rejects cross-site human writes before changing data and disables, rather than deletes, an admin", async () => {
+    const { worker, env, database } = fixture("owner");
+    database.prepare("INSERT INTO admins (id,email,password_hash,role,created_at) VALUES ('admin-2','other@example.com','', 'owner', 1)").run();
+    const csrf = await worker.fetch(new Request("https://admin.example/api/admin/activation-codes", { method: "POST", headers: { origin: "https://evil.example", "content-type": "text/plain", "sec-fetch-site": "cross-site" }, body: "{}" }), env, {} as ExecutionContext);
+    expect(csrf.status).toBe(403);
+    expect(database.prepare("SELECT count(*) AS count FROM activation_codes").get()).toEqual({ count: 0 });
+    const disabled = await worker.fetch(new Request("https://admin.example/api/admin/admins/admin-1", { method: "DELETE", headers: { origin: "https://admin.example" } }), env, {} as ExecutionContext);
+    expect(disabled.status).toBe(200);
+    expect(database.prepare("SELECT disabled_at FROM admins WHERE id='admin-1'").get()).toEqual({ disabled_at: 1_700_000_000 });
+    expect((database.prepare("SELECT count(*) AS count FROM audit_logs WHERE admin_id='admin-1'").get() as { count: number }).count).toBeGreaterThanOrEqual(1);
   });
 });
