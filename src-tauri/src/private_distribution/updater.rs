@@ -340,16 +340,16 @@ fn write_receipt_temp(
 }
 
 fn create_pending_receipt(root: &Path, receipt: &PendingInstallReceipt) -> std::io::Result<()> {
-    write_receipt_temp(root, receipt)?
+    let file = write_receipt_temp(root, receipt)?
         .persist_noclobber(root.join(RECEIPT_FILE))
         .map_err(|error| error.error)?;
-    Ok(())
+    file.sync_all()
 }
 
 fn write_pending_receipt(root: &Path, receipt: &PendingInstallReceipt) -> std::io::Result<()> {
     let file = write_receipt_temp(root, receipt)?;
-    file.persist(root.join(RECEIPT_FILE)).map_err(|e| e.error)?;
-    Ok(())
+    let file = file.persist(root.join(RECEIPT_FILE)).map_err(|e| e.error)?;
+    file.sync_all()
 }
 
 fn read_pending_receipt_with(
@@ -424,9 +424,9 @@ fn read_verified_cache(artifact: &CachedArtifact) -> std::io::Result<Vec<u8>> {
 }
 
 /// Security-sensitive final boundary. `verified_bytes` must be the single
-/// read-and-digested cache snapshot. After online renewal completes, only the
-/// in-memory shutdown/busy gates and the receipt write may precede invoking
-/// the installer.
+/// read-and-digested cache snapshot and the durable receipt must already exist.
+/// After the busy snapshot resolves, shutdown is synchronously rechecked and
+/// the installer is invoked without another await, file operation or telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalInstallError {
     AuthorizationOrSafety,
@@ -434,12 +434,38 @@ enum FinalInstallError {
     Install,
 }
 
-async fn final_install_gate<Renew, RenewFuture, Busy, BusyFuture, Write, Install, InstallFuture>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalInstallDisposition {
+    Succeeded,
+    Failed {
+        cleanup_receipt: bool,
+        report_install_failed: bool,
+    },
+}
+
+fn final_install_disposition(result: Result<(), FinalInstallError>) -> FinalInstallDisposition {
+    match result {
+        Ok(()) => FinalInstallDisposition::Succeeded,
+        Err(FinalInstallError::AuthorizationOrSafety) => FinalInstallDisposition::Failed {
+            cleanup_receipt: true,
+            report_install_failed: false,
+        },
+        Err(FinalInstallError::Receipt) => FinalInstallDisposition::Failed {
+            cleanup_receipt: false,
+            report_install_failed: false,
+        },
+        Err(FinalInstallError::Install) => FinalInstallDisposition::Failed {
+            cleanup_receipt: true,
+            report_install_failed: true,
+        },
+    }
+}
+
+async fn final_install_gate<Renew, RenewFuture, Busy, BusyFuture, Install>(
     verified_bytes: Vec<u8>,
     renew: Renew,
-    shutting_down: impl FnOnce() -> bool,
     busy_is_safe: Busy,
-    write_receipt: Write,
+    shutting_down: impl FnOnce() -> bool,
     install: Install,
 ) -> Result<(), FinalInstallError>
 where
@@ -447,20 +473,59 @@ where
     RenewFuture: Future<Output = Result<(), ()>>,
     Busy: FnOnce() -> BusyFuture,
     BusyFuture: Future<Output = bool>,
-    Write: FnOnce() -> std::io::Result<()>,
-    Install: FnOnce(Vec<u8>) -> InstallFuture,
-    InstallFuture: Future<Output = Result<(), ()>>,
+    Install: FnOnce(Vec<u8>) -> Result<(), ()>,
 {
     renew()
         .await
         .map_err(|_| FinalInstallError::AuthorizationOrSafety)?;
-    if shutting_down() || !busy_is_safe().await {
+    if !busy_is_safe().await || shutting_down() {
         return Err(FinalInstallError::AuthorizationOrSafety);
     }
+    install(verified_bytes).map_err(|_| FinalInstallError::Install)
+}
+
+async fn final_install_with_receipt<Write, Renew, RenewFuture, Busy, BusyFuture, Install>(
+    verified_bytes: Vec<u8>,
+    write_receipt: Write,
+    renew: Renew,
+    busy_is_safe: Busy,
+    shutting_down: impl FnOnce() -> bool,
+    install: Install,
+) -> Result<(), FinalInstallError>
+where
+    Write: FnOnce() -> std::io::Result<()>,
+    Renew: FnOnce() -> RenewFuture,
+    RenewFuture: Future<Output = Result<(), ()>>,
+    Busy: FnOnce() -> BusyFuture,
+    BusyFuture: Future<Output = bool>,
+    Install: FnOnce(Vec<u8>) -> Result<(), ()>,
+{
     write_receipt().map_err(|_| FinalInstallError::Receipt)?;
-    install(verified_bytes)
-        .await
-        .map_err(|_| FinalInstallError::Install)
+    final_install_gate(verified_bytes, renew, busy_is_safe, shutting_down, install).await
+}
+
+fn cleanup_failed_receipt_with<Write, Remove>(
+    root: &Path,
+    receipt: &PendingInstallReceipt,
+    write: Write,
+    remove: Remove,
+) -> bool
+where
+    Write: FnOnce(&Path, &PendingInstallReceipt) -> std::io::Result<()>,
+    Remove: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let mut cleanup_receipt = receipt.clone();
+    cleanup_receipt.state = PendingInstallState::CleanupRequired;
+    if write(root, &cleanup_receipt).is_err() {
+        return false;
+    }
+    remove_acknowledged_receipt_with(&root.join(RECEIPT_FILE), remove)
+}
+
+fn cleanup_failed_receipt(root: &Path, receipt: &PendingInstallReceipt) -> bool {
+    cleanup_failed_receipt_with(root, receipt, write_pending_receipt, |path| {
+        std::fs::remove_file(path)
+    })
 }
 
 #[cfg(feature = "gui")]
@@ -707,51 +772,43 @@ impl PrivateUpdateCoordinator {
         };
         let update = update.clone();
         self.set_status(UpdatePhase::Installing, version.clone());
-        let install_result = final_install_gate(
+        let install_result = final_install_with_receipt(
             install_bytes,
+            || create_pending_receipt(cache_root, &receipt),
             || async {
                 authorization
                     .online_authorized_credential()
                     .await
                     .map(|_| ())
             },
-            || self.shutting_down.load(Ordering::Acquire),
             || async { is_safe_snapshot(&busy.snapshot().await) },
-            || create_pending_receipt(cache_root, &receipt),
-            move |bytes| async move {
-                match tauri::async_runtime::spawn_blocking(move || update.install(bytes)).await {
-                    Ok(Ok(())) => Ok(()),
-                    _ => Err(()),
-                }
-            },
+            || self.shutting_down.load(Ordering::Acquire),
+            move |bytes| update.install(bytes).map_err(|_| ()),
         )
         .await;
-        if install_result == Err(FinalInstallError::Install) {
-            // If receipt creation succeeded but install failed, convert it to
-            // explicit cleanup ownership before attempting deletion. If the
-            // transition or delete fails, reconciliation blocks future writes.
-            if cache_root.join(RECEIPT_FILE).exists() {
-                let mut cleanup_receipt = receipt;
-                cleanup_receipt.state = PendingInstallState::CleanupRequired;
-                if write_pending_receipt(cache_root, &cleanup_receipt).is_ok() {
-                    let _ =
-                        remove_acknowledged_receipt_with(&cache_root.join(RECEIPT_FILE), |path| {
-                            std::fs::remove_file(path)
-                        });
+        match final_install_disposition(install_result) {
+            FinalInstallDisposition::Succeeded => true,
+            FinalInstallDisposition::Failed {
+                cleanup_receipt,
+                report_install_failed,
+            } => {
+                if cleanup_receipt {
+                    let _ = cleanup_failed_receipt(cache_root, &receipt);
                 }
+                if report_install_failed {
+                    let _ = client
+                        .report_event(
+                            &token,
+                            Some(&release_id),
+                            &current_version,
+                            "install_failed",
+                        )
+                        .await;
+                }
+                self.set_status(UpdatePhase::Failed, version);
+                false
             }
-            let _ = client
-                .report_event(
-                    &token,
-                    Some(&release_id),
-                    &current_version,
-                    "install_failed",
-                )
-                .await;
-            self.set_status(UpdatePhase::Failed, version);
-            return false;
         }
-        true
     }
 
     async fn reconcile_pending_install(
@@ -1141,8 +1198,9 @@ mod tests {
             let installs = Arc::new(AtomicUsize::new(0));
             let install_spy = installs.clone();
             let shutting_down = case == "shutdown";
-            let result = final_install_gate(
+            let result = final_install_with_receipt(
                 vec![1, 2, 3],
+                || Ok(()),
                 || async move {
                     if case == "revoked" {
                         Err(())
@@ -1150,12 +1208,11 @@ mod tests {
                         Ok(())
                     }
                 },
-                || shutting_down,
                 || async move { case != "busy" },
-                || Ok(()),
+                || shutting_down,
                 move |_| {
                     install_spy.fetch_add(1, Ordering::Relaxed);
-                    async { Ok(()) }
+                    Ok(())
                 },
             )
             .await;
@@ -1167,25 +1224,154 @@ mod tests {
     async fn final_install_gate_does_not_install_when_receipt_creation_is_blocked() {
         let installs = Arc::new(AtomicUsize::new(0));
         let install_spy = installs.clone();
-        let result = final_install_gate(
+        let result = final_install_with_receipt(
             vec![1, 2, 3],
-            || async { Ok(()) },
-            || false,
-            || async { true },
             || {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "owned",
                 ))
             },
+            || async { Ok(()) },
+            || async { true },
+            || false,
             move |_| {
                 install_spy.fetch_add(1, Ordering::Relaxed);
-                async { Ok(()) }
+                Ok(())
             },
         )
         .await;
         assert_eq!(result, Err(FinalInstallError::Receipt));
         assert_eq!(installs.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn final_install_gate_rechecks_shutdown_after_busy_snapshot_await() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flip_shutdown = shutdown.clone();
+        let read_shutdown = shutdown.clone();
+        let installs = Arc::new(AtomicUsize::new(0));
+        let install_spy = installs.clone();
+        let result = final_install_with_receipt(
+            vec![1, 2, 3],
+            || Ok(()),
+            || async { Ok(()) },
+            move || async move {
+                tokio::task::yield_now().await;
+                flip_shutdown.store(true, Ordering::Release);
+                true
+            },
+            move || read_shutdown.load(Ordering::Acquire),
+            move |_| {
+                install_spy.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err(FinalInstallError::AuthorizationOrSafety));
+        assert_eq!(installs.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn final_install_gate_rechecks_shutdown_changed_during_receipt_fsync() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flip_shutdown = shutdown.clone();
+        let read_shutdown = shutdown.clone();
+        let installs = Arc::new(AtomicUsize::new(0));
+        let install_spy = installs.clone();
+        let result = final_install_with_receipt(
+            vec![1, 2, 3],
+            move || {
+                flip_shutdown.store(true, Ordering::Release);
+                Ok(())
+            },
+            || async { Ok(()) },
+            || async { true },
+            move || read_shutdown.load(Ordering::Acquire),
+            move |_| {
+                install_spy.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err(FinalInstallError::AuthorizationOrSafety));
+        assert_eq!(installs.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn final_install_gate_observes_busy_started_during_receipt_fsync() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let start_busy = busy.clone();
+        let read_busy = busy.clone();
+        let installs = Arc::new(AtomicUsize::new(0));
+        let install_spy = installs.clone();
+        let result = final_install_with_receipt(
+            vec![1, 2, 3],
+            move || {
+                start_busy.store(true, Ordering::Release);
+                Ok(())
+            },
+            || async { Ok(()) },
+            move || async move { !read_busy.load(Ordering::Acquire) },
+            || false,
+            move |_| {
+                install_spy.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err(FinalInstallError::AuthorizationOrSafety));
+        assert_eq!(installs.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn every_final_install_error_fails_and_uses_the_expected_cleanup_policy() {
+        assert_eq!(
+            final_install_disposition(Ok(())),
+            FinalInstallDisposition::Succeeded
+        );
+        for (error, cleanup_receipt, report_install_failed) in [
+            (FinalInstallError::AuthorizationOrSafety, true, false),
+            (FinalInstallError::Receipt, false, false),
+            (FinalInstallError::Install, true, true),
+        ] {
+            let disposition = final_install_disposition(Err(error));
+            assert_eq!(
+                disposition,
+                FinalInstallDisposition::Failed {
+                    cleanup_receipt,
+                    report_install_failed,
+                }
+            );
+            let mut schedule = CheckSchedule::default();
+            schedule.record_failure();
+            assert_eq!(schedule.next_delay(), Duration::from_secs(15 * 60));
+        }
+    }
+    #[test]
+    fn failed_gate_receipt_keeps_cleanup_ownership_until_next_scheduler_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = PendingInstallReceipt {
+            release_id: "release_1".into(),
+            target_version: "2.22.0".into(),
+            client_event_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            state: PendingInstallState::AwaitingRelaunch,
+        };
+        create_pending_receipt(root.path(), &receipt).unwrap();
+        assert!(!cleanup_failed_receipt_with(
+            root.path(),
+            &receipt,
+            write_pending_receipt,
+            |_| Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "locked"
+            )),
+        ));
+        assert_eq!(
+            read_pending_receipt(root.path()).unwrap().unwrap().state,
+            PendingInstallState::CleanupRequired
+        );
+        let path = root.path().join(RECEIPT_FILE);
+        assert!(remove_acknowledged_receipt_with(&path, |path| {
+            std::fs::remove_file(path)
+        }));
+        assert!(!path.exists());
     }
     #[test]
     fn cached_digest_rejects_actual_file_tampering_before_install() {
