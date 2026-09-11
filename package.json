@@ -40,6 +40,7 @@
     "test:room-streamer:e2e": "playwright test -c playwright.room-streamer.config.ts",
     "test:room-streamer": "npm run test:room-streamer:model && npm run test:room-streamer:e2e",
     "test:anchor-knowledge": "node --loader ts-node/esm src/lib/anchorKnowledge.test.ts",
+    "test:anchor-learning-case": "node --loader ts-node/esm src/lib/anchorLearningCase.test.ts",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
