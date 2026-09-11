@@ -25,7 +25,7 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function error(code: LicenseErrorCode | "INVALID_UPDATE_REQUEST" | "DOWNLOAD_UNAVAILABLE" | "ARTIFACT_NOT_FOUND" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "INTERNAL_ERROR", message: string, status: number): Response {
+function error(code: LicenseErrorCode | "INVALID_UPDATE_REQUEST" | "DOWNLOAD_UNAVAILABLE" | "ARTIFACT_NOT_FOUND" | "UPDATE_RETRY" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "INTERNAL_ERROR", message: string, status: number): Response {
   return json({ error: { code, message } }, status);
 }
 
@@ -215,8 +215,8 @@ export default {
     } catch (cause) {
       if (cause instanceof LicenseError) return error(cause.code, cause.message, errorStatus[cause.code]);
       if (cause instanceof UpdateError) {
-        const status = cause.code === "INVALID_REQUEST" ? 400 : cause.code === "ARTIFACT_NOT_FOUND" ? 404 : 403;
-        const code = cause.code === "INVALID_REQUEST" ? "INVALID_UPDATE_REQUEST" : cause.code === "ARTIFACT_NOT_FOUND" ? "ARTIFACT_NOT_FOUND" : "DOWNLOAD_UNAVAILABLE";
+        const status = cause.code === "INVALID_REQUEST" ? 400 : cause.code === "ARTIFACT_NOT_FOUND" ? 404 : cause.code === "RETRYABLE" ? 503 : 403;
+        const code = cause.code === "INVALID_REQUEST" ? "INVALID_UPDATE_REQUEST" : cause.code === "ARTIFACT_NOT_FOUND" ? "ARTIFACT_NOT_FOUND" : cause.code === "RETRYABLE" ? "UPDATE_RETRY" : "DOWNLOAD_UNAVAILABLE";
         return error(code, cause.message, status);
       }
       return error("INTERNAL_ERROR", "Unable to process this request.", 500);

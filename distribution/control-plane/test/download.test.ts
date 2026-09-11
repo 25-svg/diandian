@@ -8,7 +8,7 @@ import { sha256Hex } from "../src/crypto";
 const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
 const context = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
 
-function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void): D1Database {
+function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void, beforeBatch?: () => void): D1Database {
   const statement = (sql: string, values: unknown[] = []) => ({
     sql,
     values,
@@ -24,6 +24,7 @@ function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void):
   return {
     prepare: (sql: string) => statement(sql) as unknown as D1PreparedStatement,
     batch: async (statements: D1PreparedStatement[]) => {
+      beforeBatch?.();
       database.exec("BEGIN IMMEDIATE");
       try {
         const results = (statements as unknown as Array<{ sql: string; values: unknown[] }>).map(({ sql, values }) => {
@@ -51,13 +52,13 @@ describe("private update download and events", () => {
   const databases: DatabaseSync[] = [];
   afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-  async function fixture(afterDeviceAuthentication?: () => void) {
+  async function fixture(afterDeviceAuthentication?: () => void, beforeBatch?: () => void) {
     const database = new DatabaseSync(":memory:");
     database.exec(migration);
     databases.push(database);
     const objects = new Map<string, R2ObjectBody>();
     const env = {
-      DB: makeD1(database, afterDeviceAuthentication),
+      DB: makeD1(database, afterDeviceAuthentication, beforeBatch),
       ARTIFACTS: { get: async (key: string) => objects.get(key) ?? null } as unknown as R2Bucket,
       LEASE_PRIVATE_JWK: "{}",
     };
@@ -159,6 +160,7 @@ describe("private update download and events", () => {
     expect(forged.status).toBe(400);
     expect(accepted.status).toBe(204);
     expect(invalidEvent.status).toBe(400);
+    expect(database.prepare("SELECT count(*) AS count FROM update_events").get()).toEqual({ count: 1 });
     expect(database.prepare("SELECT device_id, release_id, current_version, event_type FROM update_events").get()).toEqual({ device_id: "device-1", release_id: "release-1", current_version: "2.22.0", event_type: "install_succeeded" });
     expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.22.0" });
   });
@@ -245,5 +247,54 @@ describe("private update download and events", () => {
 
     expect(response.status).toBe(204);
     expect(database.prepare("SELECT count(*) AS count FROM download_tickets").get()).toEqual({ count: 0 });
+  });
+
+  it("rejects an install result atomically when its release version changes after the eligibility read", async () => {
+    let database: DatabaseSync;
+    const fixtureResult = await fixture(undefined, () => database.prepare("UPDATE releases SET version = '2.23.0' WHERE id = 'release-1'").run());
+    ({ database } = fixtureResult);
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token);
+    seedRelease(database);
+    seedHistoryTicket(database, "ticket-device-1", "device-1", "release-1");
+
+    const response = await worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ releaseId: "release-1", currentVersion: "2.22.0", eventType: "install_succeeded" }),
+    }), fixtureResult.env, context);
+
+    expect(response.status).toBe(403);
+    expect(database.prepare("SELECT count(*) AS count FROM update_events").get()).toEqual({ count: 0 });
+    expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: null });
+  });
+
+  it("returns retryable failure without recording an event when every install compare-and-swap conflicts", async () => {
+    let database: DatabaseSync;
+    const competingVersions = ["2.20.1", "2.21.0", "2.22.0", "2.22.1"];
+    let index = 0;
+    const fixtureResult = await fixture(undefined, () => {
+      const next = competingVersions[index++];
+      if (next) database.prepare("UPDATE devices SET current_version = ? WHERE id = 'device-1'").run(next);
+    });
+    ({ database } = fixtureResult);
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token);
+    seedRelease(database, "production", "release-23", "2.23.0");
+    seedHistoryTicket(database, "ticket-device-1", "device-1", "release-23");
+    const request = () => worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ releaseId: "release-23", currentVersion: "2.23.0", eventType: "install_succeeded" }),
+    }), fixtureResult.env, context);
+
+    const exhausted = await request();
+    expect(exhausted.status).toBe(503);
+    expect(await exhausted.json()).toEqual({ error: { code: "UPDATE_RETRY", message: "Update state changed; retry the request." } });
+    expect(database.prepare("SELECT count(*) AS count FROM update_events").get()).toEqual({ count: 0 });
+    expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.22.1" });
+
+    const retried = await request();
+    expect(retried.status).toBe(204);
+    expect(database.prepare("SELECT count(*) AS count FROM update_events").get()).toEqual({ count: 1 });
+    expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.23.0" });
   });
 });

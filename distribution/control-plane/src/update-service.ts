@@ -8,7 +8,7 @@ const WINDOWS_TARGET = "windows";
 const WINDOWS_ARCH = "x86_64";
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:(?:0|[1-9]\d*|[0-9A-Za-z-]+)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]+))*)))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
-type UpdateErrorCode = "INVALID_REQUEST" | "TICKET_INVALID" | "ARTIFACT_NOT_FOUND";
+type UpdateErrorCode = "INVALID_REQUEST" | "TICKET_INVALID" | "ARTIFACT_NOT_FOUND" | "RETRYABLE";
 
 export class UpdateError extends Error {
   constructor(public readonly code: UpdateErrorCode, message: string) {
@@ -192,6 +192,10 @@ export class UpdateService {
     if (!eligibility || (input.eventType === "install_succeeded" && eligibility.version !== input.currentVersion)) {
       throw new UpdateError("TICKET_INVALID", "Update event is unavailable.");
     }
+    if (input.eventType === "install_succeeded") {
+      await this.recordInstallSuccess(input.deviceId, input.releaseId, input.currentVersion, eventVersion, now);
+      return;
+    }
     const inserted = await this.db.prepare(
       `INSERT INTO update_events (id, device_id, release_id, current_version, event_type, created_at)
        SELECT ?, d.id, r.id, ?, ?, ?
@@ -201,7 +205,6 @@ export class UpdateService {
          AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = d.id AND dt.release_id = r.id AND dt.purpose = 'update')`,
     ).bind(crypto.randomUUID(), input.currentVersion, input.eventType, now, input.releaseId, input.deviceId).run();
     if (inserted.meta.changes !== 1) throw new UpdateError("TICKET_INVALID", "Update event is unavailable.");
-    if (input.eventType === "install_succeeded") await this.advanceCurrentVersion(input.deviceId, input.releaseId, input.currentVersion, eventVersion, now);
   }
 
   private async eventEligibility(deviceId: string, releaseId: string): Promise<{ version: string; current_version: string | null } | null> {
@@ -213,23 +216,59 @@ export class UpdateService {
     ).bind(releaseId, deviceId).first<{ version: string; current_version: string | null }>();
   }
 
-  private async advanceCurrentVersion(deviceId: string, releaseId: string, version: string, parsedVersion: ParsedVersion, now: number): Promise<void> {
+  private async recordInstallSuccess(deviceId: string, releaseId: string, version: string, parsedVersion: ParsedVersion, now: number): Promise<void> {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const eligibility = await this.eventEligibility(deviceId, releaseId);
-      if (!eligibility) return;
+      if (!eligibility || eligibility.version !== version) throw new UpdateError("TICKET_INVALID", "Update event is unavailable.");
       const current = eligibility.current_version === null ? null : parseVersion(eligibility.current_version);
-      if (current && compareVersions(parsedVersion, current) <= 0) return;
-      const updated = await this.db.prepare(
-        `UPDATE devices SET current_version = ?, last_seen_at = ?
-         WHERE id = ? AND status = 'active' AND current_version IS ?
-           AND EXISTS (
-             SELECT 1 FROM releases r WHERE r.id = ? AND r.status IN ('testing', 'production', 'halted')
-               AND (r.status != 'testing' OR devices.test_group = '1')
-           )
-           AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = devices.id AND dt.release_id = ? AND dt.purpose = 'update')`,
-      ).bind(version, now, deviceId, eligibility.current_version, releaseId, releaseId).run();
-      if (updated.meta.changes === 1) return;
+      if (current && compareVersions(parsedVersion, current) <= 0) {
+        const recorded = await this.insertInstallEvent(deviceId, releaseId, version, now);
+        if (recorded.meta.changes !== 1) throw new UpdateError("TICKET_INVALID", "Update event is unavailable.");
+        return;
+      }
+      const [recorded, advanced] = await this.db.batch([
+        this.installEventStatement(deviceId, releaseId, version, now, eligibility.current_version),
+        this.installVersionStatement(deviceId, releaseId, version, now, eligibility.current_version),
+      ]);
+      if (recorded?.meta.changes === 1 && advanced?.meta.changes === 1) return;
     }
+    throw new UpdateError("RETRYABLE", "Update state changed; retry the request.");
+  }
+
+  private installEventStatement(deviceId: string, releaseId: string, version: string, now: number, expectedCurrent: string | null): D1PreparedStatement {
+    return this.db.prepare(
+      `INSERT INTO update_events (id, device_id, release_id, current_version, event_type, created_at)
+       SELECT ?, d.id, r.id, ?, 'install_succeeded', ?
+       FROM devices d JOIN releases r ON r.id = ?
+       WHERE d.id = ? AND d.status = 'active' AND d.current_version IS ? AND r.version = ?
+         AND r.status IN ('testing', 'production', 'halted')
+         AND (r.status != 'testing' OR d.test_group = '1')
+         AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = d.id AND dt.release_id = r.id AND dt.purpose = 'update')`,
+    ).bind(crypto.randomUUID(), version, now, releaseId, deviceId, expectedCurrent, version);
+  }
+
+  private installVersionStatement(deviceId: string, releaseId: string, version: string, now: number, expectedCurrent: string | null): D1PreparedStatement {
+    return this.db.prepare(
+      `UPDATE devices SET current_version = ?, last_seen_at = ?
+       WHERE id = ? AND status = 'active' AND current_version IS ?
+         AND EXISTS (
+           SELECT 1 FROM releases r WHERE r.id = ? AND r.version = ? AND r.status IN ('testing', 'production', 'halted')
+             AND (r.status != 'testing' OR devices.test_group = '1')
+         )
+         AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = devices.id AND dt.release_id = ? AND dt.purpose = 'update')`,
+    ).bind(version, now, deviceId, expectedCurrent, releaseId, version, releaseId);
+  }
+
+  private async insertInstallEvent(deviceId: string, releaseId: string, version: string, now: number): Promise<D1Result> {
+    return this.db.prepare(
+      `INSERT INTO update_events (id, device_id, release_id, current_version, event_type, created_at)
+       SELECT ?, d.id, r.id, ?, 'install_succeeded', ?
+       FROM devices d JOIN releases r ON r.id = ?
+       WHERE d.id = ? AND d.status = 'active' AND r.version = ?
+         AND r.status IN ('testing', 'production', 'halted')
+         AND (r.status != 'testing' OR d.test_group = '1')
+         AND EXISTS (SELECT 1 FROM download_tickets dt WHERE dt.device_id = d.id AND dt.release_id = r.id AND dt.purpose = 'update')`,
+    ).bind(crypto.randomUUID(), version, now, releaseId, deviceId, version).run();
   }
 
   private now(): number {
