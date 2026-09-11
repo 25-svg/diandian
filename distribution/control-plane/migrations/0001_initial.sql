@@ -19,11 +19,12 @@ CREATE TABLE activation_codes (
          (status = 'used' AND used_by_device_id IS NOT NULL AND used_at IS NOT NULL) OR status = 'revoked')
 );
 CREATE TABLE releases (
-  id TEXT PRIMARY KEY, version TEXT NOT NULL UNIQUE,
+  id TEXT PRIMARY KEY, version TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('draft', 'testing', 'production', 'halted')) DEFAULT 'draft',
   notes TEXT NOT NULL DEFAULT '', pub_date TEXT NOT NULL, object_key TEXT NOT NULL,
   size INTEGER NOT NULL CHECK (size >= 0), sha256 TEXT NOT NULL, platform TEXT NOT NULL,
-  arch TEXT NOT NULL, signature TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  arch TEXT NOT NULL, signature TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  UNIQUE(version, platform, arch)
 );
 CREATE TABLE download_tickets (
   id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, device_id TEXT REFERENCES devices(id),

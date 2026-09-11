@@ -44,4 +44,13 @@ describe("initial D1 migration", () => {
     expect(() => database.prepare("INSERT INTO download_tickets (id, token_hash, device_id, release_id, purpose, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run("ticket-update", "ticket-hash-2", null, "release-1", "update", 3, 1)).toThrow();
     expect(() => database.prepare("INSERT INTO download_tickets (id, token_hash, device_id, release_id, purpose, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run("ticket-foreign-key", "ticket-hash-3", "missing-device", "release-1", "update", 3, 1)).toThrow();
   });
+
+  it("allows a version for different artifacts but rejects duplicate artifact targets", () => {
+    const database = createDatabase();
+    const insertRelease = database.prepare("INSERT INTO releases (id, version, status, notes, pub_date, object_key, size, sha256, platform, arch, signature, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    insertRelease.run("release-windows", "1.0.0", "production", "", "2026-09-11", "releases/windows.zip", 10, "windows-sha", "windows", "x64", "signature", 1, 1);
+    expect(() => insertRelease.run("release-macos", "1.0.0", "production", "", "2026-09-11", "releases/macos.zip", 10, "macos-sha", "darwin", "arm64", "signature", 1, 1)).not.toThrow();
+    expect(() => insertRelease.run("release-windows-duplicate", "1.0.0", "production", "", "2026-09-11", "releases/windows-duplicate.zip", 10, "windows-sha-2", "windows", "x64", "signature", 1, 1)).toThrow();
+  });
 });
