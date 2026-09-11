@@ -42,6 +42,8 @@ export interface LearningCaseSource extends Omit<AnchorKnowledgeSource, "sourceK
 export interface LearningCaseDetail extends Omit<LearningCaseSummary, "evidenceLevel" | "publishedAt"> {
   evidenceLevel: EvidenceLevel;
   evidenceSummary: string;
+  operatorCommentary: string;
+  aiAnalysis: string;
   audienceTrigger: string;
   trainingGoal: string;
   expressionReason: string;
@@ -62,6 +64,7 @@ export interface LearningCaseDetail extends Omit<LearningCaseSummary, "evidenceL
   reviewStatus: AnchorKnowledgeStatus | "retired";
   retiredAt: string | null;
   publishedAt: string | null;
+  isCurrent: boolean;
   lines: LearningCaseLine[];
   sources: LearningCaseSource[];
   tags: string[];
@@ -122,7 +125,10 @@ function isLearningCaseLine(value: unknown): value is LearningCaseLine {
 function isLearningCaseSource(value: unknown): value is LearningCaseSource {
   if (!isRecord(value) || !isNonEmptyString(value.sourceId) || !sourceKinds.has(value.sourceKind as LearningCaseSource["sourceKind"])) return false;
   if (!hasStringFields(value, ["sourceLocator", "transcriptVersion", "transcriptHash", "productFactId", "productFactVersion", "analysisVersion", "contentHash"])) return false;
-  return ["videoId", "startMs", "endMs"].every((field) => value[field] === null || isNonNegativeNumber(value[field]));
+  if (value.videoId !== null && !isNonNegativeNumber(value.videoId)) return false;
+  const { startMs, endMs } = value;
+  if ((startMs === null) !== (endMs === null)) return false;
+  return startMs === null || (isNonNegativeNumber(startMs) && isNonNegativeNumber(endMs) && endMs > startMs);
 }
 
 function hasValidLineOrder(lines: LearningCaseLine[]): boolean {
@@ -141,16 +147,17 @@ export function readLearningCaseDetail(
   if (!isRecord(value) || (scope !== "public" && scope !== "private")) return null;
   if (!hasStringFields(value, [
     "caseId", "assetId", "anchorId", "anchorName", "title", "skill", "productCategory", "sceneContext",
-    "evidenceSummary", "audienceTrigger", "trainingGoal", "expressionReason", "logicReason", "trustReason",
+    "evidenceSummary", "operatorCommentary", "aiAnalysis", "audienceTrigger", "trainingGoal", "expressionReason", "logicReason", "trustReason",
     "actionReason", "reusableOutline", "forbiddenCopy", "traineeReference", "applicableScope", "expiryConditions",
     "reviewDueAt", "videoPath",
   ])) return null;
   if (![value.caseId, value.assetId, value.anchorId].every(isNonEmptyString)) return null;
   if (!stages.has(value.stage as LearningStage) || !difficulties.has(value.difficulty as LearningDifficulty) || !evidenceLevels.has(value.evidenceLevel as EvidenceLevel)) return null;
   if (scope === "public" && value.evidenceLevel === "D") return null;
-  if (!reviewStatuses.has(value.reviewStatus as LearningCaseDetail["reviewStatus"]) || typeof value.internalUseConfirmed !== "boolean") return null;
+  if (!reviewStatuses.has(value.reviewStatus as LearningCaseDetail["reviewStatus"]) || typeof value.internalUseConfirmed !== "boolean" || typeof value.isCurrent !== "boolean") return null;
   if (!isNonNegativeNumber(value.durationMs) || !isNonNegativeNumber(value.videoStartMs) || !isNonNegativeNumber(value.videoEndMs) || value.videoStartMs >= value.videoEndMs) return null;
   if ((value.retiredAt !== null && !isString(value.retiredAt)) || (value.publishedAt !== null && !isString(value.publishedAt))) return null;
+  if (scope === "public" && (value.reviewStatus !== "published" || !isNonEmptyString(value.publishedAt) || value.retiredAt !== null || !value.isCurrent)) return null;
   if (!hasStringArray(value.factSlots) || !hasStringArray(value.tags) || !Array.isArray(value.lines) || !Array.isArray(value.sources)) return null;
   if (!value.lines.every(isLearningCaseLine) || !value.sources.every(isLearningCaseSource) || !hasValidLineOrder(value.lines)) return null;
   return value as unknown as LearningCaseDetail;
