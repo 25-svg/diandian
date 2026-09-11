@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row, Sqlite, Transaction};
@@ -357,6 +357,19 @@ pub struct LearningCaseLineInput {
 pub struct LearningCaseTagInput {
     pub tag_kind: String,
     pub tag_value: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchPublicLearningCasesRequest {
+    #[serde(default)]
+    pub query: String,
+    pub anchor_id: Option<String>,
+    pub stage: Option<String>,
+    pub skill: Option<String>,
+    pub difficulty: Option<String>,
+    #[serde(default)]
+    pub evidence_levels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
@@ -919,6 +932,571 @@ impl Database {
         self.get_anchor_knowledge_asset_unscoped(&asset_id).await
     }
 
+    pub async fn create_anchor_learning_case(
+        &self,
+        request: CreateAnchorLearningCaseRequest,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        let anchor_id = request.anchor_id.trim();
+        let actor_kind = validate_actor_kind(&request.created_by_kind)?;
+        let actor_id = request.created_by_id.trim();
+        let title = request.title.trim();
+        let body = request.body.trim();
+        if anchor_id.is_empty() || actor_id.is_empty() || title.is_empty() || body.is_empty() {
+            return Err(invalid("主播、创建者、标题和正文不能为空"));
+        }
+        validate_sources(&request.sources)?;
+        self.get_anchor_knowledge_profile(anchor_id).await?;
+
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        let mut transaction = pool.begin().await?;
+        let supersedes_asset_id = request
+            .supersedes_asset_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let version = if let Some(supersedes) = supersedes_asset_id {
+            let row = sqlx::query(
+                r#"SELECT assets.anchor_id, assets.asset_type, assets.version,
+                          assets.review_status, assets.is_current
+                   FROM anchor_knowledge_assets assets
+                   JOIN anchor_learning_cases cases ON cases.asset_id = assets.asset_id
+                   WHERE assets.asset_id = ?"#,
+            )
+            .bind(supersedes)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| invalid("被替代的学习案例不存在"))?;
+            if row.get::<String, _>("anchor_id") != anchor_id
+                || row.get::<String, _>("asset_type") != "speech"
+                || row.get::<String, _>("review_status") != "published"
+                || row.get::<i64, _>("is_current") != 1
+            {
+                return Err(invalid("只能为同一主播当前已发布的学习案例创建新版本"));
+            }
+            row.get::<i64, _>("version") + 1
+        } else {
+            1
+        };
+
+        let timestamp = now();
+        let asset_id = format!("asset-{}", uuid::Uuid::new_v4().simple());
+        let case_id = format!("case-{}", uuid::Uuid::new_v4().simple());
+        let product_id = request.product_id.trim();
+        let content_hash = asset_content_hash(anchor_id, "speech", title, body, product_id);
+        let fact_slots_json = serde_json::to_string(&request.fact_slots)
+            .map_err(|_| invalid("事实槽位无法序列化"))?;
+
+        sqlx::query(
+            r#"INSERT INTO anchor_knowledge_assets (
+                asset_id, anchor_id, asset_type, title, body, product_id, review_status,
+                version, supersedes_asset_id, created_by_kind, created_by_id, content_hash,
+                is_current, created_at, updated_at
+              ) VALUES (?, ?, 'speech', ?, ?, ?, 'candidate', ?, ?, ?, ?, ?, 0, ?, ?)"#,
+        )
+        .bind(&asset_id)
+        .bind(anchor_id)
+        .bind(title)
+        .bind(body)
+        .bind(product_id)
+        .bind(version)
+        .bind(supersedes_asset_id)
+        .bind(actor_kind)
+        .bind(actor_id)
+        .bind(&content_hash)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut *transaction)
+        .await?;
+        insert_sources(&mut transaction, &asset_id, &request.sources, &timestamp).await?;
+        sqlx::query(
+            r#"INSERT INTO anchor_learning_cases (
+                case_id, asset_id, stage, skill, product_category, difficulty, evidence_level,
+                evidence_summary, operator_commentary, ai_analysis, scene_context, audience_trigger,
+                training_goal, applicable_scope, expiry_conditions, review_due_at,
+                expression_reason, logic_reason, trust_reason, action_reason, reusable_outline,
+                forbidden_copy, trainee_reference, fact_slots_json, internal_use_confirmed,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&case_id)
+        .bind(&asset_id)
+        .bind(request.stage.trim())
+        .bind(request.skill.trim())
+        .bind(request.product_category.trim())
+        .bind(request.difficulty.trim())
+        .bind(request.evidence_level.trim())
+        .bind(request.evidence_summary.trim())
+        .bind(request.operator_commentary.trim())
+        .bind(request.ai_analysis.trim())
+        .bind(request.scene_context.trim())
+        .bind(request.audience_trigger.trim())
+        .bind(request.training_goal.trim())
+        .bind(request.applicable_scope.trim())
+        .bind(request.expiry_conditions.trim())
+        .bind(request.review_due_at.trim())
+        .bind(request.expression_reason.trim())
+        .bind(request.logic_reason.trim())
+        .bind(request.trust_reason.trim())
+        .bind(request.action_reason.trim())
+        .bind(request.reusable_outline.trim())
+        .bind(request.forbidden_copy.trim())
+        .bind(request.trainee_reference.trim())
+        .bind(&fact_slots_json)
+        .bind(request.internal_use_confirmed)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut *transaction)
+        .await?;
+
+        for (line_order, line) in request.lines.iter().enumerate() {
+            let line_order =
+                i64::try_from(line_order).map_err(|_| DatabaseError::NumberExceedI64Range)?;
+            sqlx::query(
+                r#"INSERT INTO anchor_learning_case_lines (
+                    line_id, case_id, line_order, start_ms, end_ms, original_text,
+                    function_text, timing_reason, technique, trust_mechanism, action_cue,
+                    risk_note, reusable_pattern
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(format!("line-{}", uuid::Uuid::new_v4().simple()))
+            .bind(&case_id)
+            .bind(line_order)
+            .bind(line.start_ms)
+            .bind(line.end_ms)
+            .bind(line.original_text.trim())
+            .bind(line.function_text.trim())
+            .bind(line.timing_reason.trim())
+            .bind(line.technique.trim())
+            .bind(line.trust_mechanism.trim())
+            .bind(line.action_cue.trim())
+            .bind(line.risk_note.trim())
+            .bind(line.reusable_pattern.trim())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        for tag in &request.tags {
+            sqlx::query(
+                "INSERT INTO anchor_learning_case_tags (case_id, tag_kind, tag_value) VALUES (?, ?, ?)",
+            )
+            .bind(&case_id)
+            .bind(tag.tag_kind.trim())
+            .bind(tag.tag_value.trim())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        insert_review_event(
+            &mut transaction,
+            &asset_id,
+            "",
+            "candidate",
+            actor_kind,
+            actor_id,
+            "创建学习案例候选",
+            &timestamp,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.get_anchor_learning_case_unscoped(&case_id).await
+    }
+
+    pub async fn submit_anchor_learning_case(
+        &self,
+        case_id: &str,
+        anchor_id: &str,
+        submitted_by: &str,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        let case_id = case_id.trim();
+        let anchor_id = anchor_id.trim();
+        let submitted_by = submitted_by.trim();
+        if case_id.is_empty() || anchor_id.is_empty() || submitted_by.is_empty() {
+            return Err(invalid("案例、主播和提交人不能为空"));
+        }
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        let mut transaction = pool.begin().await?;
+        let row = sqlx::query(
+            r#"SELECT assets.asset_id, assets.anchor_id, assets.review_status,
+                      cases.evidence_level, cases.internal_use_confirmed,
+                      cases.expression_reason, cases.logic_reason, cases.trust_reason,
+                      cases.action_reason, cases.forbidden_copy, cases.applicable_scope,
+                      cases.expiry_conditions, cases.review_due_at
+               FROM anchor_learning_cases cases
+               JOIN anchor_knowledge_assets assets ON assets.asset_id = cases.asset_id
+               WHERE cases.case_id = ?"#,
+        )
+        .bind(case_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| invalid("学习案例不存在"))?;
+        if row.get::<String, _>("anchor_id") != anchor_id
+            || row.get::<String, _>("review_status") != "candidate"
+        {
+            return Err(invalid("仅所属主播的候选学习案例可以提交审核"));
+        }
+        if row.get::<String, _>("evidence_level") == "D" {
+            return Err(invalid("D 级证据仅可保留为私有候选，不得提交发布审核"));
+        }
+        if row.get::<i64, _>("internal_use_confirmed") != 1 {
+            return Err(invalid("尚未确认仅限内部学习使用"));
+        }
+        for field in [
+            "expression_reason",
+            "logic_reason",
+            "trust_reason",
+            "action_reason",
+        ] {
+            if row.get::<String, _>(field).trim().is_empty() {
+                return Err(invalid("表达、逻辑、信任和行动四层原因必须完整"));
+            }
+        }
+        if row.get::<String, _>("forbidden_copy").trim().is_empty() {
+            return Err(invalid("必须明确禁止照搬的动态信息"));
+        }
+        if row.get::<String, _>("applicable_scope").trim().is_empty()
+            || row.get::<String, _>("expiry_conditions").trim().is_empty()
+        {
+            return Err(invalid("适用范围和失效条件不能为空"));
+        }
+        let review_due_at = row.get::<String, _>("review_due_at");
+        NaiveDate::parse_from_str(review_due_at.trim(), "%Y-%m-%d")
+            .map_err(|_| invalid("复审日期必须是有效的 YYYY-MM-DD"))?;
+
+        let asset_id = row.get::<String, _>("asset_id");
+        let video_ranges = sqlx::query_as::<_, (i64, i64)>(
+            r#"SELECT start_ms, end_ms FROM anchor_knowledge_sources
+               WHERE asset_id = ? AND source_kind = 'video'
+                 AND start_ms IS NOT NULL AND end_ms IS NOT NULL"#,
+        )
+        .bind(&asset_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if video_ranges.is_empty() {
+            return Err(invalid("学习案例必须引用带时间范围的视频来源"));
+        }
+        let transcript_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM anchor_knowledge_sources WHERE asset_id = ? AND source_kind = 'transcript'",
+        )
+        .bind(&asset_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if transcript_count < 1 {
+            return Err(invalid("学习案例必须引用逐字稿来源"));
+        }
+        let lines = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT start_ms, end_ms FROM anchor_learning_case_lines WHERE case_id = ? ORDER BY line_order",
+        )
+        .bind(case_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if lines.is_empty() {
+            return Err(invalid("学习案例至少需要一行真实话术"));
+        }
+        if lines.iter().any(|(line_start, line_end)| {
+            !video_ranges
+                .iter()
+                .any(|(video_start, video_end)| line_start >= video_start && line_end <= video_end)
+        }) {
+            return Err(invalid("话术时间范围必须位于引用视频片段内"));
+        }
+
+        let timestamp = now();
+        let result = sqlx::query(
+            r#"UPDATE anchor_knowledge_assets
+               SET review_status = 'pending_review', submitted_at = ?, updated_at = ?
+               WHERE asset_id = ? AND anchor_id = ? AND review_status = 'candidate'"#,
+        )
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(&asset_id)
+        .bind(anchor_id)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(invalid("学习案例状态已变化，请刷新后重试"));
+        }
+        insert_review_event(
+            &mut transaction,
+            &asset_id,
+            "candidate",
+            "pending_review",
+            "human",
+            submitted_by,
+            "提交学习案例审核",
+            &timestamp,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.get_anchor_learning_case_unscoped(case_id).await
+    }
+
+    pub async fn review_anchor_learning_case(
+        &self,
+        case_id: &str,
+        anchor_id: &str,
+        reviewer_id: &str,
+        reason: &str,
+        published_relative_path: &str,
+        published_file_hash: &str,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        let case = self
+            .get_anchor_learning_case_unscoped(case_id.trim())
+            .await?;
+        self.review_anchor_knowledge_asset(
+            ReviewAnchorKnowledgeAssetRequest {
+                anchor_id: anchor_id.trim().to_string(),
+                asset_id: case.asset_id,
+                decision: "publish".into(),
+                reviewer_id: reviewer_id.trim().to_string(),
+                reason: reason.trim().to_string(),
+            },
+            Some(published_relative_path),
+            Some(published_file_hash),
+        )
+        .await?;
+        self.get_anchor_learning_case_unscoped(case_id.trim()).await
+    }
+
+    pub async fn reject_anchor_learning_case(
+        &self,
+        case_id: &str,
+        anchor_id: &str,
+        reviewer_id: &str,
+        reason: &str,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        let case = self
+            .get_anchor_learning_case_unscoped(case_id.trim())
+            .await?;
+        self.review_anchor_knowledge_asset(
+            ReviewAnchorKnowledgeAssetRequest {
+                anchor_id: anchor_id.trim().to_string(),
+                asset_id: case.asset_id,
+                decision: "reject".into(),
+                reviewer_id: reviewer_id.trim().to_string(),
+                reason: reason.trim().to_string(),
+            },
+            None,
+            None,
+        )
+        .await?;
+        self.get_anchor_learning_case_unscoped(case_id.trim()).await
+    }
+
+    pub async fn search_public_learning_cases(
+        &self,
+        request: SearchPublicLearningCasesRequest,
+    ) -> Result<Vec<LearningCaseRow>, DatabaseError> {
+        let anchor_id = request.anchor_id.as_deref().unwrap_or_default().trim();
+        let stage = request.stage.as_deref().unwrap_or_default().trim();
+        let skill = request.skill.as_deref().unwrap_or_default().trim();
+        let difficulty = request.difficulty.as_deref().unwrap_or_default().trim();
+        if !stage.is_empty()
+            && !matches!(
+                stage,
+                "opening"
+                    | "traffic"
+                    | "needs"
+                    | "explanation"
+                    | "objection"
+                    | "conversion"
+                    | "after_sales"
+                    | "retention"
+            )
+        {
+            return Err(invalid("公开案例阶段筛选无效"));
+        }
+        if !difficulty.is_empty() && !matches!(difficulty, "beginner" | "intermediate" | "advanced")
+        {
+            return Err(invalid("公开案例难度筛选无效"));
+        }
+        let mut evidence_levels = request
+            .evidence_levels
+            .iter()
+            .map(|level| level.trim())
+            .filter(|level| !level.is_empty())
+            .collect::<Vec<_>>();
+        evidence_levels.sort_unstable();
+        evidence_levels.dedup();
+        if evidence_levels
+            .iter()
+            .any(|level| !matches!(*level, "A" | "B" | "C"))
+        {
+            return Err(invalid("公开案例证据等级仅允许 A、B、C"));
+        }
+        let evidence_filter = evidence_levels.join(",");
+        let query = request.query.trim();
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        Ok(sqlx::query_as::<_, LearningCaseRow>(
+            r#"SELECT cases.case_id, cases.asset_id, cases.stage, cases.skill,
+                      cases.product_category, cases.difficulty, cases.evidence_level,
+                      cases.evidence_summary, cases.operator_commentary, cases.ai_analysis,
+                      cases.scene_context, cases.audience_trigger, cases.training_goal,
+                      cases.applicable_scope, cases.expiry_conditions, cases.review_due_at,
+                      cases.expression_reason, cases.logic_reason, cases.trust_reason,
+                      cases.action_reason, cases.reusable_outline, cases.forbidden_copy,
+                      cases.trainee_reference, cases.fact_slots_json,
+                      cases.internal_use_confirmed, cases.retired_at, cases.retired_by,
+                      cases.retire_reason, cases.created_at, cases.updated_at
+               FROM anchor_learning_cases cases
+               JOIN anchor_knowledge_assets assets ON assets.asset_id = cases.asset_id
+               WHERE assets.review_status = 'published'
+                 AND assets.is_current = 1
+                 AND cases.retired_at IS NULL
+                 AND cases.evidence_level IN ('A','B','C')
+                 AND (? = '' OR assets.anchor_id = ?)
+                 AND (? = '' OR cases.stage = ?)
+                 AND (? = '' OR cases.skill = ?)
+                 AND (? = '' OR cases.difficulty = ?)
+                 AND (? = 1 OR instr(',' || ? || ',', ',' || cases.evidence_level || ',') > 0)
+                 AND (? = '' OR assets.title LIKE '%' || ? || '%'
+                              OR assets.body LIKE '%' || ? || '%'
+                              OR cases.skill LIKE '%' || ? || '%'
+                              OR cases.scene_context LIKE '%' || ? || '%')
+               ORDER BY assets.published_at DESC, cases.case_id
+               LIMIT 200"#,
+        )
+        .bind(anchor_id)
+        .bind(anchor_id)
+        .bind(stage)
+        .bind(stage)
+        .bind(skill)
+        .bind(skill)
+        .bind(difficulty)
+        .bind(difficulty)
+        .bind(if evidence_levels.is_empty() {
+            1_i64
+        } else {
+            0_i64
+        })
+        .bind(&evidence_filter)
+        .bind(query)
+        .bind(query)
+        .bind(query)
+        .bind(query)
+        .bind(query)
+        .fetch_all(&pool)
+        .await?)
+    }
+
+    pub async fn get_anchor_learning_case(
+        &self,
+        requester_anchor_id: &str,
+        scope: &str,
+        case_id: &str,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        let case_id = case_id.trim();
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        let access = sqlx::query(
+            r#"SELECT assets.anchor_id, assets.review_status, assets.is_current,
+                      cases.retired_at, cases.evidence_level
+               FROM anchor_learning_cases cases
+               JOIN anchor_knowledge_assets assets ON assets.asset_id = cases.asset_id
+               WHERE cases.case_id = ?"#,
+        )
+        .bind(case_id)
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| invalid("学习案例不存在"))?;
+        match scope.trim() {
+            "private"
+                if !requester_anchor_id.trim().is_empty()
+                    && access.get::<String, _>("anchor_id") == requester_anchor_id.trim() => {}
+            "public" | "team"
+                if access.get::<String, _>("review_status") == "published"
+                    && access.get::<i64, _>("is_current") == 1
+                    && access.get::<Option<String>, _>("retired_at").is_none()
+                    && matches!(
+                        access.get::<String, _>("evidence_level").as_str(),
+                        "A" | "B" | "C"
+                    ) => {}
+            "private" | "public" | "team" => return Err(invalid("无权读取该学习案例")),
+            _ => return Err(invalid("案例读取 scope 必须是 private 或 public")),
+        }
+        self.get_anchor_learning_case_unscoped(case_id).await
+    }
+
+    pub async fn retire_anchor_learning_case(
+        &self,
+        case_id: &str,
+        retired_by: &str,
+        reason: &str,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        let case_id = case_id.trim();
+        let retired_by = retired_by.trim();
+        let reason = reason.trim();
+        if case_id.is_empty() || retired_by.is_empty() || reason.is_empty() {
+            return Err(invalid("案例、下架人和下架原因不能为空"));
+        }
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        let mut transaction = pool.begin().await?;
+        let row = sqlx::query(
+            r#"SELECT assets.asset_id, assets.review_status, assets.is_current, cases.retired_at
+               FROM anchor_learning_cases cases
+               JOIN anchor_knowledge_assets assets ON assets.asset_id = cases.asset_id
+               WHERE cases.case_id = ?"#,
+        )
+        .bind(case_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| invalid("学习案例不存在"))?;
+        if row.get::<String, _>("review_status") != "published"
+            || row.get::<i64, _>("is_current") != 1
+            || row.get::<Option<String>, _>("retired_at").is_some()
+        {
+            return Err(invalid("仅当前已发布且未下架的学习案例可以下架"));
+        }
+        let asset_id = row.get::<String, _>("asset_id");
+        let timestamp = now();
+        sqlx::query(
+            r#"UPDATE anchor_learning_cases
+               SET retired_at = ?, retired_by = ?, retire_reason = ?, updated_at = ?
+               WHERE case_id = ? AND retired_at IS NULL"#,
+        )
+        .bind(&timestamp)
+        .bind(retired_by)
+        .bind(reason)
+        .bind(&timestamp)
+        .bind(case_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE anchor_knowledge_assets SET is_current = 0, updated_at = ? WHERE asset_id = ?",
+        )
+        .bind(&timestamp)
+        .bind(&asset_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM anchor_knowledge_search_index WHERE asset_id = ?")
+            .bind(&asset_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        self.get_anchor_learning_case_unscoped(case_id).await
+    }
+
     pub async fn submit_anchor_knowledge_asset(
         &self,
         request: SubmitAnchorKnowledgeAssetRequest,
@@ -1426,6 +2004,35 @@ impl Database {
         Ok(count)
     }
 
+    async fn get_anchor_learning_case_unscoped(
+        &self,
+        case_id: &str,
+    ) -> Result<LearningCaseRow, DatabaseError> {
+        if case_id.trim().is_empty() {
+            return Err(invalid("case_id 不能为空"));
+        }
+        let pool = self
+            .db
+            .read()
+            .await
+            .clone()
+            .ok_or(DatabaseError::NotFound)?;
+        sqlx::query_as::<_, LearningCaseRow>(
+            r#"SELECT case_id, asset_id, stage, skill, product_category, difficulty,
+                      evidence_level, evidence_summary, operator_commentary, ai_analysis,
+                      scene_context, audience_trigger, training_goal, applicable_scope,
+                      expiry_conditions, review_due_at, expression_reason, logic_reason,
+                      trust_reason, action_reason, reusable_outline, forbidden_copy,
+                      trainee_reference, fact_slots_json, internal_use_confirmed, retired_at,
+                      retired_by, retire_reason, created_at, updated_at
+               FROM anchor_learning_cases WHERE case_id = ?"#,
+        )
+        .bind(case_id.trim())
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| invalid("学习案例不存在"))
+    }
+
     async fn get_anchor_knowledge_asset_unscoped(
         &self,
         asset_id: &str,
@@ -1489,6 +2096,9 @@ mod tests {
             .unwrap();
         pool.execute("PRAGMA foreign_keys = ON").await.unwrap();
         pool.execute(ANCHOR_KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        pool.execute(ANCHOR_LEARNING_CASE_MIGRATION_SQL)
+            .await
+            .unwrap();
         let database = Database::new();
         database.set(pool).await;
         database
@@ -1654,6 +2264,381 @@ mod tests {
         assert!(update_error
             .to_string()
             .contains("learning case asset must be speech"));
+    }
+
+    fn valid_learning_case_request(
+        anchor_id: &str,
+        evidence_level: &str,
+    ) -> CreateAnchorLearningCaseRequest {
+        CreateAnchorLearningCaseRequest {
+            anchor_id: anchor_id.into(),
+            title: "价格异议处理".into(),
+            body: "先确认需求再提供证据".into(),
+            product_id: "camera-1".into(),
+            stage: "objection".into(),
+            skill: "价格异议处理".into(),
+            product_category: "相机".into(),
+            difficulty: "beginner".into(),
+            evidence_level: evidence_level.into(),
+            evidence_summary: "运营已核对评论和现场表现".into(),
+            operator_commentary: "运营点评：先确认需求再回应价格".into(),
+            ai_analysis: "AI分析：追问可降低直接比价风险".into(),
+            scene_context: "观众认为价格偏高".into(),
+            audience_trigger: "为什么比别家贵".into(),
+            training_goal: "先确认用途再展示证据".into(),
+            applicable_scope: "二手相机价格异议".into(),
+            expiry_conditions: "价格、库存或售后规则变化时复审".into(),
+            review_due_at: "2026-12-31".into(),
+            expression_reason: "短句承接".into(),
+            logic_reason: "先需求后证据".into(),
+            trust_reason: "只引用已核验事实".into(),
+            action_reason: "引导继续看实物".into(),
+            reusable_outline: "承接→追问→证据→行动".into(),
+            forbidden_copy: "价格、库存、赠品、成色、售后和链接不得照搬".into(),
+            trainee_reference: "先确认您的[用途]，再看[已核验事实]".into(),
+            fact_slots: vec!["用途".into(), "已核验事实".into()],
+            internal_use_confirmed: true,
+            created_by_kind: "human".into(),
+            created_by_id: "operator".into(),
+            supersedes_asset_id: None,
+            sources: vec![
+                AnchorKnowledgeSourceInput {
+                    source_kind: "video".into(),
+                    source_locator: "C:/fixtures/case.mp4".into(),
+                    video_id: Some(1),
+                    start_ms: Some(1000),
+                    end_ms: Some(4000),
+                    transcript_version: String::new(),
+                    transcript_hash: String::new(),
+                    product_fact_id: String::new(),
+                    product_fact_version: String::new(),
+                    analysis_version: String::new(),
+                    content_hash: "video-hash".into(),
+                },
+                AnchorKnowledgeSourceInput {
+                    source_kind: "transcript".into(),
+                    source_locator: "video:1".into(),
+                    video_id: Some(1),
+                    start_ms: Some(1000),
+                    end_ms: Some(4000),
+                    transcript_version: "v1".into(),
+                    transcript_hash: "transcript-hash".into(),
+                    product_fact_id: String::new(),
+                    product_fact_version: String::new(),
+                    analysis_version: String::new(),
+                    content_hash: "transcript-source-hash".into(),
+                },
+            ],
+            lines: vec![LearningCaseLineInput {
+                start_ms: 1000,
+                end_ms: 2500,
+                original_text: "先问用途".into(),
+                function_text: "需求确认".into(),
+                timing_reason: "承接评论".into(),
+                technique: "追问".into(),
+                trust_mechanism: String::new(),
+                action_cue: "停顿".into(),
+                risk_note: String::new(),
+                reusable_pattern: "先问[用途]".into(),
+            }],
+            tags: vec![LearningCaseTagInput {
+                tag_kind: "skill".into(),
+                tag_value: "价格异议".into(),
+            }],
+        }
+    }
+
+    async fn publish_learning_case(
+        database: &Database,
+        anchor_id: &str,
+        case_id: &str,
+    ) -> LearningCaseRow {
+        database
+            .submit_anchor_learning_case(case_id, anchor_id, "operator")
+            .await
+            .unwrap();
+        database
+            .review_anchor_learning_case(
+                case_id,
+                anchor_id,
+                "reviewer",
+                "可用于培训",
+                &format!("主播知识库/{anchor_id}/精品案例/{case_id}.md"),
+                "file-hash",
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn learning_case_lifecycle_is_private_until_published_and_retirement_is_immediate() {
+        let database = database().await;
+        let anchor = database
+            .create_anchor_knowledge_profile(CreateAnchorKnowledgeProfileRequest {
+                display_name: "主播A".into(),
+                aliases: vec![],
+            })
+            .await
+            .unwrap();
+        let other_anchor = profile(&database, "主播B").await;
+
+        let case_d = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "D"))
+            .await
+            .unwrap();
+        assert!(database
+            .submit_anchor_learning_case(&case_d.case_id, &anchor.anchor_id, "operator")
+            .await
+            .is_err());
+        assert_eq!(
+            database
+                .search_public_learning_cases(Default::default())
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let case_a = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "A"))
+            .await
+            .unwrap();
+        assert!(database
+            .get_anchor_learning_case(&other_anchor.anchor_id, "private", &case_a.case_id)
+            .await
+            .is_err());
+        database
+            .submit_anchor_learning_case(&case_a.case_id, &anchor.anchor_id, "operator")
+            .await
+            .unwrap();
+        let published = database
+            .review_anchor_learning_case(
+                &case_a.case_id,
+                &anchor.anchor_id,
+                "reviewer",
+                "可用于培训",
+                "主播知识库/a/精品案例/c-v1.md",
+                "file-hash",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .search_public_learning_cases(Default::default())
+                .await
+                .unwrap()[0]
+                .case_id,
+            published.case_id
+        );
+        database
+            .retire_anchor_learning_case(&published.case_id, "reviewer", "售后政策已变化")
+            .await
+            .unwrap();
+        assert!(database
+            .search_public_learning_cases(Default::default())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn learning_case_submission_rejects_each_publication_gate() {
+        let database = database().await;
+        let anchor = profile(&database, "主播A").await;
+
+        for (marker, mutate) in [
+            ("internal-use", 0),
+            ("video-source", 1),
+            ("transcript-source", 2),
+            ("four-reasons", 3),
+            ("lines", 4),
+            ("line-range", 5),
+            ("forbidden-copy", 6),
+            ("scope", 7),
+            ("expiry", 8),
+            ("review-date", 9),
+        ] {
+            let mut request = valid_learning_case_request(&anchor.anchor_id, "A");
+            request.title = marker.into();
+            match mutate {
+                0 => request.internal_use_confirmed = false,
+                1 => request
+                    .sources
+                    .retain(|source| source.source_kind != "video"),
+                2 => request
+                    .sources
+                    .retain(|source| source.source_kind != "transcript"),
+                3 => request.trust_reason.clear(),
+                4 => request.lines.clear(),
+                5 => request.lines[0].end_ms = 5000,
+                6 => request.forbidden_copy = "  ".into(),
+                7 | 8 => {}
+                9 => request.review_due_at = "2026-02-30".into(),
+                _ => unreachable!(),
+            }
+            let case = database.create_anchor_learning_case(request).await.unwrap();
+            if mutate == 7 || mutate == 8 {
+                let pool = database.db.read().await.clone().unwrap();
+                pool.execute("PRAGMA ignore_check_constraints = ON")
+                    .await
+                    .unwrap();
+                let column = if mutate == 7 {
+                    "applicable_scope"
+                } else {
+                    "expiry_conditions"
+                };
+                sqlx::query(&format!(
+                    "UPDATE anchor_learning_cases SET {column} = '  ' WHERE case_id = ?"
+                ))
+                .bind(&case.case_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+                pool.execute("PRAGMA ignore_check_constraints = OFF")
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                database
+                    .submit_anchor_learning_case(&case.case_id, &anchor.anchor_id, "operator")
+                    .await
+                    .is_err(),
+                "submission gate unexpectedly accepted {marker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn learning_case_public_search_excludes_candidate_pending_rejected_d_retired_and_old_versions(
+    ) {
+        let database = database().await;
+        let anchor = profile(&database, "主播A").await;
+        let mut hidden_ids = Vec::new();
+
+        let candidate = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "A"))
+            .await
+            .unwrap();
+        hidden_ids.push(candidate.case_id.clone());
+
+        let pending = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "B"))
+            .await
+            .unwrap();
+        database
+            .submit_anchor_learning_case(&pending.case_id, &anchor.anchor_id, "operator")
+            .await
+            .unwrap();
+        hidden_ids.push(pending.case_id.clone());
+
+        let rejected = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "C"))
+            .await
+            .unwrap();
+        database
+            .submit_anchor_learning_case(&rejected.case_id, &anchor.anchor_id, "operator")
+            .await
+            .unwrap();
+        database
+            .reject_anchor_learning_case(
+                &rejected.case_id,
+                &anchor.anchor_id,
+                "reviewer",
+                "证据不足",
+            )
+            .await
+            .unwrap();
+        hidden_ids.push(rejected.case_id.clone());
+
+        let published_d = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "D"))
+            .await
+            .unwrap();
+        let pool = database.db.read().await.clone().unwrap();
+        sqlx::query(
+            "UPDATE anchor_knowledge_assets SET review_status='published', is_current=1, reviewed_at=?, reviewed_by='fixture', published_at=?, published_relative_path='fixture.md', published_file_hash='fixture-hash' WHERE asset_id=?",
+        )
+        .bind(now())
+        .bind(now())
+        .bind(&published_d.asset_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        hidden_ids.push(published_d.case_id.clone());
+
+        let retired = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "A"))
+            .await
+            .unwrap();
+        let retired = publish_learning_case(&database, &anchor.anchor_id, &retired.case_id).await;
+        database
+            .retire_anchor_learning_case(&retired.case_id, "reviewer", "规则变化")
+            .await
+            .unwrap();
+        hidden_ids.push(retired.case_id.clone());
+
+        let old = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "B"))
+            .await
+            .unwrap();
+        let old = publish_learning_case(&database, &anchor.anchor_id, &old.case_id).await;
+        let mut next_request = valid_learning_case_request(&anchor.anchor_id, "B");
+        next_request.supersedes_asset_id = Some(old.asset_id.clone());
+        let current = database
+            .create_anchor_learning_case(next_request)
+            .await
+            .unwrap();
+        let current = publish_learning_case(&database, &anchor.anchor_id, &current.case_id).await;
+        hidden_ids.push(old.case_id.clone());
+
+        let visible_a = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "A"))
+            .await
+            .unwrap();
+        let visible_a =
+            publish_learning_case(&database, &anchor.anchor_id, &visible_a.case_id).await;
+        let visible_c = database
+            .create_anchor_learning_case(valid_learning_case_request(&anchor.anchor_id, "C"))
+            .await
+            .unwrap();
+        let visible_c =
+            publish_learning_case(&database, &anchor.anchor_id, &visible_c.case_id).await;
+
+        let result = database
+            .search_public_learning_cases(Default::default())
+            .await
+            .unwrap();
+        let result_ids = result
+            .into_iter()
+            .map(|case| case.case_id)
+            .collect::<std::collections::HashSet<_>>();
+        let expected = [visible_a.case_id, current.case_id, visible_c.case_id]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(result_ids, expected);
+        assert!(hidden_ids
+            .into_iter()
+            .all(|case_id| !result_ids.contains(&case_id)));
+    }
+
+    #[tokio::test]
+    async fn learning_case_creation_rolls_back_all_rows_when_an_extension_insert_fails() {
+        let database = database().await;
+        let anchor = profile(&database, "主播A").await;
+        let mut request = valid_learning_case_request(&anchor.anchor_id, "A");
+        request.tags[0].tag_kind = "not-supported".into();
+
+        assert!(database.create_anchor_learning_case(request).await.is_err());
+        let pool = database.db.read().await.clone().unwrap();
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM anchor_knowledge_assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM anchor_learning_cases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((assets, cases), (0, 0));
     }
 
     fn source(marker: &str) -> AnchorKnowledgeSourceInput {
