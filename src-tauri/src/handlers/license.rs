@@ -12,6 +12,18 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+#[cfg(feature = "gui")]
+pub struct AppLicenseAuthorization {
+    app: tauri::AppHandle,
+}
+
+#[cfg(feature = "gui")]
+impl AppLicenseAuthorization {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
 // Serialize read/activate/renew across awaits, including persistence and trusted time.
 static LICENSE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // If the disk fails during revocation, this process must still never reauthorize.
@@ -181,6 +193,33 @@ fn local_status(
         None
     };
     Ok(dto(status, days))
+}
+
+#[cfg(feature = "gui")]
+#[async_trait::async_trait]
+impl crate::private_distribution::updater::UpdateAuthorization for AppLicenseAuthorization {
+    async fn authorized_credential(&self) -> Result<StoredCredential, ()> {
+        let _guard = LICENSE_LOCK.lock().await;
+        (|| {
+            let store = app_store(&self.app)?;
+            if store.revoked()? {
+                return Err(LicenseError::Revoked);
+            }
+            let credential = store.vault.load()?.ok_or(LicenseError::InvalidToken)?;
+            let status = evaluate_lease_at(
+                &credential.lease,
+                &compiled_public_key()?,
+                now()?,
+                credential.last_server_time,
+            )?;
+            if matches!(status, LicenseStatus::Valid | LicenseStatus::OfflineGrace) {
+                Ok(credential)
+            } else {
+                Err(LicenseError::InvalidLease)
+            }
+        })()
+        .map_err(|_| ())
+    }
 }
 async fn activate_with<F, Fut>(
     store: &LicenseStore,

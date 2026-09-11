@@ -2,6 +2,7 @@
 pub mod client;
 pub mod lease;
 pub mod model;
+pub mod updater;
 pub mod vault;
 
 #[cfg(test)]

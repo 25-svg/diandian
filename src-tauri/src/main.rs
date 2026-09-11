@@ -122,6 +122,9 @@ async fn setup_logging(log_dir: &Path) -> Result<(), Box<dyn std::error::Error>>
         .add_filter_ignore_str("hyper")
         .add_filter_ignore_str("sqlx")
         .add_filter_ignore_str("reqwest")
+        // The updater's debug response contains a short-lived private download
+        // ticket. Suppress that crate completely so tickets never reach logs.
+        .add_filter_ignore_str("tauri_plugin_updater")
         .add_filter_ignore_str("h2")
         .add_filter_ignore_str("danmu_stream")
         .build();
@@ -877,6 +880,7 @@ async fn setup_app_state(app: &tauri::App) -> Result<State, Box<dyn std::error::
         static_server,
         storage_migration,
         app_handle: app.handle().clone(),
+        private_updater: Default::default(),
         webhook_poster,
     })
 }
@@ -894,6 +898,7 @@ fn setup_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
         .plugin(tauri_plugin_sql::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(
             tauri_plugin_sql::Builder::default()
@@ -908,6 +913,12 @@ fn setup_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
     println!("Plugins initialized");
 
     builder
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+fn get_private_update_status(state: tauri::State<'_, State>) -> private_distribution::updater::UpdateStatusDto {
+    state.private_updater.status()
 }
 
 #[cfg(feature = "gui")]
@@ -929,6 +940,7 @@ fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
         crate::handlers::license::get_license_status,
         crate::handlers::license::activate_device,
         crate::handlers::license::renew_device_license,
+        get_private_update_status,
         crate::handlers::account::get_accounts,
         crate::handlers::account::add_account,
         crate::handlers::account::remove_account,
@@ -1207,6 +1219,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let resume_state = state.clone();
                 let live_dashboard_state = state.clone();
                 let review_pipeline_state = state.clone();
+                let update_cache = app.path().app_cache_dir()?.join("private-distribution-update");
+                let update_authorization = Arc::new(
+                    crate::handlers::license::AppLicenseAuthorization::new(app.handle().clone()),
+                );
+                let update_busy = Arc::new(state.clone());
+                let update_shutdown_state = state.clone();
+                state.private_updater.start(
+                    app.handle().clone(),
+                    update_cache,
+                    update_authorization,
+                    update_busy,
+                    Arc::new(move || {
+                        tauri::async_runtime::block_on(update_shutdown_state.prepare_for_exit());
+                    }),
+                );
                 app.manage(state);
                 tauri::async_runtime::spawn(async move {
                     crate::handlers::master_script::resume_processing_master_sample_batches(
@@ -1237,14 +1264,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 let state = app_handle.state::<State>();
-                let task_manager = state.task_manager.clone();
-                let recorder_manager = state.recorder_manager.clone();
                 let app_state = state.inner().clone();
                 log::info!("Stopping background tasks and recorders before exit...");
                 tauri::async_runtime::block_on(async move {
-                    task_manager.shutdown().await;
-                    app_state.stop_all_video_previews().await;
-                    recorder_manager.stop_all().await;
+                    app_state.prepare_for_exit().await;
                 });
                 log::info!("Background tasks and recorders stopped successfully.");
             }

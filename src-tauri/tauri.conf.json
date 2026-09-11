@@ -7,6 +7,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "resources": [
       "ffmpeg.exe",
       "ffprobe.exe",
@@ -31,6 +32,13 @@
     "deep-link": {
       "desktop": {
         "schemes": ["bsr"]
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUwNEIxRDUzNkVFMTFCQzQKUldURUcrRnVVeDFMVU9yams2eWdadkdUTUx5d1ptZ0I3NXFkZmF2MkVmV01LWVVVbDRqM250UEEK",
+      "endpoints": [],
+      "windows": {
+        "installMode": "passive"
       }
     }
   },

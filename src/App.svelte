@@ -20,6 +20,7 @@
   import type { RecordItem } from "./lib/db";
   import { isClipVideo, type StartupReadiness, type VideoItem } from "./lib/interface";
   import { findArchiveSourceVideo } from "./lib/archiveVideoBinding";
+  import { watchPrivateUpdateStatus, type PrivateUpdateStatus } from "./lib/appUpdater";
   import { buildExistingClipReviewRequest, type ClipReviewRequest } from "./lib/clipReview";
   import { getMasterBaseline, listMasterSampleBatches } from "./lib/masterScript";
   import { onMount } from "svelte";
@@ -43,6 +44,8 @@
   let startupReadiness: StartupReadiness | null = null;
   let showStartupWizard = false;
   let startupReadinessLoading = false;
+  let privateUpdateStatus: PrivateUpdateStatus | null = null;
+  let stopUpdateStatusPolling: () => void = () => undefined;
 
   async function loadStartupReadiness(showWhenIncomplete = true): Promise<void> {
     startupReadinessLoading = true;
@@ -172,7 +175,12 @@
     void ensureActiveEnterpriseMaster();
     void checkMiniMaxSetup();
     void loadStartupReadiness();
+    stopUpdateStatusPolling();
+    stopUpdateStatusPolling = watchPrivateUpdateStatus((status) => {
+      privateUpdateStatus = status;
+    });
   }
+  onMount(() => () => stopUpdateStatusPolling());
   onMount(() => {
     const openMiniMaxSetup = () => {
       miniMaxSetupError = "";
@@ -326,6 +334,11 @@
 
 <ActivationGate on:authorized={startAuthorizedApp}>
 <main>
+  {#if privateUpdateStatus && ["downloading", "waiting_for_idle", "installing", "failed"].includes(privateUpdateStatus.status)}
+    <div class:failed={privateUpdateStatus.status === "failed"} class="private-update-status" role="status" aria-live="polite">
+      {privateUpdateStatus.message}
+    </div>
+  {/if}
   <div class="wrap">
     <div class="sidebar">
       <BSidebar
@@ -570,6 +583,21 @@
     background: rgba(15, 23, 42, 0.48);
     backdrop-filter: blur(12px);
   }
+  .private-update-status {
+    position: fixed;
+    z-index: 9000;
+    top: 16px;
+    right: 18px;
+    max-width: min(420px, calc(100vw - 36px));
+    padding: 10px 14px;
+    border: 1px solid rgba(37, 99, 235, 0.22);
+    border-radius: 10px;
+    background: rgba(239, 246, 255, 0.96);
+    color: #1e3a8a;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
+    font-size: 13px;
+  }
+  .private-update-status.failed { border-color: rgba(185, 28, 28, 0.24); background: rgba(254, 242, 242, 0.96); color: #991b1b; }
   .minimax-setup-card {
     width: min(520px, calc(100vw - 32px));
     display: grid;
