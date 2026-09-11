@@ -765,6 +765,7 @@ dependencies = [
  "recorder",
  "regex",
  "reqwest 0.11.27",
+ "ring",
  "sanitize-filename",
  "scraper",
  "sentry",

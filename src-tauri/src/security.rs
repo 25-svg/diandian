@@ -16,7 +16,7 @@ fn minimax_secret_path(config_path: &str) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn protect_for_current_windows_user(secret: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect_for_current_windows_user(secret: &[u8]) -> Result<Vec<u8>, String> {
     use windows::core::w;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
@@ -49,7 +49,7 @@ fn protect_for_current_windows_user(secret: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn unprotect_for_current_windows_user(protected: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn unprotect_for_current_windows_user(protected: &[u8]) -> Result<Vec<u8>, String> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
         CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -81,12 +81,12 @@ fn unprotect_for_current_windows_user(protected: &[u8]) -> Result<Vec<u8>, Strin
 }
 
 #[cfg(not(target_os = "windows"))]
-fn protect_for_current_windows_user(_secret: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect_for_current_windows_user(_secret: &[u8]) -> Result<Vec<u8>, String> {
     Err("当前版本仅支持在 Windows 安全保存 MiniMax API Key".to_string())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn unprotect_for_current_windows_user(_protected: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn unprotect_for_current_windows_user(_protected: &[u8]) -> Result<Vec<u8>, String> {
     Err("当前版本仅支持在 Windows 读取 MiniMax API Key".to_string())
 }
 

@@ -37,6 +37,8 @@ master-comparison = { path = "crates/master-comparison" }
 recorder = { path = "crates/recorder" }
 serde_json = "1.0"
 sha2 = "0.10"
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+tempfile = "3"
 reqwest = { workspace = true}
 serde_derive = "1.0.158"
 serde = "1.0.158"
@@ -167,6 +169,10 @@ optional = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "private_distribution"
+path = "src/private_distribution/mod.rs"
 
 
 [workspace.dependencies]
