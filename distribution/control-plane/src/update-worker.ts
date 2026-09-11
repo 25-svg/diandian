@@ -176,6 +176,10 @@ async function handle(request: Request, env: LicenseEnv): Promise<Response> {
     return json(await statusService(env).status(bearerToken(request)));
   }
   const rawParts = path.split("/");
+  if (rawParts.length === 4 && rawParts[1] === "v1" && rawParts[2] === "initial-download") {
+    if (request.method !== "GET") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
+    return updateService(env).initialDownload(decodePathPart(rawParts[3]!));
+  }
   if (rawParts.length === 6 && rawParts[1] === "v1" && rawParts[2] === "update") {
     if (request.method !== "GET") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
     const device = await activeDevice(request, env);

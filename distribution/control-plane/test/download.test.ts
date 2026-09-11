@@ -108,6 +108,25 @@ describe("private update download and events", () => {
     expect(download.headers.get("content-disposition")).not.toContain("private/release.exe");
   });
 
+  it("allows a valid 24-hour initial ticket without a device Bearer token but rejects revoked, expired, and non-production releases", async () => {
+    const { database, env, objects } = await fixture();
+    seedRelease(database, "production", "initial-release");
+    objects.set("private/release.exe", streamObject(new TextEncoder().encode("abc")));
+    const ticket = "i".repeat(43);
+    database.prepare("INSERT INTO download_tickets (id, token_hash, device_id, release_id, purpose, expires_at, created_at) VALUES (?, ?, NULL, ?, 'initial', ?, ?)")
+      .run("initial-ticket", await sha256Hex(ticket), "initial-release", 4_102_444_800, 1);
+    const download = () => worker.fetch(new Request(`https://control.example/v1/initial-download/${ticket}`), env, context);
+
+    expect((await download()).status).toBe(200);
+    database.prepare("UPDATE download_tickets SET revoked_at = 2 WHERE id = 'initial-ticket'").run();
+    expect((await download()).status).toBe(403);
+    database.prepare("UPDATE download_tickets SET revoked_at = NULL, expires_at = 1 WHERE id = 'initial-ticket'").run();
+    expect((await download()).status).toBe(403);
+    database.prepare("UPDATE download_tickets SET expires_at = 4_102_444_800 WHERE id = 'initial-ticket'").run();
+    database.prepare("UPDATE releases SET status = 'testing' WHERE id = 'initial-release'").run();
+    expect((await download()).status).toBe(403);
+  });
+
   it("rejects expired, revoked, cross-device, halted, and missing-object update downloads", async () => {
     const { database, env, objects } = await fixture();
     const token1 = "a".repeat(43);

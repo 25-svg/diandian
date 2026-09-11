@@ -172,6 +172,29 @@ export class UpdateService {
     });
   }
 
+  /** Initial-install links are intentionally bearerless, opaque, short-lived, and production-only. */
+  async initialDownload(ticket: string): Promise<Response> {
+    requireTicket(ticket);
+    if (!this.artifacts) throw new Error("Artifact storage is unavailable");
+    const record = await this.db.prepare(
+      `SELECT r.id, r.version, r.status, r.notes, r.pub_date, r.signature, r.object_key
+       FROM download_tickets dt JOIN releases r ON r.id = dt.release_id
+       WHERE dt.token_hash = ? AND dt.device_id IS NULL AND dt.purpose = 'initial'
+         AND dt.expires_at > ? AND dt.revoked_at IS NULL AND r.status = 'production'`,
+    ).bind(await sha256Hex(ticket), this.now()).first<DownloadRecord>();
+    if (!record) throw new UpdateError("TICKET_INVALID", "Download ticket is invalid or unavailable.");
+    const object = await this.artifacts.get(record.object_key);
+    if (!object) throw new UpdateError("ARTIFACT_NOT_FOUND", "Update artifact is unavailable.");
+    return new Response(object.body, {
+      headers: {
+        "cache-control": "private, no-store",
+        "content-disposition": "attachment; filename=\"diandian-update.exe\"; filename*=UTF-8''diandian-update.exe",
+        "content-length": String(object.size),
+        "content-type": "application/octet-stream",
+      },
+    });
+  }
+
   async reportEvent(input: { deviceId: string; releaseId: string | null; currentVersion: string; eventType: string }): Promise<void> {
     const eventVersion = requireVersion(input.currentVersion);
     if (!UPDATE_EVENT_TYPES.has(input.eventType) || input.deviceId.length === 0 || input.deviceId.length > 256) {
