@@ -1,4 +1,5 @@
 import { LEASE_SECONDS, randomToken, sha256Hex, signLease } from "./crypto";
+import type { LeasePayload } from "./domain";
 import { LicenseRepository } from "./repository";
 
 const MAX_CODE_LENGTH = 256;
@@ -12,7 +13,10 @@ export type LicenseErrorCode =
   | "ACTIVATION_CODE_USED"
   | "INSTALLATION_ALREADY_ACTIVATED"
   | "DEVICE_TOKEN_INVALID"
-  | "DEVICE_REVOKED";
+  | "DEVICE_REVOKED"
+  | "PAYLOAD_TOO_LARGE";
+
+type LeaseSigner = (payload: LeasePayload, privateJwk: JsonWebKey) => Promise<string>;
 
 export class LicenseError extends Error {
   constructor(public readonly code: LicenseErrorCode, message: string) {
@@ -29,8 +33,9 @@ export interface LicenseServiceContract {
 export class LicenseService implements LicenseServiceContract {
   constructor(
     private readonly repository: LicenseRepository,
-    private readonly privateJwk: JsonWebKey,
+    private readonly privateJwk: JsonWebKey | undefined,
     private readonly clock: () => number = () => Math.floor(Date.now() / 1000),
+    private readonly leaseSigner: LeaseSigner = signLease,
   ) {}
 
   async activate(input: { code: string; installId: string; label: string }): Promise<{ deviceToken: string; lease: string }> {
@@ -39,6 +44,7 @@ export class LicenseService implements LicenseServiceContract {
     const now = this.now();
     const deviceToken = randomToken(DEVICE_TOKEN_BYTES);
     const deviceId = crypto.randomUUID();
+    const lease = await this.lease(deviceId, now);
     const [codeHash, installHash, tokenHash] = await Promise.all([
       sha256Hex(validated.code),
       sha256Hex(validated.installId),
@@ -54,7 +60,7 @@ export class LicenseService implements LicenseServiceContract {
     });
     if (!claimed) await this.throwActivationFailure(codeHash, installHash, now);
 
-    return { deviceToken, lease: await this.lease(deviceId, now) };
+    return { deviceToken, lease };
   }
 
   async renew(deviceToken: string): Promise<{ lease: string }> {
@@ -119,10 +125,15 @@ export class LicenseService implements LicenseServiceContract {
   }
 
   private async validateSigningKey(): Promise<void> {
+    if (!this.privateJwk) throw new Error("Lease signing configuration is unavailable");
     await crypto.subtle.importKey("jwk", this.privateJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
   }
 
-  private lease(deviceId: string, issuedAt: number): Promise<string> {
-    return signLease({ deviceId, issuedAt, expiresAt: issuedAt + LEASE_SECONDS, serverTime: issuedAt }, this.privateJwk);
+  private async lease(deviceId: string, issuedAt: number): Promise<string> {
+    await this.validateSigningKey();
+    return this.leaseSigner(
+      { deviceId, issuedAt, expiresAt: issuedAt + LEASE_SECONDS, serverTime: issuedAt },
+      this.privateJwk!,
+    );
   }
 }

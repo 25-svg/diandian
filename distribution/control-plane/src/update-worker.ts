@@ -3,6 +3,7 @@ import { LicenseError, LicenseService, type LicenseErrorCode } from "./license-s
 import { LicenseRepository } from "./repository";
 
 type LicenseEnv = Env & { LEASE_PRIVATE_JWK: string };
+const MAX_ACTIVATION_BODY_BYTES = 4 * 1024;
 
 const errorStatus: Record<LicenseErrorCode, number> = {
   INVALID_REQUEST: 400,
@@ -11,6 +12,7 @@ const errorStatus: Record<LicenseErrorCode, number> = {
   INSTALLATION_ALREADY_ACTIVATED: 409,
   DEVICE_TOKEN_INVALID: 401,
   DEVICE_REVOKED: 403,
+  PAYLOAD_TOO_LARGE: 413,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -38,9 +40,37 @@ function privateJwk(secret: string): JsonWebKey {
 }
 
 async function activationInput(request: Request): Promise<{ code: string; installId: string; label: string }> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_ACTIVATION_BODY_BYTES)) {
+    throw new LicenseError("PAYLOAD_TOO_LARGE", "Activation request body is too large.");
+  }
+  if (!request.body) throw new LicenseError("INVALID_REQUEST", "Activation input is invalid.");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > MAX_ACTIVATION_BODY_BYTES) {
+        await reader.cancel();
+        throw new LicenseError("PAYLOAD_TOO_LARGE", "Activation request body is too large.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   let value: unknown;
   try {
-    value = await request.json();
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {
     throw new LicenseError("INVALID_REQUEST", "Activation input is invalid.");
   }
@@ -49,24 +79,28 @@ async function activationInput(request: Request): Promise<{ code: string; instal
   return { code: input.code as string, installId: input.installId as string, label: input.label as string };
 }
 
-function service(env: LicenseEnv): LicenseService {
+function signingService(env: LicenseEnv): LicenseService {
   return new LicenseService(new LicenseRepository(env.DB), privateJwk(env.LEASE_PRIVATE_JWK));
+}
+
+function statusService(env: LicenseEnv): LicenseService {
+  return new LicenseService(new LicenseRepository(env.DB), undefined);
 }
 
 async function handle(request: Request, env: LicenseEnv): Promise<Response> {
   const path = new URL(request.url).pathname;
   if (path === "/v1/activate") {
     if (request.method !== "POST") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
-    const result = await service(env).activate(await activationInput(request));
+    const result = await signingService(env).activate(await activationInput(request));
     return json(result, 201);
   }
   if (path === "/v1/lease/renew") {
     if (request.method !== "POST") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
-    return json(await service(env).renew(bearerToken(request)));
+    return json(await signingService(env).renew(bearerToken(request)));
   }
   if (path === "/v1/license/status") {
     if (request.method !== "GET") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
-    return json(await service(env).status(bearerToken(request)));
+    return json(await statusService(env).status(bearerToken(request)));
   }
   return error("NOT_FOUND", "Route not found.", 404);
 }

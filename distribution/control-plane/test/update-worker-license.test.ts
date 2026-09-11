@@ -109,5 +109,31 @@ describe("license worker endpoints", () => {
     expect(await status.json()).toMatchObject({ status: "revoked" });
     expect(renewal.status).toBe(403);
     expect(await renewal.json()).toEqual({ error: { code: "DEVICE_REVOKED", message: "This device has been revoked." } });
+
+    env.LEASE_PRIVATE_JWK = "not-json";
+    const statusWithoutSigningSecret = await worker.fetch(new Request("https://control.example/v1/license/status", {
+      headers: { authorization: `Bearer ${deviceToken}` },
+    }), env, {} as ExecutionContext);
+    expect(statusWithoutSigningSecret.status).toBe(200);
+    expect(await statusWithoutSigningSecret.json()).toMatchObject({ status: "revoked" });
+  });
+
+  it("rejects activation payloads larger than 4KiB before parsing or echoing them", async () => {
+    const { env } = await createFixture();
+    const oversized = "x".repeat(4_097);
+
+    const declaredTooLarge = await worker.fetch(new Request("https://control.example/v1/activate", {
+      method: "POST", headers: { "content-length": "4097" }, body: oversized,
+    }), env, {} as ExecutionContext);
+    const forgedSmallLength = await worker.fetch(new Request("https://control.example/v1/activate", {
+      method: "POST", headers: { "content-length": "1" }, body: oversized,
+    }), env, {} as ExecutionContext);
+
+    for (const response of [declaredTooLarge, forgedSmallLength]) {
+      expect(response.status).toBe(413);
+      const body = JSON.stringify(await response.json());
+      expect(body).toBe('{"error":{"code":"PAYLOAD_TOO_LARGE","message":"Activation request body is too large."}}');
+      expect(body).not.toContain(oversized);
+    }
   });
 });

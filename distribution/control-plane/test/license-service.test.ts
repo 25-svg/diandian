@@ -74,7 +74,7 @@ describe("LicenseService", () => {
     expect(database.prepare("SELECT COUNT(*) AS count FROM devices").get()).toMatchObject({ count: 1 });
   });
 
-  it("atomically permits only one concurrent claim without an orphan device", async () => {
+  it("models the atomic D1 batch state machine without an orphan device", async () => {
     const { database, service, now } = await createFixture();
     await seedCode(database, "RACE", now + 60);
 
@@ -98,6 +98,20 @@ describe("LicenseService", () => {
     await expect(service.activate({ code: "TWO", installId: "install-a", label: "A" }))
       .rejects.toMatchObject({ code: "INSTALLATION_ALREADY_ACTIVATED" });
     expect(database.prepare("SELECT status FROM activation_codes WHERE code_hash = ?").get(await sha256Hex("TWO"))).toMatchObject({ status: "unused" });
+  });
+
+  it("does not claim a code when lease signing fails", async () => {
+    const { database, repository, now } = await createFixture();
+    await seedCode(database, "SIGN-FAIL", now + 60);
+    const service = new LicenseService(repository, await keyPair(), () => now, async () => {
+      throw new Error("injected signing failure");
+    });
+
+    await expect(service.activate({ code: "SIGN-FAIL", installId: "install-a", label: "A" }))
+      .rejects.toThrow("injected signing failure");
+    expect(database.prepare("SELECT COUNT(*) AS count FROM devices").get()).toMatchObject({ count: 0 });
+    expect(database.prepare("SELECT status FROM activation_codes WHERE code_hash = ?").get(await sha256Hex("SIGN-FAIL")))
+      .toMatchObject({ status: "unused" });
   });
 
   it("rejects a revoked device immediately while status reports the business state", async () => {
