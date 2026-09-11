@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ActivationGate from "./lib/components/ActivationGate.svelte";
   import Room from "./page/Room.svelte";
   import BSidebar from "./lib/components/BSidebar.svelte";
   import Summary from "./page/Summary.svelte";
@@ -166,12 +167,12 @@
     }
   }
 
-  onMount(() => {
+  function startAuthorizedApp() {
     void set_title("典典直播切片");
     void ensureActiveEnterpriseMaster();
     void checkMiniMaxSetup();
     void loadStartupReadiness();
-  });
+  }
   onMount(() => {
     const openMiniMaxSetup = () => {
       miniMaxSetupError = "";
@@ -323,6 +324,7 @@
   log.info("App loaded");
 </script>
 
+<ActivationGate on:authorized={startAuthorizedApp}>
 <main>
   <div class="wrap">
     <div class="sidebar">
@@ -459,6 +461,8 @@
     </section>
   </div>
 {/if}
+
+</ActivationGate>
 
 <style>
   .sidebar {

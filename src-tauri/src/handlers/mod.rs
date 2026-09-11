@@ -5,6 +5,7 @@ pub mod anchor_knowledge;
 pub mod config;
 pub mod doudian_orders;
 pub mod knowledge;
+pub mod license;
 pub mod live_dashboard;
 pub mod live_dashboard_binding;
 pub mod macros;

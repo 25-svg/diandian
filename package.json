@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test:license": "node --loader ts-node/esm src/lib/license.test.ts",
     "build": "vite build",
     "build:desktop:portable": "tauri build --no-bundle --ci",
     "test:analysis-reactivity": "node scripts/check-analysis-reactivity.mjs",

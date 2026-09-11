@@ -27,6 +27,7 @@ mod master_script;
 mod migration;
 mod nas_archive;
 mod progress;
+mod private_distribution;
 mod raw_order_timeline;
 mod recorder_manager;
 mod security;
@@ -925,6 +926,9 @@ fn setup_event_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<t
 #[cfg(feature = "gui")]
 fn setup_invoke_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder.invoke_handler(tauri::generate_handler![
+        crate::handlers::license::get_license_status,
+        crate::handlers::license::activate_device,
+        crate::handlers::license::renew_device_license,
         crate::handlers::account::get_accounts,
         crate::handlers::account::add_account,
         crate::handlers::account::remove_account,
