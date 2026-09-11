@@ -54,7 +54,11 @@ async function activationInput(request: Request): Promise<{ code: string; instal
       if (done) break;
       length += value.byteLength;
       if (length > MAX_ACTIVATION_BODY_BYTES) {
-        await reader.cancel();
+        try {
+          await reader.cancel();
+        } catch {
+          // Cleanup failure cannot replace the client-visible payload limit error.
+        }
         throw new LicenseError("PAYLOAD_TOO_LARGE", "Activation request body is too large.");
       }
       chunks.push(value);

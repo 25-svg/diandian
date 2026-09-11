@@ -136,4 +136,27 @@ describe("license worker endpoints", () => {
       expect(body).not.toContain(oversized);
     }
   });
+
+  it("preserves the payload limit error when oversized stream cleanup fails", async () => {
+    const { env } = await createFixture();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(4_097)));
+      },
+      cancel() {
+        return Promise.reject(new Error("injected cancel failure"));
+      },
+    });
+    const request = new Request("https://control.example/v1/activate", {
+      method: "POST",
+      body,
+      duplex: "half",
+    } as RequestInit);
+
+    const response = await worker.fetch(request, env, {} as ExecutionContext);
+    const responseText = await response.text();
+    expect(response.status).toBe(413);
+    expect(responseText).toBe('{"error":{"code":"PAYLOAD_TOO_LARGE","message":"Activation request body is too large."}}');
+    expect(responseText).not.toContain("x".repeat(4_097));
+  });
 });
