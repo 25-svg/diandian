@@ -1,6 +1,7 @@
 export interface DeviceRecord {
   id: string;
   status: "active" | "revoked";
+  test_group: string | null;
 }
 
 interface ActivationCodeRecord {
@@ -54,7 +55,7 @@ export class LicenseRepository {
   }
 
   async findDeviceByTokenHash(tokenHash: string): Promise<DeviceRecord | null> {
-    return this.db.prepare("SELECT id, status FROM devices WHERE token_hash = ?").bind(tokenHash).first<DeviceRecord>();
+    return this.db.prepare("SELECT id, status, test_group FROM devices WHERE token_hash = ?").bind(tokenHash).first<DeviceRecord>();
   }
 
   async findDeviceByInstallHash(installHash: string): Promise<DeviceRecord | null> {
