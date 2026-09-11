@@ -58,7 +58,8 @@ function isTauriSignature(value: string): boolean {
   const outer = decodeBase64(value); if (!outer || outer.byteLength < 180 || outer.byteLength > 3072) return false;
   let box: string; try { box = new TextDecoder("utf-8", { fatal: true }).decode(outer); } catch { return false; }
   for (const char of box) { const code = char.codePointAt(0)!; if (char === "\r" || char === "\0" || (code < 0x20 && char !== "\t" && char !== "\n") || (code >= 0x7f && code <= 0x9f)) return false; }
-  const lines = box.endsWith("\n") ? box.slice(0, -1).split("\n") : box.split("\n");
+  if (box.endsWith("\n")) return false;
+  const lines = box.split("\n");
   const untrusted = "untrusted comment: ", trusted = "trusted comment: "; const untrustedText = lines[0]?.startsWith(untrusted) ? lines[0].slice(untrusted.length) : ""; const trustedText = lines[2]?.startsWith(trusted) ? lines[2].slice(trusted.length) : "";
   if (lines.length !== 4 || untrustedText.length < 1 || untrustedText.length > 512 || trustedText.length < 1 || trustedText.length > 512) return false;
   const packet = decodeBase64(lines[1]!); const global = decodeBase64(lines[3]!);

@@ -8,24 +8,36 @@ const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.
 const databases: DatabaseSync[] = [];
 afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-function tauriSignature(algorithm = 0x44, comment = "典典直播切片.exe"): string {
+function base64(bytes: Uint8Array): string { return btoa(String.fromCharCode(...bytes)); }
+
+function tauriSignature({ algorithm = 0x44, untrusted = "signature from minisign secret key", trusted = "timestamp: 1700000000 典典直播切片.exe", untrustedPrefix = "untrusted comment: ", trustedPrefix = "trusted comment: ", packet, global, suffix = "" }: { algorithm?: number; untrusted?: string; trusted?: string; untrustedPrefix?: string; trustedPrefix?: string; packet?: string; global?: string; suffix?: string } = {}): string {
   const inner = new Uint8Array(74); inner[0] = 0x45; inner[1] = algorithm;
-  const packet = btoa(String.fromCharCode(...inner));
-  const global = btoa(String.fromCharCode(...new Uint8Array(64)));
-  return btoa(String.fromCharCode(...new TextEncoder().encode(`untrusted comment: signature from minisign secret key\n${packet}\ntrusted comment: timestamp: 1700000000 ${comment}\n${global}`)));
+  return base64(new TextEncoder().encode(`${untrustedPrefix}${untrusted}\n${packet ?? base64(inner)}\n${trustedPrefix}${trusted}\n${global ?? base64(new Uint8Array(64))}${suffix}`));
 }
 
-function makeD1(database: DatabaseSync): D1Database {
+function makeD1(database: DatabaseSync, hooks: { beforeFirst?: (sql: string) => void; failAdminSuccessAudit?: boolean } = {}): D1Database {
   const statement = (sql: string, values: unknown[] = []) => ({
     sql, values,
     bind: (...bound: unknown[]) => statement(sql, bound),
-    first: async () => database.prepare(sql).get(...(values as never[])) ?? null,
+    first: async () => { hooks.beforeFirst?.(sql); return database.prepare(sql).get(...(values as never[])) ?? null; },
     all: async () => ({ success: true, meta: { changes: 0 }, results: database.prepare(sql).all(...(values as never[])) }),
-    run: async () => ({ success: true, meta: { changes: Number(database.prepare(sql).run(...(values as never[])).changes) }, results: [] }),
+    run: async () => { if (hooks.failAdminSuccessAudit && sql.startsWith("UPDATE audit_logs SET target_type='admin'")) throw new Error("audit annotation unavailable"); return { success: true, meta: { changes: Number(database.prepare(sql).run(...(values as never[])).changes) }, results: [] }; },
   });
   return { prepare: (sql: string) => statement(sql) as unknown as D1PreparedStatement, batch: async (statements: D1PreparedStatement[]) => {
     database.exec("BEGIN IMMEDIATE"); try { const results = (statements as unknown as Array<{ sql: string; values: unknown[] }>).map(({ sql, values }) => ({ success: true, meta: { changes: Number(database.prepare(sql).run(...(values as never[])).changes) }, results: [] })); database.exec("COMMIT"); return results as unknown as D1Result[]; } catch (error) { database.exec("ROLLBACK"); throw error; }
   } } as unknown as D1Database;
+}
+
+function publisherBody(signature: string, version = "2.0.0") {
+  return { version, platform: "windows", arch: "x86_64", objectKey: `private/${version}.exe`, size: 1, sha256: "a".repeat(64), signature, notes: "notes", pubDate: "2026-09-11T00:00:00Z" };
+}
+
+function publisherWorker() {
+  return createAdminWorker({ adminAccess: { verify: async () => ({ email: "admin@example.com" }) }, publisherAccess: { verify: async () => ({ serviceTokenId: "publisher" }) }, clock: () => 1_700_000_000 });
+}
+
+async function publish(worker: ReturnType<typeof createAdminWorker>, env: Parameters<ReturnType<typeof createAdminWorker>["fetch"]>[1], signature: string, version = "2.0.0") {
+  return worker.fetch(new Request("https://admin.example/api/publisher/releases", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(publisherBody(signature, version)) }), env, {} as ExecutionContext);
 }
 
 function fixture(role: "owner" | "operator" = "owner") {
@@ -131,20 +143,63 @@ describe("role-based admin API", () => {
     expect(response.status).toBe(415);
   });
 
-  it("promotes a draft only when its Tauri SignatureBox and private R2 metadata match", async () => {
-    const { worker, env, database } = fixture("owner");
-    database.prepare("UPDATE releases SET status='draft', signature=? WHERE id='r1'").run(tauriSignature(0x44, "典典\u2028直播\u2029.exe"));
-    const verifiedEnv = { ...env, ARTIFACTS: { head: async () => ({ size: 1, customMetadata: { sha256: "a".repeat(64) } }) } as unknown as R2Bucket };
-    const response = await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/testing", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" } }), verifiedEnv, {} as ExecutionContext);
-    expect(response.status).toBe(200);
-    expect(database.prepare("SELECT status FROM releases WHERE id='r1'").get()).toEqual({ status: "testing" });
+  it.each([
+    ["Tauri ED with Chinese and U+2028/U+2029 filename", tauriSignature({ algorithm: 0x44, trusted: "timestamp: 1700000000 典典\u2028直播\u2029.exe" })],
+    ["legacy Ed with the required timestamp-file TAB", tauriSignature({ algorithm: 0x64, trusted: "timestamp: 1700000000\t典典直播切片.exe" })],
+  ])("publishes and promotes a valid %s SignatureBox through the real APIs", async (_name, signature) => {
+    const { env, database } = fixture("owner");
+    const worker = publisherWorker();
+    const created = await publish(worker, env, signature);
+    expect(created.status).toBe(201);
+    const { id } = await created.json() as { id: string };
+    const artifactEnv = { ...env, ARTIFACTS: { head: async (key: string) => key === "private/2.0.0.exe" ? { size: 1, customMetadata: { sha256: "a".repeat(64) } } : null } as unknown as R2Bucket };
+    const transitioned = await worker.fetch(new Request(`https://admin.example/api/admin/releases/${id}/testing`, { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" } }), artifactEnv, {} as ExecutionContext);
+    expect(transitioned.status).toBe(200);
+    expect(database.prepare("SELECT status FROM releases WHERE id=?").get(id)).toEqual({ status: "testing" });
   });
 
-  it("accepts minisign ED and legacy Ed envelopes, but rejects unknown algorithms and controls", async () => {
+  it.each([
+    ["unknown packet algorithm", tauriSignature({ algorithm: 0x99 })],
+    ["invalid outer base64", "!invalid-base64!"],
+    ["invalid outer UTF-8", btoa("\xff")],
+    ["wrong comment prefix", tauriSignature({ untrustedPrefix: "wrong comment: " })],
+    ["empty comment", tauriSignature({ untrusted: "" })],
+    ["oversized comment", tauriSignature({ trusted: "x".repeat(513) })],
+    ["carriage return", tauriSignature({ trusted: "timestamp: 1\rfile.exe" })],
+    ["NUL", tauriSignature({ trusted: "timestamp: 1\0file.exe" })],
+    ["C0 control", tauriSignature({ trusted: "timestamp: 1\x01file.exe" })],
+    ["C1 control", tauriSignature({ trusted: `timestamp: 1${String.fromCodePoint(0x85)}file.exe` })],
+    ["truncated packet", tauriSignature({ packet: base64(new Uint8Array(73)) })],
+    ["truncated global signature", tauriSignature({ global: base64(new Uint8Array(63)) })],
+    ["fifth-line LF", tauriSignature({ suffix: "\n" })],
+  ])("rejects %s SignatureBox through the publisher API without creating a release", async (_name, signature) => {
+    const { env, database } = fixture("owner");
+    const response = await publish(publisherWorker(), env, signature);
+    expect(response.status).toBe(400);
+    expect(database.prepare("SELECT count(*) AS count FROM releases WHERE version='2.0.0'").get()).toEqual({ count: 0 });
+  });
+
+  it("uses the UPSERT RETURNING admin id for a concurrent disabled-email reactivation audit", async () => {
     const { worker, env, database } = fixture("owner");
-    database.prepare("UPDATE releases SET status='draft', signature=? WHERE id='r1'").run(tauriSignature(0x64));
-    const verifiedEnv = { ...env, ARTIFACTS: { head: async () => ({ size: 1, customMetadata: { sha256: "a".repeat(64) } }) } as unknown as R2Bucket };
-    expect((await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/testing", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" } }), verifiedEnv, {} as ExecutionContext)).status).toBe(200);
-    expect(tauriSignature(0x99)).not.toEqual(tauriSignature());
+    let injected = false;
+    const racingEnv = { ...env, DB: makeD1(database, { beforeFirst: (sql) => {
+      if (!injected && sql.startsWith("INSERT INTO admins")) {
+        injected = true;
+        database.prepare("INSERT INTO admins (id,email,password_hash,role,created_at,disabled_at) VALUES ('actual-race-id','race@example.com','', 'operator',1,2)").run();
+      }
+    } }) };
+    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ email: "race@example.com", role: "owner" }) }), racingEnv, {} as ExecutionContext);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ id: "actual-race-id", role: "owner" });
+    expect(database.prepare("SELECT target_id FROM audit_logs WHERE action='admin.create' AND details_json LIKE '%success%' ORDER BY created_at DESC LIMIT 1").get()).toEqual({ target_id: "actual-race-id" });
+  });
+
+  it("returns admin-create success and preserves started audit evidence when success annotation fails", async () => {
+    const { worker, env, database } = fixture("owner");
+    const brokenAuditEnv = { ...env, DB: makeD1(database, { failAdminSuccessAudit: true }) };
+    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ email: "audit@example.com", role: "operator" }) }), brokenAuditEnv, {} as ExecutionContext);
+    expect(response.status).toBe(201);
+    expect(database.prepare("SELECT email FROM admins WHERE email='audit@example.com'").get()).toEqual({ email: "audit@example.com" });
+    expect(database.prepare("SELECT target_type,details_json FROM audit_logs WHERE action='admin.create' ORDER BY created_at DESC LIMIT 1").get()).toMatchObject({ target_type: "admin_operation", details_json: expect.stringContaining("started") });
   });
 });
