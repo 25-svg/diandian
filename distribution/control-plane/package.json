@@ -4,7 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:ui": "esbuild admin/app.ts --bundle --format=esm --outfile=.wrangler/admin-assets/app.js && node -e \"const fs=require('node:fs');for(const f of ['index.html','styles.css'])fs.copyFileSync('admin/'+f,'.wrangler/admin-assets/'+f)\"",
+    "build": "npm run build:ui && wrangler deploy --dry-run --config wrangler.admin.jsonc --outdir .wrangler/admin-bundle && wrangler deploy --dry-run --config wrangler.update.jsonc --outdir .wrangler/update-bundle"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260911.1",

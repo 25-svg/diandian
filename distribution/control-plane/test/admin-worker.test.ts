@@ -55,6 +55,23 @@ async function request(role: "owner" | "operator", method: string, path: string,
 }
 
 describe("role-based admin API", () => {
+  it.each(["owner", "operator"] as const)("returns authenticated %s identity and summary without caching", async (role) => {
+    const { worker, env } = fixture(role);
+    const me = await worker.fetch(new Request("https://admin.example/api/admin/me"), env, {} as ExecutionContext);
+    expect(me.status).toBe(200);
+    expect(await me.json()).toEqual({ id: "admin-1", email: "admin@example.com", role });
+    expect(me.headers.get("cache-control")).toBe("no-store");
+    const summary = await worker.fetch(new Request("https://admin.example/api/admin/summary"), env, {} as ExecutionContext);
+    expect(summary.status).toBe(200);
+    expect(await summary.json()).toEqual({ devices: 0, releases: 1, activationCodes: 0 });
+  });
+
+  it("rejects unverified identity at the UI identity endpoint", async () => {
+    const { env } = fixture();
+    const worker = createAdminWorker({ adminAccess: { verify: async () => null }, publisherAccess: { verify: async () => null } });
+    const response = await worker.fetch(new Request("https://admin.example/api/admin/me", { headers: { "cf-access-authenticated-user-email": "admin@example.com" } }), env, {} as ExecutionContext);
+    expect(response.status).toBe(401);
+  });
   it.each([
     ["operator", "POST", "/api/admin/releases/r1/production", 403],
     ["operator", "POST", "/api/admin/admins", 403],
@@ -144,6 +161,7 @@ describe("role-based admin API", () => {
   });
 
   it.each([
+    ["official SignatureBox with exactly one terminal LF", tauriSignature({ suffix: "\n" })],
     ["Tauri ED with Chinese and U+2028/U+2029 filename", tauriSignature({ algorithm: 0x44, trusted: "timestamp: 1700000000 典典\u2028直播\u2029.exe" })],
     ["legacy Ed with the required timestamp-file TAB", tauriSignature({ algorithm: 0x64, trusted: "timestamp: 1700000000\t典典直播切片.exe" })],
   ])("publishes and promotes a valid %s SignatureBox through the real APIs", async (_name, signature) => {
@@ -171,7 +189,7 @@ describe("role-based admin API", () => {
     ["C1 control", tauriSignature({ trusted: `timestamp: 1${String.fromCodePoint(0x85)}file.exe` })],
     ["truncated packet", tauriSignature({ packet: base64(new Uint8Array(73)) })],
     ["truncated global signature", tauriSignature({ global: base64(new Uint8Array(63)) })],
-    ["fifth-line LF", tauriSignature({ suffix: "\n" })],
+    ["extra blank fifth line", tauriSignature({ suffix: "\n\n" })],
   ])("rejects %s SignatureBox through the publisher API without creating a release", async (_name, signature) => {
     const { env, database } = fixture("owner");
     const response = await publish(publisherWorker(), env, signature);

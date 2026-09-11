@@ -58,7 +58,8 @@ function isTauriSignature(value: string): boolean {
   const outer = decodeBase64(value); if (!outer || outer.byteLength < 180 || outer.byteLength > 3072) return false;
   let box: string; try { box = new TextDecoder("utf-8", { fatal: true }).decode(outer); } catch { return false; }
   for (const char of box) { const code = char.codePointAt(0)!; if (char === "\r" || char === "\0" || (code < 0x20 && char !== "\t" && char !== "\n") || (code >= 0x7f && code <= 0x9f)) return false; }
-  if (box.endsWith("\n")) return false;
+  // SignatureBox serialization emits one terminal LF; remove only that LF.
+  if (box.endsWith("\n")) box = box.slice(0, -1);
   const lines = box.split("\n");
   const untrusted = "untrusted comment: ", trusted = "trusted comment: "; const untrustedText = lines[0]?.startsWith(untrusted) ? lines[0].slice(untrusted.length) : ""; const trustedText = lines[2]?.startsWith(trusted) ? lines[2].slice(trusted.length) : "";
   if (lines.length !== 4 || untrustedText.length < 1 || untrustedText.length > 512 || trustedText.length < 1 || trustedText.length > 512) return false;
@@ -68,6 +69,8 @@ function isTauriSignature(value: string): boolean {
 async function requireOwner(env: Env, admin: Admin, action: string, timestamp: number) { if (admin.role === "owner") return; const auditId = await audit(env.DB, admin.id, action, "authorization", admin.id, "started", timestamp); await audit(env.DB, admin.id, action, "authorization", admin.id, "failure", timestamp, {}, auditId); throw new HttpError("FORBIDDEN", "Owner access is required.", 403); }
 
 async function adminRoute(request: Request, env: Env, admin: Admin, path: string, timestamp: number): Promise<Response> {
+  if (path === "/me" && request.method === "GET") return json(admin);
+  if (path === "/summary") path = "/overview";
   const write = request.method === "POST" || request.method === "DELETE";
   if (write) { try { csrf(request); } catch (cause) { const auditId = await audit(env.DB, admin.id, "csrf.reject", "request", path, "started", timestamp); await audit(env.DB, admin.id, "csrf.reject", "request", path, "failure", timestamp, {}, auditId); throw cause; } if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get("content-type") ?? "")) throw new HttpError("UNSUPPORTED_MEDIA_TYPE", "JSON content is required.", 415); }
   if (path === "/overview" && request.method === "GET") { const [d, r, c] = await Promise.all([env.DB.prepare("SELECT count(*) AS count FROM devices WHERE status = 'active'").first<{ count: number }>(), env.DB.prepare("SELECT count(*) AS count FROM releases WHERE status IN ('testing','production')").first<{ count: number }>(), env.DB.prepare("SELECT count(*) AS count FROM activation_codes WHERE status='unused' AND expires_at > ?").bind(timestamp).first<{ count: number }>()]); return json({ devices: d?.count ?? 0, releases: r?.count ?? 0, activationCodes: c?.count ?? 0 }); }
