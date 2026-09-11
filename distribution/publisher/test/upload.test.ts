@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
+import type { Socket } from "node:net";
 import { afterEach, expect, it, vi } from "vitest";
 import { S3Client } from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
@@ -62,6 +63,57 @@ it("fails a real stalled HTTP upload after bounded retries without registering o
     await pending;
   }
 }, 15000);
+it.each([false, true])("aborts a partial error response at the whole-upload deadline (multipart=%s)", async multipart => {
+  const { path, manifest } = await bundle(multipart ? Buffer.alloc(17 * 1024 * 1024) : Buffer.from("abc"));
+  let stalled = 0, aborted = 0, apiCalls = 0;
+  const sockets = new Set<Socket>();
+  const server = createServer((request, response) => {
+    request.resume();
+    if (request.method === "DELETE") { aborted++; response.writeHead(204); response.end(); return; }
+    if (request.method === "POST") {
+      response.writeHead(200, { "content-type": "application/xml" });
+      response.end("<InitiateMultipartUploadResult><UploadId>deadline-upload</UploadId></InitiateMultipartUploadResult>");
+      return;
+    }
+    stalled++;
+    response.writeHead(500, { "content-type": "application/xml", "content-length": "4096" });
+    response.flushHeaders();
+    response.write(`<Error><Message>${fake.secretAccessKey}`);
+    // Deliberately keep the body and socket open after flushing headers.
+  });
+  server.on("connection", socket => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("TEST_SERVER_ADDRESS");
+  const client = new S3Client({
+    endpoint: `http://127.0.0.1:${address.port}`, region: "auto", forcePathStyle: true,
+    credentials: { accessKeyId: fake.accessKeyId, secretAccessKey: fake.secretAccessKey }, maxAttempts: 1,
+    requestHandler: new NodeHttpHandler({ connectionTimeout: 100, requestTimeout: 100, socketTimeout: 6000, throwOnRequestTimeout: true }),
+  });
+  const adapter = { client, operationTimeoutMs: 500 };
+  const pending = publishRelease(path, manifest, fake, {
+    upload: (p, m, c) => uploadBundle(p, m, c, adapter),
+    fetch: async () => { apiCalls++; return new Response(); },
+  }).then(() => "UNEXPECTED_SUCCESS", error => error as Error);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([pending, new Promise<string>(resolve => { watchdog = setTimeout(() => resolve("WATCHDOG_EXPIRED"), 1800); })]);
+    expect(stalled).toBeGreaterThan(0);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("UPLOAD_FAILED");
+    for (const secret of secrets) expect((outcome as Error).message).not.toContain(secret);
+    expect(apiCalls).toBe(0);
+    expect(aborted).toBe(multipart ? 1 : 0);
+    // Close idle cleanup keepalive sockets; active stalled requests must already be cancelled.
+    server.closeIdleConnections();
+    await vi.waitFor(() => expect(sockets.size).toBe(0), { timeout: 1000 });
+  } finally {
+    clearTimeout(watchdog);
+    for (const socket of sockets) socket.destroy();
+    client.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await pending;
+  }
+}, 10000);
 it("rejects a bundle changed after validation and hides upload exception details", async () => {
   const { path, manifest } = await bundle(); await writeFile(path, "xyz");
   await expect(uploadBundle(path, manifest, fake, { createUpload: (options: any) => ({ done: async () => { for await (const _chunk of options.params.Body) {} } }) })).rejects.toThrow("UPLOAD_FAILED");
