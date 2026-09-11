@@ -3,11 +3,14 @@ import { mkdir, mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { afterEach, expect, it, vi } from "vitest";
 import { S3Client } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { uploadBundle } from "../src/upload.js";
 import { parseArgs, publishRelease } from "../src/publish.js";
 import { loadCredentials, redact } from "../src/credentials.js";
+import { validateRelease } from "../src/manifest.js";
 
 const fake = { bucket: "private-test-bucket", endpoint: "https://test.r2.cloudflarestorage.com", region: "auto", accessKeyId: "TEST_ONLY_ACCESS_ID", secretAccessKey: "TEST_ONLY_S3_SECRET", serviceTokenId: "TEST_ONLY_TOKEN_ID", serviceTokenSecret: "TEST_ONLY_TOKEN_SECRET", apiBase: "https://publisher.example.test" };
 const secrets = [fake.accessKeyId, fake.secretAccessKey, fake.serviceTokenId, fake.serviceTokenSecret];
@@ -23,11 +26,68 @@ it("sends 16 MiB multipart upload with cleanup and SHA metadata", async () => {
   await uploadBundle(path, manifest, fake, { createUpload: (options: any) => { captured = options; return { done: async () => { for await (const _chunk of options.params.Body) {} } }; } });
   expect(captured).toMatchObject({ partSize: 16777216, leavePartsOnError: false, params: { Bucket: fake.bucket, Key: manifest.objectKey, Metadata: { sha256: manifest.sha256 } } });
 });
+it("configures the real Node HTTP handler with finite connection, request and socket deadlines", async () => {
+  const { path, manifest } = await bundle(); let handler: NodeHttpHandler;
+  await uploadBundle(path, manifest, fake, { createUpload: options => ({ done: async () => {
+    handler = options.client.config.requestHandler as NodeHttpHandler;
+    // An already aborted request resolves the handler's lazy config without opening a socket.
+    await handler.handle({} as never, { abortSignal: AbortSignal.abort() }).catch(() => {});
+    for await (const _chunk of options.params.Body as AsyncIterable<Buffer>) {}
+  } }) });
+  expect(handler!).toBeInstanceOf(NodeHttpHandler);
+  expect(handler!.httpHandlerConfigs()).toMatchObject({ connectionTimeout: 10000, requestTimeout: 300000, socketTimeout: 300000, throwOnRequestTimeout: true });
+});
+it("fails a real stalled HTTP upload after bounded retries without registering or exposing secrets", async () => {
+  const { path, manifest } = await bundle(); let attempts = 0, apiCalls = 0;
+  const server = createServer(request => { attempts++; request.resume(); });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("TEST_SERVER_ADDRESS");
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const pending = publishRelease(path, manifest, fake, {
+    upload: (p, m, c) => uploadBundle(p, m, { ...c, endpoint: `http://127.0.0.1:${address.port}` }, {
+      httpHandlerOptions: { connectionTimeout: 100, requestTimeout: 100, socketTimeout: 100 },
+    }),
+    fetch: async () => { apiCalls++; return new Response(); },
+  }).then(() => "UNEXPECTED_SUCCESS", error => error as Error);
+  try {
+    const outcome = await Promise.race([pending, new Promise<string>(resolve => { watchdog = setTimeout(() => resolve("WATCHDOG_EXPIRED"), 6000); })]);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("UPLOAD_FAILED");
+    for (const secret of secrets) expect((outcome as Error).message).not.toContain(secret);
+    expect(attempts).toBe(3); expect(apiCalls).toBe(0);
+  } finally {
+    clearTimeout(watchdog);
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await pending;
+  }
+}, 15000);
 it("rejects a bundle changed after validation and hides upload exception details", async () => {
   const { path, manifest } = await bundle(); await writeFile(path, "xyz");
   await expect(uploadBundle(path, manifest, fake, { createUpload: (options: any) => ({ done: async () => { for await (const _chunk of options.params.Body) {} } }) })).rejects.toThrow("UPLOAD_FAILED");
   const error = await uploadBundle(path, manifest, fake, { createUpload: () => ({ done: async () => { throw new Error(fake.secretAccessKey); } }) }).catch(error => error);
   expect(error.message).toContain("UPLOAD_FAILED"); expect(error.message).not.toContain(fake.secretAccessKey);
+});
+it("leaves an existing release object intact when a later validated bundle changes", async () => {
+  const { path } = await bundle();
+  const packet = Buffer.alloc(74); packet[0] = 0x45; packet[1] = 0x44;
+  const signature = Buffer.from(`untrusted comment: signature\n${packet.toString("base64")}\ntrusted comment: timestamp: 1700000000\n${Buffer.alloc(64).toString("base64")}\n`).toString("base64");
+  await writeFile(`${path}.sig`, signature); await writeFile(`${path}.txt`, "Release notes");
+  const input = { version: "2.21.1", bundle: path, signature: `${path}.sig`, notes: `${path}.txt` };
+  const objects = new Map<string, Buffer>(); let apiCalls = 0;
+  const upload: typeof uploadBundle = (p, m, c) => uploadBundle(p, m, c, { createUpload: options => ({ done: async () => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of options.params.Body as AsyncIterable<Buffer>) chunks.push(chunk);
+    objects.set(options.params.Key!, Buffer.concat(chunks));
+  } }) });
+  const original = await validateRelease(input);
+  await upload(path, original, fake);
+  const nextAttempt = await validateRelease(input);
+  await writeFile(path, "xyz");
+  await expect(publishRelease(path, nextAttempt, fake, { upload, fetch: async () => { apiCalls++; return new Response(); } })).rejects.toThrow("UPLOAD_FAILED");
+  expect(objects.get(original.objectKey)?.toString()).toBe("abc");
+  expect(objects.get(nextAttempt.objectKey)?.toString()).toBe("xyz");
+  expect(objects.size).toBe(2); expect(apiCalls).toBe(0);
 });
 it("uploads before creating a draft, omits status and sends Access headers", async () => {
   const { path, manifest } = await bundle(); const events: string[] = [];

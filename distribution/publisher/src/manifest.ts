@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 
@@ -64,7 +64,9 @@ export async function validateRelease(input: ReleaseInput): Promise<ReleaseManif
   const sha256 = hash.digest("hex");
   const result: ReleaseManifest = {
     version: input.version, platform: "windows", arch: "x86_64",
-    objectKey: `releases/${input.version}/windows-x86_64/${sha256}.exe`,
+    // A changed file may finish uploading before the second hash check fails.
+    // Isolate each attempt so that failure can never overwrite an earlier release.
+    objectKey: `releases/${input.version}/windows-x86_64/${sha256}-${randomUUID()}.exe`,
     size, sha256, signature, notes, pubDate: new Date().toISOString(),
   };
   if (Buffer.byteLength(JSON.stringify(result), "utf8") > 8192) throw new Error("MANIFEST_TOO_LARGE");
