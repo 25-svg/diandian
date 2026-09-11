@@ -65,6 +65,18 @@ try {
   await page.getByRole("button", { name: "联网重试" }).click();
   await page.evaluate(() => { window.testLicense = { status: "clock_invalid", daysRemaining: null, message: "" }; window.finishOperation(); });
   await page.getByRole("alert").filter({ hasText: "系统时间" }).waitFor();
+  // A successful activation in offline grace must erase the one-time code.
+  await page.getByRole("button", { name: "使用激活码" }).click();
+  await code.fill("one-time-activation-code");
+  await page.getByRole("button", { name: "激活此电脑" }).click();
+  await page.evaluate(() => { window.testLicense = { status: "offline_grace", daysRemaining: 2, message: "" }; window.finishOperation(); });
+  await page.getByTestId("protected-content").waitFor();
+  await page.getByRole("button", { name: "联网续期" }).click();
+  await page.evaluate(() => { window.testLicense = { status: "expired", daysRemaining: null, message: "" }; window.finishOperation(); });
+  await page.getByRole("alert").filter({ hasText: "到期" }).waitFor();
+  assert.equal(await code.count(), 0, "successful activation closes the activation form");
+  await page.getByRole("button", { name: "使用激活码" }).click();
+  assert.equal(await code.inputValue(), "", "one-time code must not reappear after authorization expires");
   assert.equal(await page.evaluate(() => Object.keys(localStorage).length + Object.keys(sessionStorage).length), 0);
   console.log("license UI passed: loading, labels, paste, disabled, alerts, offline, expiry, clock, narrow viewport");
 } finally {

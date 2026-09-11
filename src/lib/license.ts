@@ -35,13 +35,22 @@ export function parseLicenseStatus(value: unknown): LicenseStatusDto {
 }
 type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 export function createLicenseClient(call: Invoke = invoke) {
-  let pending: Promise<LicenseStatusDto> | null = null;
+  const pending = new Map<string, Promise<LicenseStatusDto>>();
+  let tail: Promise<LicenseStatusDto> | null = null;
   function run(command: string, args?: Record<string, unknown>): Promise<LicenseStatusDto> {
-    if (pending) return pending;
-    pending = call(command, args).then(parseLicenseStatus).catch((): LicenseStatusDto => ({
+    const duplicate = pending.get(command);
+    if (duplicate) return duplicate;
+    // Only command names identify pending work; activation secrets stay in args.
+    const execute = () => call(command, args);
+    const result = (tail ? tail.then(execute, execute) : execute()).then(parseLicenseStatus).catch((): LicenseStatusDto => ({
       status: "blocked", daysRemaining: null, message: "授权操作未完成，请检查网络后重试。",
-    })).finally(() => { pending = null; });
-    return pending;
+    })).finally(() => {
+      pending.delete(command);
+      if (tail === result) tail = null;
+    });
+    pending.set(command, result);
+    tail = result;
+    return result;
   }
   return {
     status: () => run("get_license_status"),

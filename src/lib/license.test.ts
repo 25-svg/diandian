@@ -26,6 +26,39 @@ async function main() {
   assert.equal(calls, 1);
   finish({ status: "offline_grace", daysRemaining: 2, message: "" });
   assert.equal((await first).daysRemaining, 2);
+  const commands: string[] = [];
+  let finishQueued!: (value: unknown) => void;
+  const queued = createLicenseClient(command => {
+    commands.push(command);
+    return new Promise(resolve => { finishQueued = resolve; });
+  });
+  const status = queued.status();
+  assert.equal(queued.status(), status, "duplicate status shares its promise");
+  const renewal = queued.renew();
+  assert.notEqual(renewal, status, "renew must not reuse the status promise");
+  assert.equal(queued.renew(), renewal, "duplicate queued renew shares its promise");
+  assert.deepEqual(commands, ["get_license_status"]);
+  finishQueued({ status: "valid", daysRemaining: null, message: "" });
+  await status;
+  await Promise.resolve();
+  assert.deepEqual(commands, ["get_license_status", "renew_device_license"]);
+  finishQueued({ status: "offline_grace", daysRemaining: 3, message: "" });
+  assert.equal((await renewal).daysRemaining, 3);
+
+  const recoveryCommands: string[] = [];
+  let rejectRenew!: (reason: unknown) => void;
+  const recovery = createLicenseClient(command => {
+    recoveryCommands.push(command);
+    return command === "renew_device_license"
+      ? new Promise((_resolve, reject) => { rejectRenew = reject; })
+      : Promise.resolve({ status: "valid", daysRemaining: null, message: "" });
+  });
+  const rejected = recovery.renew();
+  const afterFailure = recovery.status();
+  rejectRenew(new Error("Bearer secret"));
+  assert.equal((await rejected).status, "blocked");
+  assert.equal((await afterFailure).status, "valid");
+  assert.deepEqual(recoveryCommands, ["renew_device_license", "get_license_status"]);
   console.log("license state / runtime boundary / concurrency tests passed");
 }
 void main();

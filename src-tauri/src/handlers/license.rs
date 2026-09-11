@@ -120,17 +120,29 @@ impl LicenseStore {
         }
     }
     fn revoke(&self) -> Result<(), LicenseError> {
+        self.revoke_with_marker(|| {
+            std::fs::create_dir_all(&self.root).map_err(|_| LicenseError::Vault)?;
+            let mut file =
+                tempfile::NamedTempFile::new_in(&self.root).map_err(|_| LicenseError::Vault)?;
+            file.write_all(b"revoked")
+                .and_then(|_| file.as_file().sync_all())
+                .map_err(|_| LicenseError::Vault)?;
+            file.persist(self.root.join("revoked"))
+                .map_err(|_| LicenseError::Vault)?;
+            Ok(())
+        })
+    }
+    // Keep every marker I/O step inside one failure boundary. The writer seam is
+    // private to this module and never exposed through a Tauri command.
+    fn revoke_with_marker(
+        &self,
+        write_marker: impl FnOnce() -> Result<(), LicenseError>,
+    ) -> Result<(), LicenseError> {
         REVOKED_IN_PROCESS
             .lock()
             .map_err(|_| LicenseError::Vault)?
             .insert(self.root.clone());
-        std::fs::create_dir_all(&self.root).map_err(|_| LicenseError::Vault)?;
-        let mut file =
-            tempfile::NamedTempFile::new_in(&self.root).map_err(|_| LicenseError::Vault)?;
-        file.write_all(b"revoked")
-            .and_then(|_| file.as_file().sync_all())
-            .map_err(|_| LicenseError::Vault)?;
-        if file.persist(self.root.join("revoked")).is_err() {
+        if write_marker().is_err() {
             // Best effort removal prevents a stale lease surviving a failed marker write.
             let _ = self.vault.clear();
             return Err(LicenseError::Vault);
@@ -517,6 +529,55 @@ mod tests {
             .status,
             "revoked"
         );
+    }
+    #[test]
+    fn marker_directory_failure_clears_old_vault_and_keeps_process_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cannot-create-directory");
+        std::fs::write(&root, b"occupied").unwrap();
+        let store = LicenseStore {
+            root,
+            vault: CredentialVault::at(dir.path().join("device.dpapi")),
+        };
+        store.vault.store(&credential(&signer())).unwrap();
+        assert_eq!(store.revoke().unwrap_err(), LicenseError::Vault);
+        assert!(store.vault.load().unwrap().is_none(), "stale vault must be removed even when directory creation fails");
+        assert!(store.revoked().unwrap());
+        REVOKED_IN_PROCESS.lock().unwrap().remove(&store.root);
+    }
+    #[test]
+    fn each_marker_writer_failure_clears_vault_and_keeps_process_revoked() {
+        for failed_step in ["create", "temp", "write", "sync", "persist"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LicenseStore::at(dir.path().to_owned());
+            let key = signer();
+            store.vault.store(&credential(&key)).unwrap();
+            // Inject only the unavailable filesystem step, preserving earlier
+            // real writes and the real DPAPI vault / revocation behavior.
+            let step = |name| {
+                if name == failed_step { Err(LicenseError::Vault) } else { Ok(()) }
+            };
+            let result = store.revoke_with_marker(|| {
+                step("create")?;
+                std::fs::create_dir_all(&store.root).unwrap();
+                step("temp")?;
+                let mut file = tempfile::NamedTempFile::new_in(&store.root).unwrap();
+                step("write")?;
+                file.write_all(b"revoked").unwrap();
+                step("sync")?;
+                file.as_file().sync_all().unwrap();
+                step("persist")?;
+                file.persist(store.root.join("revoked")).unwrap();
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err(), LicenseError::Vault, "{failed_step}");
+            assert!(store.vault.load().unwrap().is_none(), "{failed_step}");
+            assert_eq!(local_status(&store, key.public_key().as_ref(), 101).unwrap().status, "revoked", "{failed_step}");
+            assert_eq!(safe_error(LicenseError::Vault).message, "无法安全验证授权，请联网重试或联系管理员。");
+            REVOKED_IN_PROCESS.lock().unwrap().remove(&store.root);
+            let restarted = LicenseStore::at(store.root.clone());
+            assert_eq!(local_status(&restarted, key.public_key().as_ref(), 102).unwrap().status, "unactivated", "{failed_step}");
+        }
     }
     #[test]
     fn corrupted_storage_and_missing_key_never_authorize_and_dto_has_no_secrets() {

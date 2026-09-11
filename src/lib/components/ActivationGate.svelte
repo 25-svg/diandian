@@ -33,7 +33,8 @@
     if (mounted) {
       license = result;
       pending = "";
-      if (resolveLicenseView(result) === "app") { code = ""; showActivation = false; }
+      const activatedView = resolveLicenseView(result);
+      if (activatedView === "app" || activatedView === "app-with-warning") { code = ""; showActivation = false; }
     }
   }
   onMount(() => {
