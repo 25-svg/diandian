@@ -169,6 +169,9 @@ optional = true
 git = "https://github.com/tauri-apps/fix-path-env-rs"
 optional = true
 
+[build-dependencies]
+url = "2.5.4"
+
 [build-dependencies.tauri-build]
 version = "2"
 features = []

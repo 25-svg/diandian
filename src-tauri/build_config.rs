@@ -1,4 +1,5 @@
 use std::env;
+use url::Url;
 
 pub const DEV_UPDATE_ENDPOINT: &str = "http://127.0.0.1:8787/";
 pub const DEV_LICENSE_PUBLIC_KEY: &str =
@@ -43,26 +44,26 @@ pub fn validate_public_key(value: &str) -> Result<(), &'static str> {
 }
 
 pub fn validate_endpoint(value: &str) -> Result<(), &'static str> {
-    if !value.starts_with("https://") || value.len() <= "https://".len() {
-        return Err("must be an HTTPS root origin");
+    let endpoint = Url::parse(value).map_err(|_| "must be a valid absolute URL")?;
+    if endpoint.scheme() != "https" || !value.starts_with("https://") {
+        return Err("must use HTTPS");
     }
-    let authority_and_path = &value["https://".len()..];
-    if value
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace() || byte == b'\\')
-        || authority_and_path.contains('@')
-        || authority_and_path.contains('?')
-        || authority_and_path.contains('#')
+    let authority_and_suffix = &value["https://".len()..];
+    let raw_suffix = authority_and_suffix
+        .find('/')
+        .map_or("", |index| &authority_and_suffix[index..]);
+    if endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.path() != "/"
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !matches!(raw_suffix, "" | "/")
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == b'\\')
     {
-        return Err("must not contain credentials, query, or fragment");
-    }
-    let (authority, path) = authority_and_path
-        .split_once('/')
-        .map_or((authority_and_path, ""), |(authority, path)| {
-            (authority, path)
-        });
-    if authority.is_empty() || !path.is_empty() {
-        return Err("must be a root origin");
+        return Err("must be an HTTPS root origin without credentials, path, query, or fragment");
     }
     Ok(())
 }
@@ -103,13 +104,31 @@ mod tests {
 
     #[test]
     fn endpoint_requires_https_root_without_credentials_or_suffixes() {
-        assert!(validate_endpoint("https://updates.example.com/").is_ok());
+        for valid in [
+            "https://updates.example.com",
+            "https://updates.example.com/",
+            "https://updates.example.com:8443/",
+            "https://[2001:db8::1]/",
+            "https://[2001:db8::1]:8443/",
+        ] {
+            assert!(validate_endpoint(valid).is_ok(), "rejected {valid}");
+        }
         for invalid in [
             "http://updates.example.com/",
+            " https://updates.example.com/",
+            "https://updates.example.com/ ",
+            "https://:/",
+            "https://updates.example.com:bad/",
+            "https://updates.example.com:70000/",
+            "https://2001:db8::1/",
             "https://user@updates.example.com/",
+            "https://:password@updates.example.com/",
             "https://updates.example.com/v1",
+            "https://updates.example.com/.",
+            "https://updates.example.com/%2e",
             "https://updates.example.com/?channel=prod",
             "https://updates.example.com/#prod",
+            "https://updates.example.com\\escape",
         ] {
             assert!(validate_endpoint(invalid).is_err(), "accepted {invalid}");
         }

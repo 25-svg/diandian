@@ -14,6 +14,17 @@ run(process.execPath, ["scripts/test-private-distribution-config.mjs"]);
 run(npm, ["--prefix", "distribution/control-plane", "test"], process.env, process.platform === "win32");
 run(npm, ["--prefix", "distribution/publisher", "test"], process.env, process.platform === "win32");
 run(npm, ["run", "test:license"], process.env, process.platform === "win32");
+run(process.execPath, ["scripts/test-license-ui.mjs"]);
 run(process.execPath, ["--loader", "ts-node/esm", "src/lib/appUpdater.test.ts"]);
+run("cargo", ["test", "--manifest-path", "src-tauri/Cargo.toml", "--bin", "bili-shadowreplay", "--no-default-features", "--features", "gui", "handlers::license"], cargoEnvironment);
 run("cargo", ["test", "--manifest-path", "src-tauri/Cargo.toml", "--test", "private_distribution", "--no-default-features", "--features", "gui"], cargoEnvironment);
 run("cargo", ["test", "--manifest-path", "src-tauri/Cargo.toml", "private_distribution::updater", "--no-default-features", "--features", "gui"], cargoEnvironment);
+
+const canary = `diandian-build-secret-canary-${process.pid}-${Date.now()}`;
+const buildEnvironment = {
+  ...process.env,
+  PRIVATE_DISTRIBUTION_SECRET_CANARY: canary,
+  VITE_PRIVATE_DISTRIBUTION_SECRET_CANARY: canary,
+};
+run(npm, ["run", "build"], buildEnvironment, process.platform === "win32");
+run(process.execPath, ["scripts/audit-private-client.mjs"], buildEnvironment);

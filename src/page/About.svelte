@@ -3,48 +3,8 @@
   import { BookOpen, MessageCircle, Video, Heart } from "lucide-svelte";
   import MacModal from "../lib/components/MacModal.svelte";
   import PageShell from "../lib/components/PageShell.svelte";
-  import { hasNewVersion, latestVersion } from "../lib/stores/version";
   let version = `v${__APP_VERSION__}`;
   let showDonateModal = false;
-  let releases = [];
-
-  // get releases from github api
-  fetch("https://api.github.com/repos/Xinrea/bili-shadowreplay/releases")
-    .then((response) => response.json())
-    .then((data) => {
-      // Filter out prerelease versions
-      const stableReleases = data.filter((release) => !release.prerelease);
-      const latest = stableReleases[0]?.tag_name;
-      latestVersion.set(latest);
-      // Compare versions and set hasNewVersion
-      if (version && latest !== version) {
-        hasNewVersion.set(true);
-      }
-      releases = stableReleases.slice(0, 3).map((release) => ({
-        version: release.tag_name,
-        date: new Date(release.published_at).toLocaleDateString(),
-        description: release.body,
-        url: release.html_url,
-      }));
-    });
-
-  function formatReleaseNotes(notes) {
-    if (!notes) return [];
-    return notes
-      .split("\n")
-      .filter(
-        (line) => line.trim().startsWith("*") || line.trim().startsWith("-"),
-      )
-      .map((line) => {
-        line = line.trim().replace(/^[*-]\s*/, "");
-        // Remove commit hash at the end (- hash or hash)
-        line = line
-          .replace(/\s*-\s*[a-f0-9]{40}$/, "")
-          .replace(/\s+[a-f0-9]{40}$/, "");
-        return line;
-      })
-      .filter((line) => line.length > 0);
-  }
 
   function toggleDonateModal() {
     showDonateModal = !showDonateModal;
@@ -123,38 +83,13 @@
       </button>
     </div>
 
-    <!-- What's New -->
+    <!-- Private updates -->
     <div class="space-y-4">
       <h2 class="text-[15px] font-semibold text-[color:var(--mac-label)]">更新说明</h2>
-      <div class="mac-card">
-        {#each releases as release}
-          <!-- svelte-ignore a11y-click-events-have-key-events -->
-          <div
-            class="p-4 cursor-pointer {release !== releases[releases.length - 1]
-              ? 'border-b border-gray-200 dark:border-gray-700'
-              : ''}"
-            on:click={() => {
-              open(release.url);
-            }}
-          >
-            <div class="flex items-center justify-between">
-              <h3 class="text-sm font-medium text-gray-900 dark:text-white">
-                Version {release.version}
-              </h3>
-              <span class="text-xs text-gray-500 dark:text-gray-400"
-                >Released on {release.date}</span
-              >
-            </div>
-            <ul class="mt-2 space-y-1 text-sm text-gray-600 dark:text-gray-300">
-              {#each formatReleaseNotes(release.description) as note}
-                <li class="flex items-start space-x-2">
-                  <span class="text-blue-500">•</span>
-                  <span>{note}</span>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {/each}
+      <div class="mac-card p-4">
+        <p class="text-sm text-[color:var(--mac-secondary)]">
+          更新由管理员私密发布。应用会在空闲时自动检查并安装，无需访问公开下载页面。
+        </p>
       </div>
     </div>
   </div>
