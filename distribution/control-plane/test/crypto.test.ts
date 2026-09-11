@@ -52,12 +52,32 @@ describe("offline license lease cryptography", () => {
     expect(token).not.toContain("=");
     expect(token).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(await sha256Hex(token)).toMatch(/^[a-f0-9]{64}$/);
+    expect(await sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     expect(expiresAt - issuedAt).toBe(7 * 24 * 60 * 60);
     expect(encodedBody).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(encodedSignature).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(decodeBase64url(encodedSignature!).byteLength).toBe(64);
     expect(new TextDecoder().decode(decodeBase64url(encodedBody!))).toBe(
       '{"deviceId":"dev-1","issuedAt":100,"expiresAt":604900,"serverTime":100}',
     );
     expect(await verifyFixtureLease(lease, publicJwk)).toBe(true);
+  });
+
+  it("accepts only an integer token byte count from one through 65536", () => {
+    expect(randomToken(1)).toMatch(/^[A-Za-z0-9_-]{2}$/);
+    expect(randomToken(65536)).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    for (const invalidBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 65537]) {
+      expect(() => randomToken(invalidBytes)).toThrow(RangeError);
+    }
+  });
+
+  it("rejects lease payloads without safe integer times or an exact seven-day duration", async () => {
+    const { privateJwk } = await createKeyPair();
+    const valid = { deviceId: "dev-1", issuedAt: 100, expiresAt: 100 + LEASE_SECONDS, serverTime: 100 };
+
+    await expect(signLease({ ...valid, expiresAt: valid.expiresAt - 1 }, privateJwk)).rejects.toThrow(RangeError);
+    await expect(signLease({ ...valid, issuedAt: Number.NaN }, privateJwk)).rejects.toThrow(RangeError);
+    await expect(signLease({ ...valid, serverTime: Number.MAX_SAFE_INTEGER + 1 }, privateJwk)).rejects.toThrow(RangeError);
   });
 });
