@@ -54,10 +54,11 @@ describe("Access identity boundary", () => {
     [{ exp: 1_900_000_000, iat: 1_800_000_000, email: "a@example.com" }, "missing issuer/audience"],
     [{ iss: issuer, aud: "admin", exp: 1_900_000_000, email: "a@example.com" }, "missing iat"],
     [{ iss: issuer, aud: "admin", exp: 1_900_000_000, iat: 9_999_999_999, email: "a@example.com" }, "future iat"],
-  ])("fails closed on %s", async (claims, _label) => {
-    const signed = await jwt(claims);
+  ])("fails closed on %s", async (claims, label) => {
+    const audience = `claim-${label}`;
+    const signed = await jwt({ ...claims, ...(("aud" in claims && claims.aud) ? { aud: audience } : {}) });
     vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ keys: [signed.jwk] }), { headers: { "content-type": "application/json" } }));
-    const adapter = createAccessIdentityAdapter({ issuer, audience: "admin", jwksUrl });
+    const adapter = createAccessIdentityAdapter({ issuer, audience, jwksUrl });
     await expect(adapter.verify(new Request("https://admin", { headers: { "cf-access-jwt-assertion": signed.token } }))).resolves.toBeNull();
     vi.unstubAllGlobals();
   });
