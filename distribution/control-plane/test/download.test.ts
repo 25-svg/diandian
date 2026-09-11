@@ -96,7 +96,7 @@ describe("private update download and events", () => {
     const check = await update(env, token);
     const body = await check.json() as { url: string };
     const ticket = new URL(body.url).pathname.split("/").at(-1)!;
-    const download = await worker.fetch(new Request(`https://control.example/v1/download/${ticket}`, { headers: { authorization: `Bearer ${token}` } }), env, context);
+    const download = await worker.fetch(new Request(body.url, { headers: { authorization: `Bearer ${token}` } }), env, context);
 
     expect(check.status).toBe(200);
     expect(download.status).toBe(200);
@@ -139,18 +139,20 @@ describe("private update download and events", () => {
     const validTicket = new URL((await normal.json() as { url: string }).url).pathname.split("/").at(-1)!;
     const ticketHash = await sha256Hex(validTicket);
 
+    expect((await worker.fetch(new Request(`https://control.example/v1/download/other-release/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
+
     database.prepare("UPDATE download_tickets SET expires_at = 1 WHERE token_hash = ?").run(ticketHash);
-    expect((await worker.fetch(new Request(`https://control.example/v1/download/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
+    expect((await worker.fetch(new Request(`https://control.example/v1/download/release-1/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
     database.prepare("UPDATE download_tickets SET expires_at = 4102444800, revoked_at = NULL WHERE token_hash = ?").run(ticketHash);
-    expect((await worker.fetch(new Request(`https://control.example/v1/download/${validTicket}`, { headers: { authorization: `Bearer ${token2}` } }), env, context)).status).toBe(403);
+    expect((await worker.fetch(new Request(`https://control.example/v1/download/release-1/${validTicket}`, { headers: { authorization: `Bearer ${token2}` } }), env, context)).status).toBe(403);
     database.prepare("UPDATE download_tickets SET revoked_at = 2 WHERE token_hash = ?").run(ticketHash);
-    expect((await worker.fetch(new Request(`https://control.example/v1/download/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
+    expect((await worker.fetch(new Request(`https://control.example/v1/download/release-1/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
     database.prepare("UPDATE download_tickets SET revoked_at = NULL WHERE token_hash = ?").run(ticketHash);
     database.prepare("UPDATE releases SET status = 'halted'").run();
-    expect((await worker.fetch(new Request(`https://control.example/v1/download/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
+    expect((await worker.fetch(new Request(`https://control.example/v1/download/release-1/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(403);
     database.prepare("UPDATE releases SET status = 'production'").run();
     objects.clear();
-    expect((await worker.fetch(new Request(`https://control.example/v1/download/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(404);
+    expect((await worker.fetch(new Request(`https://control.example/v1/download/release-1/${validTicket}`, { headers: { authorization: `Bearer ${token1}` } }), env, context)).status).toBe(404);
   });
 
   it("rejects malformed update paths and records only authenticated allowlisted update events", async () => {
@@ -241,7 +243,7 @@ describe("private update download and events", () => {
 
     const updateResponse = await update(fixtureResult.env, token);
     database.prepare("UPDATE devices SET status = 'active'").run();
-    const downloadResponse = await worker.fetch(new Request(`https://control.example/v1/download/${ticket}`, { headers: { authorization: `Bearer ${token}` } }), fixtureResult.env, context);
+    const downloadResponse = await worker.fetch(new Request(`https://control.example/v1/download/release-1/${ticket}`, { headers: { authorization: `Bearer ${token}` } }), fixtureResult.env, context);
     database.prepare("UPDATE devices SET status = 'active'").run();
     const eventResponse = await worker.fetch(new Request("https://control.example/v1/update-events", {
       method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },

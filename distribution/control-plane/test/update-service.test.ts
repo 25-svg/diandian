@@ -84,7 +84,7 @@ describe("UpdateService.resolveUpdate", () => {
     const ticket = new URL(result!.url).pathname.split("/").at(-1)!;
     const stored = database.prepare("SELECT device_id, release_id, expires_at, token_hash FROM download_tickets").get() as Record<string, unknown>;
 
-    expect(result!.url).toMatch(/^https:\/\/control\.example\/v1\/download\/[A-Za-z0-9_-]{43}$/);
+    expect(result!.url).toMatch(/^https:\/\/control\.example\/v1\/download\/release-1\/[A-Za-z0-9_-]{43}$/);
     expect(stored).toMatchObject({ device_id: "device-1", release_id: "release-1", expires_at: 1_700_000_900 });
     expect(stored.token_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(stored.token_hash).not.toBe(ticket);

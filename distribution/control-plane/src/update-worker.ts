@@ -193,10 +193,10 @@ async function handle(request: Request, env: LicenseEnv): Promise<Response> {
     });
     return result ? json(result) : new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
   }
-  if (rawParts.length === 4 && rawParts[1] === "v1" && rawParts[2] === "download") {
+  if (rawParts.length === 5 && rawParts[1] === "v1" && rawParts[2] === "download") {
     if (request.method !== "GET") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
     const device = await activeDevice(request, env);
-    return updateService(env).download({ ticket: decodePathPart(rawParts[3]!), deviceId: device.id, testGroup: device.testGroup });
+    return updateService(env).download({ releaseId: decodePathPart(rawParts[3]!), ticket: decodePathPart(rawParts[4]!), deviceId: device.id, testGroup: device.testGroup });
   }
   if (path === "/v1/update-events") {
     if (request.method !== "POST") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);

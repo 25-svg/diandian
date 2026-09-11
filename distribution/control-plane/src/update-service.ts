@@ -140,13 +140,14 @@ export class UpdateService {
       version: candidate.release.version,
       notes: candidate.release.notes,
       pub_date: candidate.release.pub_date,
-      url: new URL(`/v1/download/${ticket}`, origin).toString(),
+      url: new URL(`/v1/download/${candidate.release.id}/${ticket}`, origin).toString(),
       signature: candidate.release.signature,
     };
   }
 
-  async download(input: { ticket: string; deviceId: string; testGroup: boolean }): Promise<Response> {
+  async download(input: { ticket: string; releaseId: string; deviceId: string; testGroup: boolean }): Promise<Response> {
     requireTicket(input.ticket);
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(input.releaseId)) throw new UpdateError("INVALID_REQUEST", "Release is invalid.");
     if (!this.artifacts) throw new Error("Artifact storage is unavailable");
     const now = this.now();
     const record = await this.db.prepare(
@@ -155,8 +156,9 @@ export class UpdateService {
        JOIN releases r ON r.id = dt.release_id
        WHERE dt.token_hash = ? AND dt.device_id = ? AND dt.purpose = 'update'
          AND dt.expires_at > ? AND dt.revoked_at IS NULL AND d.status = 'active'
-         AND (r.status = 'production' OR (r.status = 'testing' AND d.test_group = '1'))`,
-    ).bind(await sha256Hex(input.ticket), input.deviceId, now).first<DownloadRecord>();
+         AND (r.status = 'production' OR (r.status = 'testing' AND d.test_group = '1'))
+         AND r.id = ?`,
+    ).bind(await sha256Hex(input.ticket), input.deviceId, now, input.releaseId).first<DownloadRecord>();
     if (!record) {
       throw new UpdateError("TICKET_INVALID", "Download ticket is invalid or unavailable.");
     }

@@ -220,6 +220,23 @@ impl crate::private_distribution::updater::UpdateAuthorization for AppLicenseAut
         })()
         .map_err(|_| ())
     }
+    async fn online_authorized_credential(&self) -> Result<StoredCredential, ()> {
+        let _guard = LICENSE_LOCK.lock().await;
+        async {
+            let store = app_store(&self.app)?;
+            if store.revoked()? {
+                return Err(LicenseError::Revoked);
+            }
+            let key = compiled_public_key()?;
+            let client = DistributionClient::compiled()?;
+            renew_online_credential(&store, &key, now, |token| async move {
+                client.renew(&token).await
+            })
+            .await
+        }
+        .await
+        .map_err(|_| ())
+    }
 }
 async fn activate_with<F, Fut>(
     store: &LicenseStore,
@@ -300,6 +317,44 @@ where
         Err(LicenseError::Unavailable) => local_status(store, key, clock()?),
         Err(error) => Err(error),
     }
+}
+
+async fn renew_online_credential<F, Fut>(
+    store: &LicenseStore,
+    key: &[u8],
+    clock: impl Fn() -> Result<i64, LicenseError>,
+    renew: F,
+) -> Result<StoredCredential, LicenseError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<RenewalResponse, LicenseError>>,
+{
+    let Some(mut credential) = store.vault.load()? else {
+        return Err(LicenseError::InvalidToken);
+    };
+    let old_claims = verify_lease(&credential.lease, key)?;
+    let response = match renew(credential.device_token.clone()).await {
+        Ok(value) => value,
+        Err(error @ (LicenseError::Revoked | LicenseError::InvalidToken)) => {
+            store.revoke()?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let claims = verify_lease(&response.lease, key)?;
+    if claims.device_id != old_claims.device_id
+        || claims.server_time < credential.last_server_time.max(old_claims.server_time)
+    {
+        return Err(LicenseError::InvalidResponse);
+    }
+    let status = evaluate_lease_at(&response.lease, key, clock()?, claims.server_time)?;
+    if status != LicenseStatus::Valid {
+        return Err(LicenseError::InvalidLease);
+    }
+    credential.lease = response.lease;
+    credential.last_server_time = claims.server_time;
+    store.accept(&credential)?;
+    Ok(credential)
 }
 #[cfg(feature = "gui")]
 fn app_store(app: &tauri::AppHandle) -> Result<LicenseStore, LicenseError> {
@@ -568,6 +623,35 @@ mod tests {
             .status,
             "revoked"
         );
+    }
+    #[tokio::test]
+    async fn updater_online_boundary_rejects_network_fallback_and_persists_fresh_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LicenseStore::at(dir.path().to_owned());
+        let key = signer();
+        store.vault.store(&credential(&key)).unwrap();
+        assert_eq!(
+            renew_online_credential(
+                &store,
+                key.public_key().as_ref(),
+                || Ok(101),
+                |_| async { Err(LicenseError::Unavailable) }
+            )
+            .await
+            .unwrap_err(),
+            LicenseError::Unavailable
+        );
+        let lease = signed(&key, "device", 200);
+        let refreshed = renew_online_credential(
+            &store,
+            key.public_key().as_ref(),
+            || Ok(200),
+            |_| async { Ok(RenewalResponse { lease }) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.last_server_time, 200);
+        assert_eq!(store.vault.load().unwrap().unwrap().last_server_time, 200);
     }
     #[test]
     fn marker_directory_failure_clears_old_vault_and_keeps_process_revoked() {
