@@ -230,6 +230,27 @@ describe("private update download and events", () => {
     expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.23.0" });
   });
 
+  it("idempotently accepts a response-lost install event id and rejects conflicting reuse", async () => {
+    const { database, env } = await fixture();
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token);
+    seedRelease(database, "production", "release-22", "2.22.0");
+    seedRelease(database, "production", "release-23", "2.23.0");
+    seedHistoryTicket(database, "ticket-22", "device-1", "release-22");
+    seedHistoryTicket(database, "ticket-23", "device-1", "release-23");
+    const clientEventId = "123e4567-e89b-42d3-a456-426614174000";
+    const post = (releaseId: string, currentVersion: string) => worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ releaseId, currentVersion, eventType: "install_succeeded", clientEventId }),
+    }), env, context);
+
+    expect((await post("release-22", "2.22.0")).status).toBe(204); // response is considered lost
+    expect((await post("release-22", "2.22.0")).status).toBe(204);
+    expect(database.prepare("SELECT count(*) AS count FROM update_events WHERE id = ?").get(clientEventId)).toEqual({ count: 1 });
+    expect((await post("release-23", "2.23.0")).status).toBe(400);
+    expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.22.0" });
+  });
+
   it("rechecks authorization after the initial Bearer lookup before update, download, and event writes", async () => {
     let database: DatabaseSync;
     const fixtureResult = await fixture(() => database.prepare("UPDATE devices SET status = 'revoked'").run());

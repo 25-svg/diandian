@@ -147,7 +147,7 @@ pub struct PrivateUpdateCoordinator {
     running: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
-    cached_path: Arc<Mutex<Option<PathBuf>>>,
+    cached_artifact: Arc<Mutex<Option<CachedArtifact>>>,
 }
 impl Default for PrivateUpdateCoordinator {
     fn default() -> Self {
@@ -156,7 +156,7 @@ impl Default for PrivateUpdateCoordinator {
             running: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),
-            cached_path: Arc::new(Mutex::new(None)),
+            cached_artifact: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -177,11 +177,14 @@ impl PrivateUpdateCoordinator {
             .ok()
             .map(|_| RunGuard(self.running.clone()))
     }
-    fn set_cached_path(&self, path: Option<PathBuf>) {
-        *self.cached_path.lock().unwrap_or_else(|e| e.into_inner()) = path;
+    fn set_cached_artifact(&self, artifact: Option<CachedArtifact>) {
+        *self
+            .cached_artifact
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = artifact;
     }
-    fn cached_path(&self) -> Option<PathBuf> {
-        self.cached_path
+    fn cached_artifact(&self) -> Option<CachedArtifact> {
+        self.cached_artifact
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -192,20 +195,27 @@ impl PrivateUpdateCoordinator {
             .is_ok()
     }
     fn cleanup_cached_path_with(&self, remove: impl FnOnce(&Path) -> std::io::Result<()>) -> bool {
-        let Some(path) = self.cached_path() else {
+        let Some(artifact) = self.cached_artifact() else {
             return true;
         };
+        let path = artifact.path;
         match remove(&path) {
             Ok(()) => {
-                let mut owned = self.cached_path.lock().unwrap_or_else(|e| e.into_inner());
-                if owned.as_ref() == Some(&path) {
+                let mut owned = self
+                    .cached_artifact
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if owned.as_ref().is_some_and(|owned| owned.path == path) {
                     *owned = None;
                 }
                 true
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut owned = self.cached_path.lock().unwrap_or_else(|e| e.into_inner());
-                if owned.as_ref() == Some(&path) {
+                let mut owned = self
+                    .cached_artifact
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if owned.as_ref().is_some_and(|owned| owned.path == path) {
                     *owned = None;
                 }
                 true
@@ -216,9 +226,23 @@ impl PrivateUpdateCoordinator {
     fn cleanup_cached_path(&self) -> bool {
         self.cleanup_cached_path_with(|path| std::fs::remove_file(path))
     }
+    fn prepare_scheduler_entry_with(
+        &self,
+        remove: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> bool {
+        self.cleanup_cached_path_with(remove)
+    }
+    fn prepare_scheduler_entry(&self) -> bool {
+        self.prepare_scheduler_entry_with(|path| std::fs::remove_file(path))
+    }
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
-        self.cleanup_cached_path();
+        for _ in 0..3 {
+            if self.cleanup_cached_path() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -230,6 +254,13 @@ where
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) | Err(_) => Err(()),
     }
+}
+
+async fn report_best_effort<F, T, E>(future: F)
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let _ = future.await;
 }
 
 fn valid_release_id(value: &str) -> bool {
@@ -271,6 +302,7 @@ fn release_id_from_download_url(origin: &url::Url, download: &url::Url) -> Resul
 struct PendingInstallReceipt {
     release_id: String,
     target_version: String,
+    client_event_id: String,
 }
 
 fn write_pending_receipt(root: &Path, receipt: &PendingInstallReceipt) -> std::io::Result<()> {
@@ -284,7 +316,31 @@ fn write_pending_receipt(root: &Path, receipt: &PendingInstallReceipt) -> std::i
     Ok(())
 }
 
-fn write_verified_cache(root: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+fn remove_acknowledged_receipt_with(
+    path: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> bool {
+    match remove(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedArtifact {
+    path: PathBuf,
+    sha256: [u8; 32],
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut value = [0; 32];
+    value.copy_from_slice(digest.as_ref());
+    value
+}
+
+fn write_verified_cache(root: &Path, bytes: &[u8]) -> std::io::Result<CachedArtifact> {
     use std::io::Write;
     std::fs::create_dir_all(root)?;
     let target = root.join("verified-update.bin");
@@ -292,7 +348,21 @@ fn write_verified_cache(root: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     temporary.persist(&target).map_err(|e| e.error)?;
-    Ok(target)
+    Ok(CachedArtifact {
+        path: target,
+        sha256: sha256(bytes),
+    })
+}
+
+fn read_verified_cache(artifact: &CachedArtifact) -> std::io::Result<Vec<u8>> {
+    let bytes = std::fs::read(&artifact.path)?;
+    if sha256(&bytes) != artifact.sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verified update cache digest mismatch",
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(feature = "gui")]
@@ -312,12 +382,11 @@ impl PrivateUpdateCoordinator {
         tauri::async_runtime::spawn(async move {
             let stale_cache = cache_root.join("verified-update.bin");
             if stale_cache.exists() {
-                coordinator.set_cached_path(Some(stale_cache));
+                coordinator.set_cached_artifact(Some(CachedArtifact {
+                    path: stale_cache,
+                    sha256: [0; 32],
+                }));
             }
-            coordinator.cleanup_cached_path();
-            coordinator
-                .reconcile_pending_install(&app, &cache_root, authorization.as_ref())
-                .await;
             let mut schedule = CheckSchedule::default();
             loop {
                 let delay = schedule.next_delay();
@@ -326,6 +395,17 @@ impl PrivateUpdateCoordinator {
                 }
                 if coordinator.shutting_down.load(Ordering::Acquire) {
                     break;
+                }
+                let receipt_reconciled = coordinator
+                    .reconcile_pending_install(&app, &cache_root, authorization.as_ref())
+                    .await;
+                if !receipt_reconciled {
+                    schedule.record_failure();
+                    continue;
+                }
+                if !coordinator.prepare_scheduler_entry() {
+                    schedule.record_failure();
+                    continue;
                 }
                 let success = coordinator
                     .run_once(
@@ -356,6 +436,10 @@ impl PrivateUpdateCoordinator {
         let Some(_run) = self.begin_run() else {
             return false;
         };
+        if !self.prepare_scheduler_entry() {
+            self.set_status(UpdatePhase::Failed, None);
+            return false;
+        }
         self.set_status(UpdatePhase::Checking, None);
         let credential = match authorization.authorized_credential().await {
             Ok(value) => value,
@@ -387,14 +471,7 @@ impl PrivateUpdateCoordinator {
             }
         };
         let current_version = app.package_info().version.to_string();
-        if client
-            .report_event(&token, None, &current_version, "check")
-            .await
-            .is_err()
-        {
-            self.set_status(UpdatePhase::Failed, None);
-            return false;
-        }
+        report_best_effort(client.report_event(&token, None, &current_version, "check")).await;
         let updater = match build_private_updater(app, endpoint, &token, before_install_exit) {
             Ok(updater) => updater,
             Err(_) => {
@@ -421,19 +498,13 @@ impl PrivateUpdateCoordinator {
                 return false;
             }
         };
-        if client
-            .report_event(
-                &token,
-                Some(&release_id),
-                &current_version,
-                "download_started",
-            )
-            .await
-            .is_err()
-        {
-            self.set_status(UpdatePhase::Failed, version);
-            return false;
-        }
+        report_best_effort(client.report_event(
+            &token,
+            Some(&release_id),
+            &current_version,
+            "download_started",
+        ))
+        .await;
         self.set_status(UpdatePhase::Downloading, version.clone());
         let bytes =
             match bounded_download(update.download(|_, _| {}, || {}), DOWNLOAD_TIMEOUT).await {
@@ -463,8 +534,8 @@ impl PrivateUpdateCoordinator {
             return false;
         }
         // Update::download verifies the Tauri minisign signature before returning.
-        let cache_path = match write_verified_cache(cache_root, &bytes) {
-            Ok(path) => path,
+        let cache = match write_verified_cache(cache_root, &bytes) {
+            Ok(cache) => cache,
             Err(_) => {
                 let _ = client
                     .report_event(
@@ -479,7 +550,7 @@ impl PrivateUpdateCoordinator {
             }
         };
         drop(bytes);
-        self.set_cached_path(Some(cache_path.clone()));
+        self.set_cached_artifact(Some(cache.clone()));
         self.set_status(UpdatePhase::WaitingForIdle, version.clone());
         let started = std::time::Instant::now();
         let mut gate = IdleGate::new(IDLE_REQUIRED);
@@ -508,9 +579,14 @@ impl PrivateUpdateCoordinator {
             self.set_status(UpdatePhase::Failed, version);
             return false;
         }
-        let install_bytes = match tokio::fs::read(&cache_path).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
+        let _validated_bytes = match tokio::task::spawn_blocking({
+            let cache = cache.clone();
+            move || read_verified_cache(&cache)
+        })
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            _ => {
                 self.cleanup_cached_path();
                 let _ = client
                     .report_event(
@@ -540,12 +616,48 @@ impl PrivateUpdateCoordinator {
             self.set_status(UpdatePhase::Failed, version);
             return false;
         }
+        // Install only the exact bytes whose digest was retained when Tauri
+        // verified the download. Re-read at the last boundary to close the
+        // cache-tampering window between the first read and Update::install.
+        let install_bytes = match tokio::task::spawn_blocking({
+            let cache = cache.clone();
+            move || read_verified_cache(&cache)
+        })
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            _ => {
+                self.cleanup_cached_path();
+                let _ = client
+                    .report_event(
+                        &token,
+                        Some(&release_id),
+                        &current_version,
+                        "install_failed",
+                    )
+                    .await;
+                self.set_status(UpdatePhase::Failed, version);
+                return false;
+            }
+        };
+        if !self.cleanup_cached_path() {
+            let _ = client
+                .report_event(
+                    &token,
+                    Some(&release_id),
+                    &current_version,
+                    "install_failed",
+                )
+                .await;
+            self.set_status(UpdatePhase::Failed, version);
+            return false;
+        }
         let receipt = PendingInstallReceipt {
             release_id: release_id.clone(),
             target_version: update.version.clone(),
+            client_event_id: uuid::Uuid::new_v4().to_string(),
         };
         if write_pending_receipt(cache_root, &receipt).is_err() {
-            self.cleanup_cached_path();
             let _ = client
                 .report_event(
                     &token,
@@ -563,6 +675,7 @@ impl PrivateUpdateCoordinator {
             tauri::async_runtime::spawn_blocking(move || update.install(install_bytes)).await;
         if !matches!(install, Ok(Ok(()))) {
             self.cleanup_cached_path();
+            let _ = tokio::fs::remove_file(cache_root.join(RECEIPT_FILE)).await;
             let _ = client
                 .report_event(
                     &token,
@@ -582,37 +695,44 @@ impl PrivateUpdateCoordinator {
         app: &tauri::AppHandle,
         root: &Path,
         authorization: &dyn UpdateAuthorization,
-    ) {
+    ) -> bool {
         let path = root.join(RECEIPT_FILE);
         let Ok(bytes) = tokio::fs::read(&path).await else {
-            return;
+            return true;
         };
         let Ok(receipt) = serde_json::from_slice::<PendingInstallReceipt>(&bytes) else {
-            return;
+            return true;
         };
         if !valid_release_id(&receipt.release_id)
+            || uuid::Uuid::parse_str(&receipt.client_event_id).is_err()
             || receipt.target_version != app.package_info().version.to_string()
         {
-            return;
+            return true;
         }
         let Ok(credential) = authorization.online_authorized_credential().await else {
-            return;
+            return false;
         };
         let Ok(client) = super::client::DistributionClient::compiled() else {
-            return;
+            return false;
         };
         if client
-            .report_event(
+            .report_event_idempotent(
                 &credential.device_token,
                 Some(&receipt.release_id),
                 &receipt.target_version,
                 "install_succeeded",
+                &receipt.client_event_id,
             )
             .await
             .is_ok()
         {
-            let _ = tokio::fs::remove_file(path).await;
+            if !remove_acknowledged_receipt_with(&path, |path| std::fs::remove_file(path)) {
+                // Retain the receipt so the next scheduler iteration retries.
+                return false;
+            }
+            return true;
         }
+        false
     }
 }
 
@@ -761,11 +881,22 @@ mod tests {
             "timeout must cancel the real awaited future"
         );
     }
+    #[tokio::test]
+    async fn telemetry_failure_never_skips_following_security_gate() {
+        let gate_reached = Arc::new(AtomicBool::new(false));
+        report_best_effort(async { Err::<(), _>("telemetry unavailable") }).await;
+        gate_reached.store(true, Ordering::Release);
+        assert!(gate_reached.load(Ordering::Acquire));
+    }
     #[test]
     fn failed_cleanup_retains_cache_ownership_until_retry_succeeds() {
         let coordinator = PrivateUpdateCoordinator::default();
         let path = PathBuf::from("private-update.bin");
-        coordinator.set_cached_path(Some(path.clone()));
+        let artifact = CachedArtifact {
+            path: path.clone(),
+            sha256: [0; 32],
+        };
+        coordinator.set_cached_artifact(Some(artifact.clone()));
         let attempts = AtomicUsize::new(0);
         assert!(!coordinator.cleanup_cached_path_with(|owned| {
             assert_eq!(owned, path.as_path());
@@ -775,13 +906,13 @@ mod tests {
                 "busy",
             ))
         }));
-        assert_eq!(coordinator.cached_path(), Some(path.clone()));
+        assert_eq!(coordinator.cached_artifact(), Some(artifact));
         assert!(coordinator.cleanup_cached_path_with(|owned| {
             assert_eq!(owned, path.as_path());
             attempts.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }));
-        assert_eq!(coordinator.cached_path(), None);
+        assert_eq!(coordinator.cached_artifact(), None);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
     }
     #[test]
@@ -801,25 +932,96 @@ mod tests {
         let receipt = PendingInstallReceipt {
             release_id: "release_1".into(),
             target_version: "2.22.0".into(),
+            client_event_id: "123e4567-e89b-42d3-a456-426614174000".into(),
         };
         write_pending_receipt(root.path(), &receipt).unwrap();
         write_pending_receipt(root.path(), &receipt).unwrap();
         let bytes = std::fs::read(root.path().join(RECEIPT_FILE)).unwrap();
-        assert_eq!(serde_json::from_slice::<PendingInstallReceipt>(&bytes).unwrap(), receipt);
+        assert_eq!(
+            serde_json::from_slice::<PendingInstallReceipt>(&bytes).unwrap(),
+            receipt
+        );
         let text = String::from_utf8(bytes).unwrap();
-        assert!(!text.contains("Bearer") && !text.contains("deviceToken") && !text.contains("ticket"));
-        assert!(serde_json::from_str::<PendingInstallReceipt>(r#"{"releaseId":"release_1","targetVersion":"2.22.0","extra":true}"#).is_err());
+        assert!(
+            !text.contains("Bearer") && !text.contains("deviceToken") && !text.contains("ticket")
+        );
+        assert!(serde_json::from_str::<PendingInstallReceipt>(
+            r#"{"releaseId":"release_1","targetVersion":"2.22.0","extra":true}"#
+        )
+        .is_err());
+    }
+    #[test]
+    fn acknowledged_receipt_delete_failure_is_retried_and_retained_until_success() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(RECEIPT_FILE);
+        std::fs::write(&path, b"receipt").unwrap();
+        assert!(!remove_acknowledged_receipt_with(&path, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "busy",
+            ))
+        }));
+        assert!(path.exists());
+        assert!(remove_acknowledged_receipt_with(&path, |path| {
+            std::fs::remove_file(path)
+        }));
+        assert!(!path.exists());
+    }
+    #[test]
+    fn cached_digest_rejects_actual_file_tampering_before_install() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = write_verified_cache(root.path(), b"signed exact bytes").unwrap();
+        assert_eq!(
+            read_verified_cache(&artifact).unwrap(),
+            b"signed exact bytes"
+        );
+        std::fs::write(&artifact.path, b"tampered after verification").unwrap();
+        assert!(read_verified_cache(&artifact).is_err());
+    }
+    #[test]
+    fn next_scheduler_entry_retries_owned_cleanup_without_manual_helper() {
+        let coordinator = PrivateUpdateCoordinator::default();
+        let path = PathBuf::from("private-update.bin");
+        let artifact = CachedArtifact {
+            path: path.clone(),
+            sha256: [7; 32],
+        };
+        coordinator.set_cached_artifact(Some(artifact));
+        let attempts = AtomicUsize::new(0);
+        let entry = || {
+            coordinator.prepare_scheduler_entry_with(|owned| {
+                assert_eq!(owned, path.as_path());
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "busy",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        assert!(
+            !entry(),
+            "first scheduler iteration must not overwrite owned cache"
+        );
+        assert!(
+            entry(),
+            "next scheduler iteration must retry cleanup automatically"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(coordinator.cached_artifact().is_none());
     }
     #[tokio::test]
     async fn verified_cache_is_atomic_and_shutdown_cleans_it() {
         let root = tempfile::tempdir().unwrap();
-        let path = write_verified_cache(root.path(), b"verified").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"verified");
+        let artifact = write_verified_cache(root.path(), b"verified").unwrap();
+        assert_eq!(std::fs::read(&artifact.path).unwrap(), b"verified");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
         let coordinator = PrivateUpdateCoordinator::default();
-        coordinator.set_cached_path(Some(path.clone()));
+        coordinator.set_cached_artifact(Some(artifact.clone()));
         coordinator.shutdown().await;
-        assert!(!path.exists());
+        assert!(!artifact.path.exists());
     }
     #[test]
     fn status_wire_is_read_only_and_contains_no_credentials() {

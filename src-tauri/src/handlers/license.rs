@@ -653,6 +653,64 @@ mod tests {
         assert_eq!(refreshed.last_server_time, 200);
         assert_eq!(store.vault.load().unwrap().unwrap().last_server_time, 200);
     }
+    #[tokio::test]
+    async fn updater_online_boundary_revokes_on_server_revoked_and_invalid_token() {
+        for server_error in [LicenseError::Revoked, LicenseError::InvalidToken] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LicenseStore::at(dir.path().to_owned());
+            let key = signer();
+            store.vault.store(&credential(&key)).unwrap();
+            assert_eq!(
+                renew_online_credential(
+                    &store,
+                    key.public_key().as_ref(),
+                    || Ok(101),
+                    |_| {
+                        let error = server_error;
+                        async move { Err(error) }
+                    }
+                )
+                .await
+                .unwrap_err(),
+                server_error
+            );
+            assert!(store.revoked().unwrap());
+            assert!(store.root.join("revoked").exists());
+            REVOKED_IN_PROCESS.lock().unwrap().remove(&store.root);
+            assert_eq!(
+                local_status(&store, key.public_key().as_ref(), 102)
+                    .unwrap()
+                    .status,
+                "revoked"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn updater_online_revocation_marker_failure_still_clears_vault_and_blocks_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("marker-parent-is-file");
+        std::fs::write(&root, b"occupied").unwrap();
+        let store = LicenseStore {
+            root,
+            vault: CredentialVault::at(dir.path().join("device.dpapi")),
+        };
+        let key = signer();
+        store.vault.store(&credential(&key)).unwrap();
+        assert_eq!(
+            renew_online_credential(
+                &store,
+                key.public_key().as_ref(),
+                || Ok(101),
+                |_| async { Err(LicenseError::Revoked) }
+            )
+            .await
+            .unwrap_err(),
+            LicenseError::Vault
+        );
+        assert!(store.vault.load().unwrap().is_none());
+        assert!(store.revoked().unwrap());
+        REVOKED_IN_PROCESS.lock().unwrap().remove(&store.root);
+    }
     #[test]
     fn marker_directory_failure_clears_old_vault_and_keeps_process_revoked() {
         let dir = tempfile::tempdir().unwrap();
@@ -664,7 +722,10 @@ mod tests {
         };
         store.vault.store(&credential(&signer())).unwrap();
         assert_eq!(store.revoke().unwrap_err(), LicenseError::Vault);
-        assert!(store.vault.load().unwrap().is_none(), "stale vault must be removed even when directory creation fails");
+        assert!(
+            store.vault.load().unwrap().is_none(),
+            "stale vault must be removed even when directory creation fails"
+        );
         assert!(store.revoked().unwrap());
         REVOKED_IN_PROCESS.lock().unwrap().remove(&store.root);
     }
@@ -678,7 +739,11 @@ mod tests {
             // Inject only the unavailable filesystem step, preserving earlier
             // real writes and the real DPAPI vault / revocation behavior.
             let step = |name| {
-                if name == failed_step { Err(LicenseError::Vault) } else { Ok(()) }
+                if name == failed_step {
+                    Err(LicenseError::Vault)
+                } else {
+                    Ok(())
+                }
             };
             let result = store.revoke_with_marker(|| {
                 step("create")?;
@@ -695,11 +760,26 @@ mod tests {
             });
             assert_eq!(result.unwrap_err(), LicenseError::Vault, "{failed_step}");
             assert!(store.vault.load().unwrap().is_none(), "{failed_step}");
-            assert_eq!(local_status(&store, key.public_key().as_ref(), 101).unwrap().status, "revoked", "{failed_step}");
-            assert_eq!(safe_error(LicenseError::Vault).message, "无法安全验证授权，请联网重试或联系管理员。");
+            assert_eq!(
+                local_status(&store, key.public_key().as_ref(), 101)
+                    .unwrap()
+                    .status,
+                "revoked",
+                "{failed_step}"
+            );
+            assert_eq!(
+                safe_error(LicenseError::Vault).message,
+                "无法安全验证授权，请联网重试或联系管理员。"
+            );
             REVOKED_IN_PROCESS.lock().unwrap().remove(&store.root);
             let restarted = LicenseStore::at(store.root.clone());
-            assert_eq!(local_status(&restarted, key.public_key().as_ref(), 102).unwrap().status, "unactivated", "{failed_step}");
+            assert_eq!(
+                local_status(&restarted, key.public_key().as_ref(), 102)
+                    .unwrap()
+                    .status,
+                "unactivated",
+                "{failed_step}"
+            );
         }
     }
     #[test]

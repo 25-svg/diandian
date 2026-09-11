@@ -112,7 +112,7 @@ function decodePathPart(value: string): string {
   }
 }
 
-async function updateEventInput(request: Request): Promise<{ deviceId?: unknown; releaseId: unknown; currentVersion: unknown; eventType: unknown }> {
+async function updateEventInput(request: Request): Promise<{ deviceId?: unknown; releaseId: unknown; currentVersion: unknown; eventType: unknown; clientEventId?: unknown }> {
   const contentLength = request.headers.get("content-length");
   if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_UPDATE_EVENT_BODY_BYTES)) {
     throw new LicenseError("PAYLOAD_TOO_LARGE", "Update event body is too large.");
@@ -150,10 +150,10 @@ async function updateEventInput(request: Request): Promise<{ deviceId?: unknown;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new LicenseError("INVALID_REQUEST", "Update event is invalid.");
   const input = value as Record<string, unknown>;
   const keys = Object.keys(input);
-  if (keys.some((key) => !["deviceId", "releaseId", "currentVersion", "eventType"].includes(key))) {
+  if (keys.some((key) => !["deviceId", "releaseId", "currentVersion", "eventType", "clientEventId"].includes(key))) {
     throw new LicenseError("INVALID_REQUEST", "Update event is invalid.");
   }
-  return { deviceId: input.deviceId, releaseId: input.releaseId, currentVersion: input.currentVersion, eventType: input.eventType };
+  return { deviceId: input.deviceId, releaseId: input.releaseId, currentVersion: input.currentVersion, eventType: input.eventType, clientEventId: input.clientEventId };
 }
 
 function updateService(env: LicenseEnv): UpdateService {
@@ -203,10 +203,11 @@ async function handle(request: Request, env: LicenseEnv): Promise<Response> {
     const device = await activeDevice(request, env);
     const input = await updateEventInput(request);
     if (input.deviceId !== undefined && input.deviceId !== device.id) throw new UpdateError("INVALID_REQUEST", "Update event is invalid.");
-    if ((input.releaseId !== null && typeof input.releaseId !== "string") || typeof input.currentVersion !== "string" || typeof input.eventType !== "string") {
+    if ((input.releaseId !== null && typeof input.releaseId !== "string") || typeof input.currentVersion !== "string" || typeof input.eventType !== "string"
+      || (input.clientEventId !== undefined && typeof input.clientEventId !== "string")) {
       throw new UpdateError("INVALID_REQUEST", "Update event is invalid.");
     }
-    await updateService(env).reportEvent({ deviceId: device.id, releaseId: input.releaseId, currentVersion: input.currentVersion, eventType: input.eventType });
+    await updateService(env).reportEvent({ deviceId: device.id, releaseId: input.releaseId, currentVersion: input.currentVersion, eventType: input.eventType, clientEventId: input.clientEventId });
     return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
   }
   return error("NOT_FOUND", "Route not found.", 404);

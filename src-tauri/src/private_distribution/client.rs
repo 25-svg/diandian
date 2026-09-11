@@ -226,6 +226,54 @@ impl DistributionClient {
         }
         Ok(())
     }
+
+    pub async fn report_event_idempotent(
+        &self,
+        device_token: &str,
+        release_id: Option<&str>,
+        current_version: &str,
+        event_type: &str,
+        client_event_id: &str,
+    ) -> Result<(), LicenseError> {
+        if event_type != "install_succeeded"
+            || uuid::Uuid::parse_str(client_event_id).is_err()
+            || !valid_text(current_version, 128)
+            || release_id.is_none_or(|id| {
+                id.is_empty()
+                    || id.len() > 256
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            })
+        {
+            return Err(LicenseError::InvalidInput);
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Input<'a> {
+            release_id: Option<&'a str>,
+            current_version: &'a str,
+            event_type: &'a str,
+            client_event_id: &'a str,
+        }
+        let bytes = self
+            .post(
+                "/v1/update-events",
+                Some(device_token),
+                Some(&Input {
+                    release_id,
+                    current_version,
+                    event_type,
+                    client_event_id,
+                }),
+                StatusCode::NO_CONTENT,
+            )
+            .await?;
+        if !bytes.is_empty() {
+            return Err(LicenseError::InvalidResponse);
+        }
+        Ok(())
+    }
 }
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, LicenseError> {
     serde_json::from_slice(bytes).map_err(|_| LicenseError::InvalidResponse)
@@ -366,6 +414,32 @@ mod private_distribution_client_tests {
             body,
             serde_json::json!({"releaseId":null,"currentVersion":"2.21.1","eventType":"check"})
         );
+    }
+    #[tokio::test]
+    async fn install_receipt_event_carries_only_stable_id_and_safe_payload() {
+        let (endpoint, server) = fixture("204 No Content", String::new(), "", Duration::ZERO);
+        let event_id = "123e4567-e89b-42d3-a456-426614174000";
+        client(&endpoint, Duration::from_secs(2))
+            .report_event_idempotent(
+                &token(),
+                Some("release_1"),
+                "2.22.0",
+                "install_succeeded",
+                event_id,
+            )
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "releaseId":"release_1", "currentVersion":"2.22.0",
+                "eventType":"install_succeeded", "clientEventId":event_id
+            })
+        );
+        assert!(!body.to_string().contains(&token()));
     }
     #[tokio::test]
     async fn errors_are_fixed_and_revocation_is_distinct() {
