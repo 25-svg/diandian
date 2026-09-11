@@ -1,12 +1,14 @@
 {
   "name": "bili-shadowreplay",
   "private": true,
-  "version": "2.20.0",
+  "version": "2.21.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "test:license": "node --loader ts-node/esm src/lib/license.test.ts",
+    "test:private-distribution": "node scripts/test-private-distribution.mjs",
     "build": "vite build",
+    "build:private-distribution": "node scripts/build-private-distribution.mjs",
     "build:desktop:portable": "tauri build --no-bundle --ci",
     "test:analysis-reactivity": "node scripts/check-analysis-reactivity.mjs",
     "test:analysis-zoom": "node --loader ts-node/esm src/lib/analysisZoom.test.ts",
@@ -66,6 +68,7 @@
     "@tauri-apps/plugin-os": "2.3.0",
     "@tauri-apps/plugin-shell": "2.3.0",
     "@tauri-apps/plugin-sql": "2.3.0",
+    "@tauri-apps/plugin-updater": "2.6.1",
     "lucide-svelte": "^0.479.0",
     "marked": "^16.1.1",
     "qrcode": "^1.5.4",

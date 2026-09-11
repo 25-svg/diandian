@@ -50,6 +50,9 @@ importers:
       '@tauri-apps/plugin-sql':
         specifier: 2.3.0
         version: 2.3.0
+      '@tauri-apps/plugin-updater':
+        specifier: 2.6.1
+        version: 2.6.1
       lucide-svelte:
         specifier: ^0.479.0
         version: 0.479.0(svelte@3.59.2)
@@ -967,6 +970,9 @@ packages:
 
   '@tauri-apps/plugin-sql@2.3.0':
     resolution: {integrity: sha512-JYwIocfsLaDWa41LMiZWuzts7yCJR+EpZPRmgpO7Gd7XiAS9S67dKz306j/k/d9XntB0YopMRBol2OIWMschuA==}
+
+  '@tauri-apps/plugin-updater@2.6.1':
+    resolution: {integrity: sha512-iiOevw4kc12Ok99J9KthXwUqwPv1sYjG+tNEDZqPmwvOmIq7s58nKMRz6NJPKXT4U16NzMPffFcP/LUOsz6c4A==}
 
   '@tsconfig/node10@1.0.12':
     resolution: {integrity: sha512-UCYBaeFvM11aU2y3YPZ//O5Rhj+xKyzy7mvcIoAjASbigy8mHMryP5cK7dgjlz2hWxh1g5pLw084E0a/wlUSFQ==}
@@ -3346,6 +3352,10 @@ snapshots:
       '@tauri-apps/api': 2.6.0
 
   '@tauri-apps/plugin-sql@2.3.0':
+    dependencies:
+      '@tauri-apps/api': 2.6.0
+
+  '@tauri-apps/plugin-updater@2.6.1':
     dependencies:
       '@tauri-apps/api': 2.6.0
 
