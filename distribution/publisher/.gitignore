@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.cache/
+.test-tmp/
+*.dpapi
+*.credential*
+.env*
+*.log
