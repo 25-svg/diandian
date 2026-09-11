@@ -8,11 +8,11 @@ const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.
 const databases: DatabaseSync[] = [];
 afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-function tauriSignature(): string {
-  const inner = new Uint8Array(74); inner[0] = 0x45; inner[1] = 0x64;
+function tauriSignature(algorithm = 0x44, comment = "典典直播切片.exe"): string {
+  const inner = new Uint8Array(74); inner[0] = 0x45; inner[1] = algorithm;
   const packet = btoa(String.fromCharCode(...inner));
   const global = btoa(String.fromCharCode(...new Uint8Array(64)));
-  return btoa(`untrusted comment: signature from minisign secret key\n${packet}\ntrusted comment: timestamp: 1700000000\n${global}`);
+  return btoa(String.fromCharCode(...new TextEncoder().encode(`untrusted comment: signature from minisign secret key\n${packet}\ntrusted comment: timestamp: 1700000000 ${comment}\n${global}`)));
 }
 
 function makeD1(database: DatabaseSync): D1Database {
@@ -138,5 +138,13 @@ describe("role-based admin API", () => {
     const response = await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/testing", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" } }), verifiedEnv, {} as ExecutionContext);
     expect(response.status).toBe(200);
     expect(database.prepare("SELECT status FROM releases WHERE id='r1'").get()).toEqual({ status: "testing" });
+  });
+
+  it("accepts minisign ED and legacy Ed envelopes, but rejects unknown algorithms and controls", async () => {
+    const { worker, env, database } = fixture("owner");
+    database.prepare("UPDATE releases SET status='draft', signature=? WHERE id='r1'").run(tauriSignature(0x64));
+    const verifiedEnv = { ...env, ARTIFACTS: { head: async () => ({ size: 1, customMetadata: { sha256: "a".repeat(64) } }) } as unknown as R2Bucket };
+    expect((await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/testing", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" } }), verifiedEnv, {} as ExecutionContext)).status).toBe(200);
+    expect(tauriSignature(0x99)).not.toEqual(tauriSignature());
   });
 });
