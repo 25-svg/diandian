@@ -6,11 +6,14 @@ import { UpdateService } from "../src/update-service";
 
 const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
 
-function makeD1(database: DatabaseSync): D1Database {
+function makeD1(database: DatabaseSync, beforeTicketInsert?: () => void): D1Database {
   const statement = (sql: string, values: unknown[] = []) => ({
     bind: (...bound: unknown[]) => statement(sql, bound),
     first: async () => database.prepare(sql).get(...(values as never[])) ?? null,
-    run: async () => ({ success: true, meta: { changes: Number(database.prepare(sql).run(...(values as never[])).changes) }, results: [] }),
+    run: async () => {
+      if (sql.startsWith("INSERT INTO download_tickets")) beforeTicketInsert?.();
+      return { success: true, meta: { changes: Number(database.prepare(sql).run(...(values as never[])).changes) }, results: [] };
+    },
     all: async () => ({ success: true, meta: { changes: 0 }, results: database.prepare(sql).all(...(values as never[])) }),
   });
   return { prepare: (sql: string) => statement(sql) as unknown as D1PreparedStatement } as D1Database;
@@ -20,12 +23,12 @@ describe("UpdateService.resolveUpdate", () => {
   const databases: DatabaseSync[] = [];
   afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-  function fixture() {
+  function fixture(beforeTicketInsert?: () => void) {
     const database = new DatabaseSync(":memory:");
     database.exec(migration);
     database.prepare("INSERT INTO devices (id, fingerprint_hash, token_hash, status, activated_at, created_at) VALUES ('device-1', 'fp-1', 'token-1', 'active', 1, 1)").run();
     databases.push(database);
-    return { database, service: new UpdateService(makeD1(database), () => 1_700_000_000) };
+    return { database, service: new UpdateService(makeD1(database, beforeTicketInsert), () => 1_700_000_000) };
   }
 
   function release(database: DatabaseSync, id: string, version: string, status: string) {
@@ -44,6 +47,7 @@ describe("UpdateService.resolveUpdate", () => {
   ])("keeps %s releases hidden according to test-group visibility", async (status, testGroup, hidden) => {
     const { database, service } = fixture();
     release(database, "release-1", "2.22.0", status);
+    if (testGroup) database.prepare("UPDATE devices SET test_group = '1' WHERE id = 'device-1'").run();
 
     const result = await service.resolveUpdate({
       deviceId: "device-1", testGroup, currentVersion: "2.21.0", target: "windows", arch: "x86_64", origin: "https://control.example",
@@ -90,5 +94,26 @@ describe("UpdateService.resolveUpdate", () => {
     const { service } = fixture();
     await expect(service.resolveUpdate({ deviceId: "device-1", testGroup: false, currentVersion: "2.21.0", target: "darwin", arch: "arm64", origin: "https://control.example" }))
       .rejects.toMatchObject({ code: "INVALID_REQUEST" });
+  });
+
+  it("does not issue a ticket when a device is revoked after candidate selection", async () => {
+    let database: DatabaseSync;
+    const fixtureResult = fixture(() => database.prepare("UPDATE devices SET status = 'revoked'").run());
+    ({ database } = fixtureResult);
+    release(database, "release-1", "2.22.0", "production");
+
+    await expect(fixtureResult.service.resolveUpdate({ deviceId: "device-1", testGroup: false, currentVersion: "2.21.0", target: "windows", arch: "x86_64", origin: "https://control.example" })).resolves.toBeNull();
+    expect(database.prepare("SELECT count(*) AS count FROM download_tickets").get()).toEqual({ count: 0 });
+  });
+
+  it("does not issue a testing ticket after the device loses its test-group membership", async () => {
+    let database: DatabaseSync;
+    const fixtureResult = fixture(() => database.prepare("UPDATE devices SET test_group = NULL").run());
+    ({ database } = fixtureResult);
+    database.prepare("UPDATE devices SET test_group = '1'").run();
+    release(database, "release-1", "2.22.0", "testing");
+
+    await expect(fixtureResult.service.resolveUpdate({ deviceId: "device-1", testGroup: true, currentVersion: "2.21.0", target: "windows", arch: "x86_64", origin: "https://control.example" })).resolves.toBeNull();
+    expect(database.prepare("SELECT count(*) AS count FROM download_tickets").get()).toEqual({ count: 0 });
   });
 });

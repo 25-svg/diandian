@@ -59,7 +59,7 @@ export class LicenseRepository {
   }
 
   async findDeviceByInstallHash(installHash: string): Promise<DeviceRecord | null> {
-    return this.db.prepare("SELECT id, status FROM devices WHERE fingerprint_hash = ?").bind(installHash).first<DeviceRecord>();
+    return this.db.prepare("SELECT id, status, test_group FROM devices WHERE fingerprint_hash = ?").bind(installHash).first<DeviceRecord>();
   }
 
   async findActivationCode(codeHash: string): Promise<ActivationCodeRecord | null> {

@@ -8,12 +8,16 @@ import { sha256Hex } from "../src/crypto";
 const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
 const context = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
 
-function makeD1(database: DatabaseSync): D1Database {
+function makeD1(database: DatabaseSync, afterDeviceAuthentication?: () => void): D1Database {
   const statement = (sql: string, values: unknown[] = []) => ({
     sql,
     values,
     bind: (...bound: unknown[]) => statement(sql, bound),
-    first: async () => database.prepare(sql).get(...(values as never[])) ?? null,
+    first: async () => {
+      const result = database.prepare(sql).get(...(values as never[])) ?? null;
+      if (sql === "SELECT id, status, test_group FROM devices WHERE token_hash = ?") afterDeviceAuthentication?.();
+      return result;
+    },
     run: async () => ({ success: true, meta: { changes: Number(database.prepare(sql).run(...(values as never[])).changes) }, results: [] }),
     all: async () => ({ success: true, meta: { changes: 0 }, results: database.prepare(sql).all(...(values as never[])) }),
   });
@@ -47,13 +51,13 @@ describe("private update download and events", () => {
   const databases: DatabaseSync[] = [];
   afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
-  async function fixture() {
+  async function fixture(afterDeviceAuthentication?: () => void) {
     const database = new DatabaseSync(":memory:");
     database.exec(migration);
     databases.push(database);
     const objects = new Map<string, R2ObjectBody>();
     const env = {
-      DB: makeD1(database),
+      DB: makeD1(database, afterDeviceAuthentication),
       ARTIFACTS: { get: async (key: string) => objects.get(key) ?? null } as unknown as R2Bucket,
       LEASE_PRIVATE_JWK: "{}",
     };
@@ -65,11 +69,16 @@ describe("private update download and events", () => {
       .run(id, `fp-${id}`, await sha256Hex(token), testGroup ? "1" : null);
   }
 
-  function seedRelease(database: DatabaseSync, status = "production") {
+  function seedRelease(database: DatabaseSync, status = "production", id = "release-1", version = "2.22.0") {
     database.prepare(`INSERT INTO releases
       (id, version, status, notes, pub_date, object_key, size, sha256, platform, arch, signature, created_at, updated_at)
-      VALUES ('release-1', '2.22.0', ?, 'notes', '2026-09-11T00:00:00Z', 'private/release.exe', 3, 'sha', 'windows', 'x86_64', 'sig', 1, 1)`)
-      .run(status);
+      VALUES (?, ?, ?, 'notes', '2026-09-11T00:00:00Z', 'private/release.exe', 3, 'sha', 'windows', 'x86_64', 'sig', 1, 1)`)
+      .run(id, version, status);
+  }
+
+  function seedHistoryTicket(database: DatabaseSync, id: string, deviceId: string, releaseId: string) {
+    database.prepare("INSERT INTO download_tickets (id, token_hash, device_id, release_id, purpose, expires_at, created_at) VALUES (?, ?, ?, ?, 'update', 1, 1)")
+      .run(id, `hash-${id}`, deviceId, releaseId);
   }
 
   async function update(env: Record<string, unknown>, token: string, currentVersion = "2.21.0") {
@@ -129,6 +138,7 @@ describe("private update download and events", () => {
     const token = "a".repeat(43);
     await seedDevice(database, "device-1", token);
     seedRelease(database);
+    seedHistoryTicket(database, "ticket-device-1-event", "device-1", "release-1");
 
     expect((await worker.fetch(new Request("https://control.example/v1/update/windows/x86_64/%ZZ", { headers: { authorization: `Bearer ${token}` } }), env, context)).status).toBe(400);
     expect((await worker.fetch(new Request("https://control.example/v1/update/windows/x86_64/2.21.0", { headers: { authorization: "Bearer short" } }), env, context)).status).toBe(401);
@@ -151,5 +161,89 @@ describe("private update download and events", () => {
     expect(invalidEvent.status).toBe(400);
     expect(database.prepare("SELECT device_id, release_id, current_version, event_type FROM update_events").get()).toEqual({ device_id: "device-1", release_id: "release-1", current_version: "2.22.0", event_type: "install_succeeded" });
     expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.22.0" });
+  });
+
+  it("requires issued device-specific tickets for result events while preserving halted history", async () => {
+    const { database, env } = await fixture();
+    const token1 = "a".repeat(43);
+    const token2 = "b".repeat(43);
+    await seedDevice(database, "device-1", token1);
+    await seedDevice(database, "device-2", token2);
+    seedRelease(database);
+    const post = (body: unknown) => worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token1}`, "content-type": "application/json" }, body: JSON.stringify(body),
+    }), env, context);
+
+    expect((await post({ currentVersion: "2.21.0", eventType: "check", releaseId: null })).status).toBe(204);
+    expect((await post({ currentVersion: "2.21.0", eventType: "download_started", releaseId: null })).status).toBe(400);
+    expect((await post({ currentVersion: "2.22.0", eventType: "install_succeeded", releaseId: "release-1" })).status).toBe(403);
+    seedHistoryTicket(database, "ticket-device-2", "device-2", "release-1");
+    expect((await post({ currentVersion: "2.22.0", eventType: "install_succeeded", releaseId: "release-1" })).status).toBe(403);
+    seedHistoryTicket(database, "ticket-device-1", "device-1", "release-1");
+    database.prepare("UPDATE releases SET status = 'halted' WHERE id = 'release-1'").run();
+    expect((await post({ currentVersion: "2.22.0", eventType: "install_succeeded", releaseId: "release-1" })).status).toBe(204);
+    database.prepare("UPDATE releases SET status = 'draft' WHERE id = 'release-1'").run();
+    expect((await post({ currentVersion: "2.22.0", eventType: "install_succeeded", releaseId: "release-1" })).status).toBe(403);
+    database.prepare("UPDATE releases SET status = 'testing' WHERE id = 'release-1'").run();
+    expect((await post({ currentVersion: "2.22.0", eventType: "install_succeeded", releaseId: "release-1" })).status).toBe(403);
+  });
+
+  it("keeps device current_version monotonic when installation success events arrive out of order", async () => {
+    const { database, env } = await fixture();
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token);
+    seedRelease(database, "production", "release-22", "2.22.0");
+    seedRelease(database, "production", "release-23", "2.23.0");
+    seedHistoryTicket(database, "ticket-22", "device-1", "release-22");
+    seedHistoryTicket(database, "ticket-23", "device-1", "release-23");
+    const installed = (releaseId: string, currentVersion: string) => worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ releaseId, currentVersion, eventType: "install_succeeded" }),
+    }), env, context);
+
+    expect((await installed("release-23", "2.23.0")).status).toBe(204);
+    expect((await installed("release-22", "2.22.0")).status).toBe(204);
+    expect((await installed("release-23", "2.23.0")).status).toBe(204);
+    expect(database.prepare("SELECT current_version FROM devices WHERE id = 'device-1'").get()).toEqual({ current_version: "2.23.0" });
+  });
+
+  it("rechecks authorization after the initial Bearer lookup before update, download, and event writes", async () => {
+    let database: DatabaseSync;
+    const fixtureResult = await fixture(() => database.prepare("UPDATE devices SET status = 'revoked'").run());
+    ({ database } = fixtureResult);
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token);
+    seedRelease(database);
+    seedHistoryTicket(database, "ticket-device-1", "device-1", "release-1");
+    const ticket = "t".repeat(43);
+    database.prepare("UPDATE download_tickets SET token_hash = ?, expires_at = 4102444800 WHERE id = 'ticket-device-1'").run(await sha256Hex(ticket));
+
+    const updateResponse = await update(fixtureResult.env, token);
+    database.prepare("UPDATE devices SET status = 'active'").run();
+    const downloadResponse = await worker.fetch(new Request(`https://control.example/v1/download/${ticket}`, { headers: { authorization: `Bearer ${token}` } }), fixtureResult.env, context);
+    database.prepare("UPDATE devices SET status = 'active'").run();
+    const eventResponse = await worker.fetch(new Request("https://control.example/v1/update-events", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ currentVersion: "2.21.0", eventType: "check", releaseId: null }),
+    }), fixtureResult.env, context);
+
+    expect(updateResponse.status).toBe(204);
+    expect(downloadResponse.status).toBe(403);
+    expect(eventResponse.status).toBe(403);
+    expect(database.prepare("SELECT count(*) AS count FROM update_events").get()).toEqual({ count: 0 });
+  });
+
+  it("rechecks testing membership after the initial Bearer lookup before issuing a testing ticket", async () => {
+    let database: DatabaseSync;
+    const fixtureResult = await fixture(() => database.prepare("UPDATE devices SET test_group = NULL").run());
+    ({ database } = fixtureResult);
+    const token = "a".repeat(43);
+    await seedDevice(database, "device-1", token, true);
+    seedRelease(database, "testing");
+
+    const response = await update(fixtureResult.env, token);
+
+    expect(response.status).toBe(204);
+    expect(database.prepare("SELECT count(*) AS count FROM download_tickets").get()).toEqual({ count: 0 });
   });
 });
