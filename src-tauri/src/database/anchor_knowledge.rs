@@ -151,6 +151,26 @@ CREATE TABLE anchor_learning_cases (
   updated_at TEXT NOT NULL
 );
 
+CREATE TRIGGER trg_anchor_learning_cases_asset_speech_insert
+BEFORE INSERT ON anchor_learning_cases
+WHEN NOT EXISTS (
+  SELECT 1 FROM anchor_knowledge_assets
+  WHERE asset_id = NEW.asset_id AND asset_type = 'speech'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'learning case asset must be speech');
+END;
+
+CREATE TRIGGER trg_anchor_learning_cases_asset_speech_update
+BEFORE UPDATE OF asset_id ON anchor_learning_cases
+WHEN NOT EXISTS (
+  SELECT 1 FROM anchor_knowledge_assets
+  WHERE asset_id = NEW.asset_id AND asset_type = 'speech'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'learning case asset must be speech');
+END;
+
 CREATE TABLE anchor_learning_case_lines (
   line_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL REFERENCES anchor_learning_cases(case_id) ON DELETE CASCADE,
@@ -1572,6 +1592,68 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn learning_cases_only_extend_speech_assets() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        pool.execute("PRAGMA foreign_keys = ON").await.unwrap();
+        pool.execute(ANCHOR_KNOWLEDGE_MIGRATION_SQL).await.unwrap();
+        pool.execute(ANCHOR_LEARNING_CASE_MIGRATION_SQL)
+            .await
+            .unwrap();
+        pool.execute(
+            "INSERT INTO anchor_knowledge_profiles (anchor_id, display_name, normalized_name, vault_relative_root, created_at, updated_at) VALUES ('anchor-a','主播A','主播a','主播知识库/anchor-a',datetime('now'),datetime('now'))",
+        )
+        .await
+        .unwrap();
+        for (asset_id, asset_type) in [
+            ("speech-1", "speech"),
+            ("deal-1", "deal_clip"),
+            ("deal-2", "deal_clip"),
+        ] {
+            sqlx::query(
+                "INSERT INTO anchor_knowledge_assets (asset_id, anchor_id, asset_type, title, body, created_by_kind, created_by_id, content_hash, created_at, updated_at) VALUES (?,?,?,?,?,'human','operator',?,datetime('now'),datetime('now'))",
+            )
+            .bind(asset_id)
+            .bind("anchor-a")
+            .bind(asset_type)
+            .bind(format!("title-{asset_id}"))
+            .bind(format!("body-{asset_id}"))
+            .bind(format!("hash-{asset_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        pool.execute(
+            "INSERT INTO anchor_learning_cases (case_id, asset_id, stage, skill, difficulty, evidence_level, scene_context, training_goal, applicable_scope, expiry_conditions, review_due_at, created_at, updated_at) VALUES ('speech-case','speech-1','needs','需求确认','beginner','A','场景','目标','范围','条件','2026-12-31',datetime('now'),datetime('now'))",
+        )
+        .await
+        .unwrap();
+        let insert_error = sqlx::query(
+            "INSERT INTO anchor_learning_cases (case_id, asset_id, stage, skill, difficulty, evidence_level, scene_context, training_goal, applicable_scope, expiry_conditions, review_due_at, created_at, updated_at) VALUES ('deal-case','deal-1','needs','需求确认','beginner','A','场景','目标','范围','条件','2026-12-31',datetime('now'),datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(insert_error
+            .to_string()
+            .contains("learning case asset must be speech"));
+
+        let update_error = sqlx::query(
+            "UPDATE anchor_learning_cases SET asset_id = 'deal-2' WHERE case_id = 'speech-case'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(update_error
+            .to_string()
+            .contains("learning case asset must be speech"));
     }
 
     fn source(marker: &str) -> AnchorKnowledgeSourceInput {
