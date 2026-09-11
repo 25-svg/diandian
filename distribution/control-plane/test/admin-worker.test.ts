@@ -133,7 +133,7 @@ describe("role-based admin API", () => {
 
   it("promotes a draft only when its Tauri SignatureBox and private R2 metadata match", async () => {
     const { worker, env, database } = fixture("owner");
-    database.prepare("UPDATE releases SET status='draft', signature=? WHERE id='r1'").run(tauriSignature());
+    database.prepare("UPDATE releases SET status='draft', signature=? WHERE id='r1'").run(tauriSignature(0x44, "典典\u2028直播\u2029.exe"));
     const verifiedEnv = { ...env, ARTIFACTS: { head: async () => ({ size: 1, customMetadata: { sha256: "a".repeat(64) } }) } as unknown as R2Bucket };
     const response = await worker.fetch(new Request("https://admin.example/api/admin/releases/r1/testing", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" } }), verifiedEnv, {} as ExecutionContext);
     expect(response.status).toBe(200);
