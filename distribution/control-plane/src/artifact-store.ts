@@ -113,7 +113,7 @@ export class GitHubArtifactStore implements ArtifactStore {
   async head(key: string): Promise<ArtifactHead | null> {
     const assetId = githubAssetId(key);
     if (!assetId) return null;
-    const response = await this.fetcher(this.endpoint(assetId), { headers: this.headers("application/vnd.github+json"), redirect: "error" });
+    const response = await this.fetcher(this.endpoint(assetId), { headers: this.headers("application/vnd.github+json"), redirect: "manual" });
     if (response.status === 404) { await response.body?.cancel(); return null; }
     if (!response.ok) { await response.body?.cancel(); throw new Error("GitHub asset metadata is unavailable"); }
     const asset = parseAsset(await boundedJson(response), assetId);
@@ -129,7 +129,7 @@ export class GitHubArtifactStore implements ArtifactStore {
     if (response.status === 302 || response.status === 301 || response.status === 307 || response.status === 308) {
       const location = safeAssetLocation(response.headers.get("location"));
       await response.body?.cancel();
-      binary = await this.fetcher(location, { redirect: "error", headers: { "user-agent": "diandian-update-worker" } });
+      binary = await this.fetcher(location, { redirect: "manual", headers: { "user-agent": "diandian-update-worker" } });
     }
     if (!binary.ok || !binary.body) { await binary.body?.cancel(); throw new Error("GitHub release asset is unavailable"); }
     const sizeRaw = binary.headers.get("content-length");
