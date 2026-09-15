@@ -34,7 +34,7 @@ describe("business account administration", () => {
     const response = await adminRequest(worker, env, "/api/admin/app-users", { username: "manager.a", displayName: "运营负责人", password: "Initial-Password-1", role: "operations_manager", anchorId: null, managedTeamIds: ["team-a"] });
     expect(response.status).toBe(201);
     const stored = database.prepare("SELECT id,password_hash,role FROM app_users WHERE username='manager.a'").get() as { id: string; password_hash: string; role: string };
-    expect(stored.password_hash).toMatch(/^pbkdf2_sha256\$210000\$/);
+    expect(stored.password_hash).toMatch(/^pbkdf2_sha256\$100000\$/);
     expect(stored.password_hash).not.toContain("Initial-Password-1");
     let login: Response;
     try { login = (await handleAppAuth(new Request("https://updates.example/v1/app-auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username: "manager.a", password: "Initial-Password-1" }) }), env, 1_700_000_000))!; } catch (cause) { login = appAuthFailure(cause); }

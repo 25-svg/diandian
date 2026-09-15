@@ -21,10 +21,11 @@ type SessionUser = StoredUser & { session_id: string };
 
 const MAX_BODY = 4 * 1024;
 const SESSION_SECONDS = 12 * 60 * 60;
-const PBKDF2_ITERATIONS = 210_000;
+// Cloudflare Workers WebCrypto currently caps PBKDF2 at 100,000 iterations.
+const PBKDF2_ITERATIONS = 100_000;
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_SECONDS = 15 * 60;
-const DUMMY_PASSWORD_HASH = "pbkdf2_sha256$210000$ZGlhbmRpYW4tYWRtaW52MQ$NeuE5xFqIzUnzugGQQfJfMUxTWqPeXKgfiDUI-NFkWE";
+const DUMMY_PASSWORD_HASH = "pbkdf2_sha256$100000$ZGlhbmRpYW4tZHVtbXktdjE$rjmUmRCndQCooEL7RfHs2iPrC3jeoYIv3wqArF-z-_0";
 const encoder = new TextEncoder();
 
 export class AppAuthError extends Error {
