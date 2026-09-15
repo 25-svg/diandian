@@ -3,10 +3,12 @@
   import { createLicenseClient, resolveLicenseView, type LicenseStatusDto } from "../license";
   import LicenseBanner from "./LicenseBanner.svelte";
 
+  export let bypass = false;
+
   const client = createLicenseClient();
   const dispatch = createEventDispatcher<{ authorized: void }>();
   let license: LicenseStatusDto | null = null;
-  let loading = true;
+  let loading = !bypass;
   let pending: "" | "activate" | "renew" = "";
   let code = "";
   let label = "";
@@ -14,7 +16,7 @@
   let announced = false;
   let mounted = true;
   $: view = resolveLicenseView(license);
-  $: allowed = view === "app" || view === "app-with-warning";
+  $: allowed = bypass || view === "app" || view === "app-with-warning";
   $: if (allowed && !announced) {
     announced = true;
     dispatch("authorized");
@@ -38,6 +40,10 @@
     }
   }
   onMount(() => {
+    if (bypass) {
+      loading = false;
+      return;
+    }
     void (async () => {
       let result = await client.status();
       // Confirm existing authorization online before mounting business content.

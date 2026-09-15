@@ -1,5 +1,5 @@
 type AdminView = "summary" | "devices" | "codes" | "releases" | "admins" | "audit";
-type Identity = { id: string; email: string; role: "owner" | "operator" };
+type Identity = { id: string; email: string; role: "owner" | "operator"; mustChangePassword: boolean };
 type Row = Record<string, unknown>;
 type PageResult = { items: Row[]; nextCursor: string | null };
 const names: Record<AdminView, string> = { summary: "总览", devices: "设备", codes: "激活码与下载链接", releases: "版本", admins: "管理员", audit: "操作记录" };
@@ -11,6 +11,7 @@ const descriptions: Record<AdminView, string> = {
 const statuses: Record<string, string> = { active: "已启用", revoked: "已禁用", unused: "未使用", used: "已使用", draft: "草稿", testing: "测试中", production: "已发布", halted: "已停止", owner: "主管理员", operator: "普通管理员" };
 const root = document.querySelector<HTMLDivElement>("#app")!;
 let identity: Identity;
+let sessionToken = sessionStorage.getItem("diandian-admin-session") ?? "";
 let epoch = 0;
 let sensitiveGeneration = 0;
 let main: HTMLElement;
@@ -28,12 +29,20 @@ function message(text: string, failed = false) {
   notice.textContent = text; notice.setAttribute("role", failed ? "alert" : "status"); notice.className = failed ? "notice error" : "notice";
 }
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api/admin${path}`, { credentials: "same-origin", cache: "no-store", ...init });
+  const headers = new Headers(init?.headers); if (sessionToken) headers.set("authorization", `Bearer ${sessionToken}`);
+  const response = await fetch(`/api/admin${path}`, { credentials: "same-origin", cache: "no-store", ...init, headers });
   if (!response.ok) {
+    if (response.status === 401) { sessionToken = ""; sessionStorage.removeItem("diandian-admin-session"); }
     const labels: Record<number, string> = { 401: "登录已失效，请刷新页面重新登录。", 403: "没有执行此操作的权限。", 409: "当前状态不允许此操作，请刷新后重试。", 429: "请求过于频繁，请稍后重试。" };
     throw new Error(labels[response.status] ?? "请求失败，请稍后重试。");
   }
   return response.json() as Promise<T>;
+}
+async function authApi<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers); if (sessionToken) headers.set("authorization", `Bearer ${sessionToken}`);
+  const response = await fetch(`/api/auth${path}`, { credentials: "same-origin", cache: "no-store", ...init, headers });
+  if (!response.ok) throw new Error(response.status === 401 ? "邮箱或密码错误。" : response.status === 400 ? "当前密码错误或新密码不符合要求。" : "登录服务暂时不可用。");
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 function clearSensitive(invalidatePending = true) {
   if (invalidatePending) ++sensitiveGeneration;
@@ -155,9 +164,10 @@ function createForms(view: AdminView, parent: HTMLElement) {
   if (view === "admins" && identity.role === "owner") {
     const form = el("form", "", "panel form"); form.append(el("h2", "添加管理员"));
     const email = field(form, "邮箱", "email"); email.required = true; email.maxLength = 320;
+    const password = field(form, "一次性初始密码（至少 10 位）", "password"); password.required = true; password.minLength = 10; password.maxLength = 128; password.autocomplete = "new-password";
     const role = select(form, "权限", [["operator", "普通管理员"], ["owner", "主管理员"]]);
     const submit = el("button", "添加管理员", "primary"); form.append(submit);
-    form.addEventListener("submit", (event) => { event.preventDefault(); confirmAction("添加管理员", `将为 ${email.value} 授予${statuses[role.value]}权限。`, "/admins", { email: email.value.trim(), role: role.value }); }); parent.append(form);
+    form.addEventListener("submit", (event) => { event.preventDefault(); confirmAction("添加管理员", `将为 ${email.value} 授予${statuses[role.value]}权限，并要求首次登录修改密码。`, "/admins", { email: email.value.trim(), role: role.value, password: password.value }); }); parent.append(form);
   }
 }
 async function render() {
@@ -194,13 +204,8 @@ async function render() {
     content.append(button("重试", () => { void render(); }));
   }
 }
-async function boot() {
-  clearView();
-  root.replaceChildren(el("p", "正在加载…", "boot"));
-  try {
-    identity = await api<Identity>("/me");
-    if (identity.role !== "owner" && identity.role !== "operator") throw new Error("没有后台访问权限。");
-    root.replaceChildren(); const aside = el("aside", "", "sidebar"); const brand = el("div", "", "brand");
+async function renderWorkspace() {
+    root.classList.remove("auth-layout"); root.replaceChildren(); const aside = el("aside", "", "sidebar"); const brand = el("div", "", "brand");
     const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg"); icon.setAttribute("viewBox", "0 0 24 24"); icon.setAttribute("aria-hidden", "true");
     const path = document.createElementNS(icon.namespaceURI, "path"); path.setAttribute("d", "M4 4h7v7H4zM14 4h6v7h-6zM4 14h7v6H4zM14 14h6v6h-6z"); icon.append(path);
     brand.append(icon, el("strong", "点点 · 分发管理")); aside.append(brand, el("p", "工作空间", "eyebrow"));
@@ -209,14 +214,32 @@ async function boot() {
       if (identity.role !== "owner" && (view === "admins" || view === "audit")) continue;
       const link = el("a", name); link.href = `#${view}`; nav.append(link);
     }
-    aside.append(nav); const user = el("div", "", "identity"); user.append(el("p", identity.email), badge(identity.role)); aside.append(user);
+    aside.append(nav); const user = el("div", "", "identity"); const logout = button("退出登录", () => { void authApi<void>("/logout", { method: "POST", headers: { "content-type": "application/json" } }).finally(() => { sessionToken = ""; sessionStorage.removeItem("diandian-admin-session"); void boot(); }); }); user.append(el("p", identity.email), badge(identity.role), logout); aside.append(user);
     main = el("main"); main.id = "main"; main.tabIndex = -1;
     const skip = el("a", "跳至主要内容", "skip"); skip.href = "#main";
     skip.addEventListener("click", (event) => { event.preventDefault(); main.focus(); });
     root.append(skip, aside, main); await render();
-  } catch (error) {
-    const failure = el("p", `加载失败：${error instanceof Error ? error.message : "请刷新重试。"}`); failure.setAttribute("role", "alert"); root.replaceChildren(failure, button("重试", () => { void boot(); }));
-  }
+}
+function authShell(title: string, description: string) {
+  root.classList.add("auth-layout"); const card = el("main", "", "auth-card"); card.append(el("p", "点点 · 私密分发管理", "eyebrow"), el("h1", title), el("p", description, "muted")); root.replaceChildren(card); return card;
+}
+function renderLogin(errorText = "") {
+  const card = authShell("管理员登录", "使用分发后台账号登录。连续输错 5 次将锁定 15 分钟。");
+  const notice = el("p", errorText, errorText ? "notice error" : "notice"); notice.setAttribute("role", errorText ? "alert" : "status");
+  const form = el("form", "", "form"); const email = field(form, "邮箱", "email"); email.required = true; email.autocomplete = "username"; const password = field(form, "密码", "password"); password.required = true; password.autocomplete = "current-password";
+  const submit = el("button", "登录", "primary"); form.append(submit); card.append(notice, form);
+  form.addEventListener("submit", (event) => { event.preventDefault(); submit.disabled = true; notice.textContent = "正在登录…"; void authApi<{ token: string; admin: Identity }>("/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: email.value.trim().toLowerCase(), password: password.value }) }).then((result) => { sessionToken = result.token; sessionStorage.setItem("diandian-admin-session", sessionToken); identity = result.admin; if (identity.mustChangePassword) renderPasswordChange(password.value); else void renderWorkspace(); }).catch((error) => renderLogin(error instanceof Error ? error.message : "登录失败。")).finally(() => { submit.disabled = false; }); });
+}
+function renderPasswordChange(currentPassword: string) {
+  const card = authShell("首次登录，请修改密码", "设置至少 10 位的新密码后才能进入后台。"); const notice = el("p", "", "notice"); notice.setAttribute("role", "status");
+  const form = el("form", "", "form"); const next = field(form, "新密码", "password"); next.required = true; next.minLength = 10; next.maxLength = 128; next.autocomplete = "new-password"; const confirm = field(form, "再次输入新密码", "password"); confirm.required = true; confirm.minLength = 10; confirm.maxLength = 128; confirm.autocomplete = "new-password"; const submit = el("button", "保存并进入", "primary"); form.append(submit); card.append(notice, form);
+  form.addEventListener("submit", (event) => { event.preventDefault(); if (next.value !== confirm.value) { notice.textContent = "两次输入的新密码不一致。"; notice.className = "notice error"; return; } submit.disabled = true; void authApi<{ admin: Identity }>("/password", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ currentPassword, newPassword: next.value }) }).then((result) => { identity = result.admin; void renderWorkspace(); }).catch((error) => { notice.textContent = error instanceof Error ? error.message : "修改失败。"; notice.className = "notice error"; }).finally(() => { submit.disabled = false; }); });
+}
+async function boot() {
+  clearView(); root.replaceChildren(el("p", "正在加载…", "boot"));
+  if (!sessionToken) { renderLogin(); return; }
+  try { const result = await authApi<{ admin: Identity }>("/me"); identity = result.admin; if (identity.mustChangePassword) { sessionToken = ""; sessionStorage.removeItem("diandian-admin-session"); renderLogin("请使用初始密码重新登录并完成改密。"); return; } await renderWorkspace(); }
+  catch { sessionToken = ""; sessionStorage.removeItem("diandian-admin-session"); renderLogin("登录已失效，请重新登录。"); }
 }
 window.addEventListener("hashchange", () => { if (identity) void render(); });
 window.addEventListener("pagehide", clearView);

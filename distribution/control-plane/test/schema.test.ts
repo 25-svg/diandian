@@ -2,8 +2,8 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
-const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
-const requiredTables = ["admins", "devices", "activation_codes", "releases", "download_tickets", "update_events", "audit_logs"];
+const migration = ["0001_initial.sql", "0002_app_auth.sql", "0003_local_admin_auth.sql"].map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8")).join("\n");
+const requiredTables = ["admins", "devices", "activation_codes", "releases", "download_tickets", "update_events", "audit_logs", "app_users", "app_user_sessions", "admin_sessions"];
 
 describe("initial D1 migration", () => {
   const databases: DatabaseSync[] = [];
@@ -32,6 +32,7 @@ describe("initial D1 migration", () => {
     expect(activationColumns).toEqual(expect.arrayContaining(["code_hash", "status", "used_by_device_id", "used_at"]));
     expect(database.prepare("SELECT sql FROM sqlite_master WHERE name = 'devices'").get()).toHaveProperty("sql", expect.stringContaining("CHECK"));
     expect(database.prepare("PRAGMA table_info(admins)").all().map(({ name }) => name)).toContain("disabled_at");
+    expect(indexes).toEqual(expect.arrayContaining(["idx_app_users_role_active", "idx_app_sessions_token", "idx_app_sessions_user", "idx_admin_sessions_token", "idx_admin_sessions_admin"]));
   });
 
   it("enforces one activation code for one device and ticket purpose binding", () => {

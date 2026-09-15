@@ -3,7 +3,10 @@
   "name": "diandian-admin-api",
   "main": "src/admin-worker.ts",
   "compatibility_date": "2026-09-11",
-  "vars": { "GITHUB_RELEASES_REPOSITORY": "25-svg/diandian-releases" },
+  "vars": {
+    "GITHUB_RELEASES_REPOSITORY": "25-svg/diandian-releases",
+    "UPDATE_API_BASE_URL": "https://diandian-update-api.xuxu-jarvis-home.workers.dev"
+  },
   "assets": {
     "directory": ".wrangler/admin-assets",
     "not_found_handling": "single-page-application",

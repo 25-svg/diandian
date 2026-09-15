@@ -4,6 +4,7 @@ import { sha256Hex } from "./crypto";
 import { LicenseError, LicenseService, type LicenseErrorCode } from "./license-service";
 import { LicenseRepository } from "./repository";
 import { UpdateError, UpdateService } from "./update-service";
+import { appAuthFailure, handleAppAuth } from "./app-auth";
 
 type LicenseEnv = Env & { LEASE_PRIVATE_JWK: string };
 const MAX_ACTIVATION_BODY_BYTES = 4 * 1024;
@@ -28,6 +29,15 @@ function json(body: unknown, status = 200): Response {
 
 function error(code: LicenseErrorCode | "INVALID_UPDATE_REQUEST" | "DOWNLOAD_UNAVAILABLE" | "ARTIFACT_NOT_FOUND" | "UPDATE_RETRY" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "INTERNAL_ERROR", message: string, status: number): Response {
   return json({ error: { code, message } }, status);
+}
+
+function appCors(response: Response, request: Request): Response {
+  const origin = request.headers.get("origin") ?? "";
+  if (!/^(?:tauri:\/\/localhost|http:\/\/tauri\.localhost|http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?)$/.test(origin)) return response;
+  const copy = new Response(response.body, response);
+  copy.headers.set("access-control-allow-origin", origin);
+  copy.headers.set("vary", "Origin");
+  return copy;
 }
 
 function bearerToken(request: Request): string {
@@ -163,6 +173,11 @@ function updateService(env: LicenseEnv): UpdateService {
 
 async function handle(request: Request, env: LicenseEnv): Promise<Response> {
   const path = new URL(request.url).pathname;
+  if (path.startsWith("/v1/app-auth/") && request.method === "OPTIONS") {
+    return appCors(new Response(null, { status: 204, headers: { "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "authorization, content-type", "access-control-max-age": "600", "cache-control": "no-store" } }), request);
+  }
+  const authResponse = await handleAppAuth(request, env);
+  if (authResponse) return appCors(authResponse, request);
   if (path === "/v1/activate") {
     if (request.method !== "POST") return error("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
     const result = await signingService(env).activate(await activationInput(request));
@@ -219,6 +234,7 @@ export default {
     try {
       return await handle(request, env);
     } catch (cause) {
+      if (new URL(request.url).pathname.startsWith("/v1/app-auth/")) return appCors(appAuthFailure(cause), request);
       if (cause instanceof LicenseError) return error(cause.code, cause.message, errorStatus[cause.code]);
       if (cause instanceof UpdateError) {
         const status = cause.code === "INVALID_REQUEST" ? 400 : cause.code === "ARTIFACT_NOT_FOUND" ? 404 : cause.code === "RETRYABLE" ? 503 : 403;

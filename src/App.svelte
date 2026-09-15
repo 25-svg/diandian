@@ -1,5 +1,6 @@
 <script lang="ts">
   import ActivationGate from "./lib/components/ActivationGate.svelte";
+  import AppAuthGate from "./lib/components/AppAuthGate.svelte";
   import Room from "./page/Room.svelte";
   import BSidebar from "./lib/components/BSidebar.svelte";
   import Summary from "./page/Summary.svelte";
@@ -13,6 +14,7 @@
   import StreamerCoach from "./page/StreamerCoach.svelte";
   import CameraKnowledgeQuiz from "./page/CameraKnowledgeQuiz.svelte";
   import AnchorKnowledge from "./page/AnchorKnowledge.svelte";
+  import OperationsDashboard from "./page/OperationsDashboard.svelte";
   import Archive from "./page/Archive.svelte";
   import ArchiveAnalysis from "./page/ArchiveAnalysis.svelte";
   import MasterSourceDialog from "./lib/components/master/MasterSourceDialog.svelte";
@@ -25,6 +27,7 @@
   import { getMasterBaseline, listMasterSampleBatches } from "./lib/masterScript";
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { canAccessRoute, defaultRoute, type AppUser } from "./lib/appAuth";
 
   let active = "总览";
   let analysisArchive: RecordItem | null = null;
@@ -46,6 +49,10 @@
   let startupReadinessLoading = false;
   let privateUpdateStatus: PrivateUpdateStatus | null = null;
   let stopUpdateStatusPolling: () => void = () => undefined;
+  let authUser: AppUser | null = null;
+  let authGate: AppAuthGate;
+  let appStarted = false;
+  const operationsSections = ["运营总览", "主播团队", "改进任务", "资产审核"] as const;
 
   async function loadStartupReadiness(showWhenIncomplete = true): Promise<void> {
     startupReadinessLoading = true;
@@ -170,16 +177,34 @@
     }
   }
 
-  function startAuthorizedApp() {
+  function startAuthorizedApp(user: AppUser) {
+    if (appStarted) return;
+    appStarted = true;
     void set_title("典典直播切片");
-    void ensureActiveEnterpriseMaster();
-    void checkMiniMaxSetup();
-    void loadStartupReadiness();
+    if (user.role === "anchor") {
+      void ensureActiveEnterpriseMaster();
+      void checkMiniMaxSetup();
+      void loadStartupReadiness();
+    }
     stopUpdateStatusPolling();
     stopUpdateStatusPolling = watchPrivateUpdateStatus((status) => {
       privateUpdateStatus = status;
     });
   }
+  function handleAuthenticated(event: CustomEvent<AppUser>) {
+    authUser = event.detail;
+    active = defaultRoute(event.detail.role);
+    startAuthorizedApp(event.detail);
+  }
+  function handleSignedOut() {
+    authUser = null;
+    active = "总览";
+    showStartupWizard = false;
+    showMiniMaxSetup = false;
+    stopUpdateStatusPolling();
+    appStarted = false;
+  }
+  $: if (authUser && !canAccessRoute(authUser.role, active)) active = defaultRoute(authUser.role);
   onMount(() => () => stopUpdateStatusPolling());
   onMount(() => {
     const openMiniMaxSetup = () => {
@@ -332,7 +357,9 @@
   log.info("App loaded");
 </script>
 
-<ActivationGate on:authorized={startAuthorizedApp}>
+<ActivationGate bypass={import.meta.env.DEV}>
+<AppAuthGate bind:this={authGate} on:authenticated={handleAuthenticated} on:signedOut={handleSignedOut}>
+{#if authUser}
 <main>
   {#if privateUpdateStatus && ["downloading", "waiting_for_idle", "installing", "failed"].includes(privateUpdateStatus.status)}
     <div class:failed={privateUpdateStatus.status === "failed"} class="private-update-status" role="status" aria-live="polite">
@@ -343,6 +370,9 @@
     <div class="sidebar">
       <BSidebar
         bind:activeUrl={active}
+        role={authUser.role}
+        displayName={authUser.displayName}
+        on:logout={() => void authGate.logout()}
         on:activeChange={(e) => {
           // Leaving analysis via sidebar should clear stale source so it does not
           // reopen an empty analysis page on the next click.
@@ -355,6 +385,7 @@
       />
     </div>
     <div class="content">
+      {#if authUser.role === "anchor"}
       <div class="page" class:visible={active == "总览"}>
         <Summary />
       </div>
@@ -401,6 +432,16 @@
       <div class="page" class:visible={active == "账号"}>
         <Account />
       </div>
+      {:else}
+      {#each operationsSections as operationsSection}
+        <div class="page" class:visible={active == operationsSection}>
+          <OperationsDashboard
+            section={operationsSection}
+            on:navigate={(event) => active = event.detail}
+          />
+        </div>
+      {/each}
+      {/if}
       <div class="page" class:visible={active == "设置"}>
         <Setting />
       </div>
@@ -411,7 +452,7 @@
   </div>
 </main>
 
-{#if masterSourceVideo}
+{#if authUser.role === "anchor" && masterSourceVideo}
   <MasterSourceDialog
     videoId={masterSourceVideo.id}
     videoTitle={masterSourceVideo.title || masterSourceVideo.file || "整场直播母稿"}
@@ -423,7 +464,7 @@
   />
 {/if}
 
-{#if showStartupWizard && startupReadiness}
+{#if authUser.role === "anchor" && showStartupWizard && startupReadiness}
   <StartupWizard
     readiness={startupReadiness}
     refreshing={startupReadinessLoading}
@@ -474,6 +515,9 @@
     </section>
   </div>
 {/if}
+
+{/if}
+</AppAuthGate>
 
 </ActivationGate>
 

@@ -9,6 +9,8 @@ button:disabled { opacity: .65; cursor: wait; }
 a { color: inherit; }
 :focus-visible { outline: 3px solid #86efac; outline-offset: 3px; }
 #app { display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }
+#app.auth-layout { display: grid; grid-template-columns: minmax(0, 520px); place-content: center; padding: 24px; }
+.auth-card { max-width: 520px; padding: 32px; background: var(--panel); border: 1px solid #3b4960; border-radius: 10px; box-shadow: 0 24px 70px rgb(0 0 0 / .28); }
 .sidebar { padding: 28px 16px; background: #131e30; border-right: 1px solid #334155; }
 .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 40px; }
 .brand svg { width: 26px; height: 26px; fill: var(--accent); flex-shrink: 0; }

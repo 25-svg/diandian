@@ -14,6 +14,11 @@
     Sparkles,
     Bot,
     Camera,
+    BriefcaseBusiness,
+    UserRoundSearch,
+    ClipboardCheck,
+    ShieldCheck,
+    LogOut,
   } from "lucide-svelte";
   import { hasNewVersion } from "../stores/version";
   import SidebarItem from "./SidebarItem.svelte";
@@ -22,6 +27,8 @@
   const dispatch = createEventDispatcher();
 
   export let activeUrl = "总览";
+  export let role = "anchor";
+  export let displayName = "";
 
   /**
    * @param {{ detail: String; }} route
@@ -45,7 +52,22 @@
   </div>
 
   <div class="nav-label">工作台</div>
+  <div class="role-badge">{role === "operations_manager" ? "负责人端" : "主播端"}</div>
   <nav class="nav-list" aria-label="主导航">
+    {#if role === "operations_manager"}
+    <SidebarItem label="运营总览" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon"><BriefcaseBusiness class="w-5 h-5" /></div>
+    </SidebarItem>
+    <SidebarItem label="主播团队" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon"><UserRoundSearch class="w-5 h-5" /></div>
+    </SidebarItem>
+    <SidebarItem label="改进任务" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon"><ClipboardCheck class="w-5 h-5" /></div>
+    </SidebarItem>
+    <SidebarItem label="资产审核" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon"><ShieldCheck class="w-5 h-5" /></div>
+    </SidebarItem>
+    {:else}
     <SidebarItem label="总览" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
         <LayoutDashboard class="w-5 h-5" />
@@ -91,11 +113,12 @@
         <BookOpenCheck class="w-5 h-5" />
       </div>
     </SidebarItem>
-    <SidebarItem label="账号" {activeUrl} on:activeChange={navigate}>
-      <div slot="icon">
-        <Users class="w-5 h-5" />
-      </div>
-    </SidebarItem>
+    {/if}
+    {#if role === "anchor"}
+      <SidebarItem label="账号" {activeUrl} on:activeChange={navigate}>
+        <div slot="icon"><Users class="w-5 h-5" /></div>
+      </SidebarItem>
+    {/if}
     <SidebarItem label="设置" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
         <Settings class="w-5 h-5" />
@@ -114,11 +137,11 @@
   </nav>
 
   <div class="sidebar-footer">
-    <div class="ready-dot"></div>
-    <div>
-      <strong><Sparkles size={13} /> AI 复盘已就绪</strong>
-      <span>自动转写并发现片段</span>
+    <div class="identity">
+      <strong><Sparkles size={13} /> {displayName || "已登录"}</strong>
+      <span>{role === "operations_manager" ? "运营负责人" : "主播账号"}</span>
     </div>
+    <button class="logout" type="button" aria-label="退出登录" title="退出登录" on:click={() => dispatch("logout")}><LogOut size={16} /></button>
   </div>
 </aside>
 
@@ -152,6 +175,7 @@
   .brand-copy strong { font-size: 15px; letter-spacing: -0.25px; white-space: nowrap; }
   .brand-copy span { margin-top: 2px; color: var(--mac-tertiary); font-size: 10px; white-space: nowrap; }
   .nav-label { padding: 0 12px 7px; color: var(--mac-quaternary); font-size: 10px; font-weight: 650; letter-spacing: 0.08em; }
+  .role-badge { margin: 0 6px 10px; padding: 8px 10px; border: 1px solid rgba(0,113,227,.16); border-radius: 9px; background: rgba(0,113,227,.07); color: var(--mac-blue); font-size: 11px; font-weight: 700; text-align: center; }
   .nav-list { display: flex; flex-direction: column; gap: 3px; }
   .sidebar-footer {
     display: flex;
@@ -164,10 +188,12 @@
     background: rgba(255, 255, 255, 0.58);
     box-shadow: 0 5px 18px rgba(30, 35, 45, 0.05);
   }
-  .ready-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: var(--mac-green); box-shadow: 0 0 0 4px rgba(48, 209, 88, 0.12); }
-  .sidebar-footer > div:last-child { min-width: 0; display: flex; flex-direction: column; }
+  .identity { min-width: 0; display: flex; flex: 1; flex-direction: column; }
   .sidebar-footer strong { display: flex; align-items: center; gap: 4px; color: var(--mac-secondary); font-size: 10px; }
   .sidebar-footer span { margin-top: 2px; color: var(--mac-tertiary); font-size: 9px; }
+  .logout { width: 44px; height: 44px; display: grid; place-items: center; flex: 0 0 44px; border: 0; border-radius: 9px; background: transparent; color: var(--mac-secondary); cursor: pointer; }
+  .logout:hover { background: var(--mac-fill); color: var(--mac-red); }
+  .logout:focus-visible { outline: 3px solid var(--mac-blue); outline-offset: 2px; }
 
   @media (max-width: 700px) {
     .dd-sidebar {

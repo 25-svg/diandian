@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createAdminWorker, type VerifiedAccessIdentity } from "../src/admin-worker";
 
-const migration = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
+const migration = ["0001_initial.sql", "0002_app_auth.sql", "0003_local_admin_auth.sql"].map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8")).join("\n");
 const databases: DatabaseSync[] = [];
 afterEach(() => databases.splice(0).forEach((database) => database.close()));
 
@@ -144,11 +144,11 @@ describe("role-based admin API", () => {
   it("does not let an owner upsert demote an active last owner, but reactivates a disabled email", async () => {
     const { worker, env, database } = fixture("owner");
     const headers = { origin: "https://admin.example", "content-type": "application/json" };
-    const self = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers, body: JSON.stringify({ email: "admin@example.com", role: "operator" }) }), env, {} as ExecutionContext);
+    const self = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers, body: JSON.stringify({ email: "admin@example.com", role: "operator", password: "Initial-Password-1" }) }), env, {} as ExecutionContext);
     expect(self.status).toBe(409);
     expect(database.prepare("SELECT role,disabled_at FROM admins WHERE id='admin-1'").get()).toEqual({ role: "owner", disabled_at: null });
     database.prepare("INSERT INTO admins (id,email,password_hash,role,created_at,disabled_at) VALUES ('disabled','old@example.com','', 'operator', 1, 2)").run();
-    const restored = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers, body: JSON.stringify({ email: "old@example.com", role: "owner" }) }), env, {} as ExecutionContext);
+    const restored = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers, body: JSON.stringify({ email: "old@example.com", role: "owner", password: "Initial-Password-1" }) }), env, {} as ExecutionContext);
     expect(restored.status).toBe(201);
     expect(await restored.json()).toMatchObject({ id: "disabled", role: "owner" });
     expect(database.prepare("SELECT role,disabled_at FROM admins WHERE id='disabled'").get()).toEqual({ role: "owner", disabled_at: null });
@@ -206,7 +206,7 @@ describe("role-based admin API", () => {
         database.prepare("INSERT INTO admins (id,email,password_hash,role,created_at,disabled_at) VALUES ('actual-race-id','race@example.com','', 'operator',1,2)").run();
       }
     } }) };
-    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ email: "race@example.com", role: "owner" }) }), racingEnv, {} as ExecutionContext);
+    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ email: "race@example.com", role: "owner", password: "Initial-Password-1" }) }), racingEnv, {} as ExecutionContext);
     expect(response.status).toBe(201);
     expect(await response.json()).toMatchObject({ id: "actual-race-id", role: "owner" });
     expect(database.prepare("SELECT target_id FROM audit_logs WHERE action='admin.create' AND details_json LIKE '%success%' ORDER BY created_at DESC LIMIT 1").get()).toEqual({ target_id: "actual-race-id" });
@@ -215,7 +215,7 @@ describe("role-based admin API", () => {
   it("returns admin-create success and preserves started audit evidence when success annotation fails", async () => {
     const { worker, env, database } = fixture("owner");
     const brokenAuditEnv = { ...env, DB: makeD1(database, { failAdminSuccessAudit: true }) };
-    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ email: "audit@example.com", role: "operator" }) }), brokenAuditEnv, {} as ExecutionContext);
+    const response = await worker.fetch(new Request("https://admin.example/api/admin/admins", { method: "POST", headers: { origin: "https://admin.example", "content-type": "application/json" }, body: JSON.stringify({ email: "audit@example.com", role: "operator", password: "Initial-Password-1" }) }), brokenAuditEnv, {} as ExecutionContext);
     expect(response.status).toBe(201);
     expect(database.prepare("SELECT email FROM admins WHERE email='audit@example.com'").get()).toEqual({ email: "audit@example.com" });
     expect(database.prepare("SELECT target_type,details_json FROM audit_logs WHERE action='admin.create' ORDER BY created_at DESC LIMIT 1").get()).toMatchObject({ target_type: "admin_operation", details_json: expect.stringContaining("started") });
