@@ -115,7 +115,7 @@ export class GitHubArtifactStore implements ArtifactStore {
     if (!assetId) return null;
     const response = await this.fetcher(this.endpoint(assetId), { headers: this.headers("application/vnd.github+json"), redirect: "manual" });
     if (response.status === 404) { await response.body?.cancel(); return null; }
-    if (!response.ok) { await response.body?.cancel(); throw new Error("GitHub asset metadata is unavailable"); }
+    if (!response.ok) { const status = response.status; await response.body?.cancel(); throw new Error(`GitHub asset metadata is unavailable (${status})`); }
     const asset = parseAsset(await boundedJson(response), assetId);
     return { size: asset.size, customMetadata: sha256Metadata(asset) };
   }
