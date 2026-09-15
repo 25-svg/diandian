@@ -1,12 +1,12 @@
 {
-  "productName": "bili-shadowreplay-cuda",
+  "productName": "典典直播切片",
   "app": {
     "windows": [
       {
         "label": "main",
         "fullscreen": false,
         "resizable": true,
-        "title": "BiliBili ShadowReplay",
+        "title": "典典直播切片",
         "width": 1300,
         "height": 600,
         "transparent": false,
