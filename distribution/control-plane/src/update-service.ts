@@ -1,5 +1,6 @@
 import { randomToken, sha256Hex } from "./crypto";
 import type { UpdateResponse } from "./domain";
+import type { ArtifactStore } from "./artifact-store";
 
 const UPDATE_TICKET_SECONDS = 15 * 60;
 const UPDATE_TOKEN_BYTES = 32;
@@ -91,7 +92,7 @@ export class UpdateService {
   constructor(
     private readonly db: D1Database,
     private readonly clock: () => number = () => Math.floor(Date.now() / 1000),
-    private readonly artifacts?: R2Bucket,
+    private readonly artifacts?: ArtifactStore,
   ) {}
 
   async resolveUpdate(input: {

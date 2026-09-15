@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { artifactStoreFromEnv } from "./artifact-store";
 import { sha256Hex } from "./crypto";
 import { LicenseError, LicenseService, type LicenseErrorCode } from "./license-service";
 import { LicenseRepository } from "./repository";
@@ -157,7 +158,7 @@ async function updateEventInput(request: Request): Promise<{ deviceId?: unknown;
 }
 
 function updateService(env: LicenseEnv): UpdateService {
-  return new UpdateService(env.DB, undefined, env.ARTIFACTS);
+  return new UpdateService(env.DB, undefined, artifactStoreFromEnv(env));
 }
 
 async function handle(request: Request, env: LicenseEnv): Promise<Response> {

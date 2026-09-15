@@ -3,6 +3,6 @@
   "name": "diandian-update-api",
   "main": "src/update-worker.ts",
   "compatibility_date": "2026-09-11",
-  "d1_databases": [{ "binding": "DB", "database_name": "diandian-control", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }],
-  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "diandian-artifacts" }]
+  "vars": { "GITHUB_RELEASES_REPOSITORY": "25-svg/diandian-releases" },
+  "d1_databases": [{ "binding": "DB", "database_name": "diandian-control", "database_id": "b4e4bb5e-aeeb-4ee0-be0e-82c860d6cbe0", "migrations_dir": "migrations" }]
 }
