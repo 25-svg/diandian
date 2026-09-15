@@ -35,7 +35,7 @@
       }
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUwNEIxRDUzNkVFMTFCQzQKUldURUcrRnVVeDFMVU9yams2eWdadkdUTUx5d1ptZ0I3NXFkZmF2MkVmV01LWVVVbDRqM250UEEK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExQ0NEOTYzQTNGOTc2N0MKUldSOGR2bWpZOW5Nb1RlYjMvdmhkeWVjbFM0YkxNdnJUT2RBRWJzTm13cGRxaHNJYzdQcmhtSTkK",
       "endpoints": [],
       "windows": {
         "installMode": "passive"
