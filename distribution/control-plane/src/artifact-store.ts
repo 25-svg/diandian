@@ -89,7 +89,11 @@ function safeAssetLocation(value: string | null): URL {
 }
 
 export class GitHubArtifactStore implements ArtifactStore {
-  constructor(private readonly repository: string, private readonly token: string, private readonly fetcher: Fetcher = fetch) {
+  constructor(
+    private readonly repository: string,
+    private readonly token: string,
+    private readonly fetcher: Fetcher = (input, init) => fetch(input, init),
+  ) {
     if (!validRepository(repository) || !validSecret(token)) throw new Error("GitHub artifact storage is unavailable");
   }
 
