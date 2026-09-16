@@ -72,7 +72,16 @@ impl CredentialVault {
             .as_file()
             .sync_all()
             .map_err(|_| LicenseError::Vault)?;
-        // tempfile uses atomic replace on Windows; existing file survives failure.
+        // `NamedTempFile::persist` uses rename semantics. Windows refuses to
+        // rename over an existing file, so remove the old encrypted blob first.
+        // If the replacement fails, the app fails closed (no usable credential)
+        // and the caller can activate again; plaintext is never written.
+        #[cfg(windows)]
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err(LicenseError::Vault),
+        }
         temporary
             .persist(&self.path)
             .map_err(|_| LicenseError::Vault)?;
